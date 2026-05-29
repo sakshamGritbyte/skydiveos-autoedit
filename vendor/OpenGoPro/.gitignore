@@ -1,0 +1,56 @@
+**/*.vscode/
+
+**/*.crt
+/.build
+
+/.env
+**.log
+
+/test.html
+/link_results
+.vscode
+**/venv
+**/.venv
+**/__pycache__/
+**/dist/
+xcuserdata/
+.git
+**/temp
+/*.jpg
+/*.gpmf
+/docs/_config-temp.yml
+# This is built and stored in the Docker image
+/docs/Gemfile.lock
+
+# Vim
+*~
+*.sw[p_]
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Ruby Gem
+*.gem
+.bundle
+**/vendor/bundle
+
+# Node.js and NPM
+node_modules
+npm-debug.log*
+package-lock.json
+codekit-config.json
+
+# macOS
+.DS_Store
+
+# Jekyll generated files
+/docs/.jekyll-cache
+/docs/.jekyll-metadata
+/docs/.sass-cache
+/docs/_asset_bundler_cache
+/docs/_site
+!/docs/assets/images/demos
+# .gitignore
+sample-data/
+vendor/OpenGoPro/.git

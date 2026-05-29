@@ -1,0 +1,207 @@
+# github-pages.yml/Open GoPro, Version 2.0 (C) Copyright 2021 GoPro, Inc. (http://gopro.com/OpenGoPro).
+# This copyright was auto-generated on Wed, Sep  1, 2021  5:05:34 PM
+
+name: On Update to Main
+
+on:
+    push:
+        branches: [main]
+    workflow_dispatch:
+
+jobs:
+    mirror-main-to-staging:
+        name: Mirror Public Main to Staging
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout branch (staging public_main_mirror)
+              uses: actions/checkout@v5
+              with:
+                  repository: gopro/OpenGoPro-Staging
+                  ref: public_main_mirror
+                  token: ${{ secrets.PUSH_TO_STAGING }}
+
+            - name: Mirror Public Main
+              shell: bash
+              run: |
+                  git remote add public https://github.com/gopro/OpenGoPro
+                  git fetch public main
+                  git reset --hard public/main
+                  git push -f
+
+    copyright:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v5
+              with:
+                  token: ${{ secrets.PUSH_TO_PROTECTED_BRANCH }}
+
+            - name: Check for (and add) missing copyrights
+              shell: bash
+              run: |
+                  make copyright
+                  echo "NUM_MODIFIED=$(git diff --numstat | wc -l)" >> $GITHUB_ENV
+
+            - name: Push changes
+              if: env.NUM_MODIFIED != 0
+              shell: bash
+              run: |
+                  git config core.fileMode false
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                  git config user.name "github-actions[bot]"
+                  git add .
+                  git commit -m "updating copyrights from pre merge check in github action"
+                  git push
+
+    check:
+        needs: copyright
+        name: Check modified files for SDK changes
+        runs-on: ubuntu-latest
+        outputs:
+            build_python_sdk: ${{ steps.check_python_files.outputs.found_modified_python_file }}
+            build_kotlin_sdk: ${{ steps.check_kotlin_files.outputs.found_modified_kotlin_file }}
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v5
+              with:
+                  fetch-depth: 2
+
+            - name: Analyze modified Python SDK files
+              id: check_python_files
+              run: |
+                  echo "=============== list modified files ==============="
+                  git diff --name-only HEAD^ HEAD
+                  echo
+                  git diff --name-only HEAD^ HEAD >files.txt
+                  while IFS= read -r file; do
+                      if [[ $file != demos/python/sdk_wireless_camera_control* ]]; then
+                          echo "found_modified_python_file=false" >> "$GITHUB_OUTPUT"
+                      else
+                          echo "Found a Python SDK modified file"
+                          echo "found_modified_python_file=true" >> "$GITHUB_OUTPUT"
+                          break
+                      fi
+                  done <files.txt
+
+            - name: Analyze modified Kotlin SDK files
+              id: check_kotlin_files
+              run: |
+                  echo "=============== list modified files ==============="
+                  git diff --name-only HEAD^ HEAD
+                  echo
+                  git diff --name-only HEAD^ HEAD >files.txt
+                  while IFS= read -r file; do
+                      if [[ $file != demos/kotlin/kmp_sdk* ]]; then
+                          echo "found_modified_kotlin_file=false" >> "$GITHUB_OUTPUT"
+                      else
+                          echo "Found a Kotlin SDK modified file"
+                          echo "found_modified_kotlin_file=true" >> "$GITHUB_OUTPUT"
+                          break
+                      fi
+                  done <files.txt
+
+    python_sdk:
+        name: Build and Deploy Python SDK Documentation
+        needs: check
+        if: needs.check.outputs.build_python_sdk == 'true'
+        runs-on: ${{ matrix.os }}
+        strategy:
+            matrix:
+                os: [ubuntu-latest]
+                include:
+                    - os: ubuntu-latest
+                      path: ~/Library/Caches/pip
+
+        steps:
+            - name: Checkout source branch (the PR branch)
+              uses: actions/checkout@v5
+              with:
+                  path: source
+
+            - name: Install Dot to build Sphinx Diagrams
+              shell: bash
+              run: sudo apt-get update && sudo apt install -y graphviz
+
+            - name: Set up Python 3.13.3
+              uses: actions/setup-python@v6
+              with:
+                  python-version: 3.13.3
+
+            - name: Restore cached pip environment
+              uses: actions/cache@v4
+              with:
+                  path: ${{ matrix.path }}
+                  key: ${{ runner.os }}-3.13.3-pip-${{ hashFiles('demos/python/sdk_wireless_camera_control/poetry.lock') }}
+                  restore-keys: |
+                      ${{ runner.os }}-pip-
+
+            - name: Install dependencies
+              working-directory: ./source/demos/python/sdk_wireless_camera_control/
+              run: |
+                  python -m pip install --upgrade pip wheel
+                  pip install nox==2024.10.9
+                  pip install nox-poetry==1.0.3
+                  pip install poetry==2.0.0
+                  pip install poetry-plugin-export==1.8.0
+
+            - name: Build Sphinx Documentation
+              working-directory: ./source/demos/python/sdk_wireless_camera_control/
+              run: nox -s docs
+
+            - name: Checkout target branch (the gh-pages branch)
+              uses: actions/checkout@v5
+              with:
+                  ref: gh-pages
+                  path: target
+
+            - name: Deploy to Github Pages
+              run: |
+                  rm -rf ./target/python_sdk
+                  mkdir -p ./target/python_sdk
+                  cp -r ./source/demos/python/sdk_wireless_camera_control/docs/build/. ./target/python_sdk
+                  cd  ./target/python_sdk
+                  git add .
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                  git config user.name "github-actions[bot]"
+                  git commit --allow-empty -m "sphinx build from Action ${GITHUB_SHA}"
+                  git push
+
+    kotlin_sdk:
+        name: Build and Deploy Kotlin SDK Documentation
+        needs: check
+        if: needs.check.outputs.build_kotlin_sdk == 'true'
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout source branch (the PR branch)
+              uses: actions/checkout@v5
+              with:
+                  path: source
+
+            - name: Setup Java
+              uses: actions/setup-java@v5
+              with:
+                  distribution: 'temurin'
+                  java-version: '17'
+                  cache: gradle
+                  cache-dependency-path: source/demos/kotlin/kmp_sdk
+
+            - name: Build Dokka Documentation
+              working-directory: source/demos/kotlin/kmp_sdk
+              run: ./gradlew dokkaHtml
+
+            - name: Checkout target branch (the gh-pages branch)
+              uses: actions/checkout@v5
+              with:
+                  ref: gh-pages
+                  path: target
+
+            - name: Deploy to Github Pages
+              run: |
+                  rm -rf ./target/kotlin_sdk
+                  mkdir -p ./target/kotlin_sdk
+                  cp -r ./source/demos/kotlin/kmp_sdk/wsdk/build/dokka/html/. ./target/kotlin_sdk
+                  cd  ./target/kotlin_sdk
+                  git add .
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                  git config user.name "github-actions[bot]"
+                  git commit --allow-empty -m "Dokka build from Action ${GITHUB_SHA}"
+                  git push

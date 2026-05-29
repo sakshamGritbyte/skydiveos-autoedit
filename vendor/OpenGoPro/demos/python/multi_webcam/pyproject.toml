@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "multi-webcam"
+version = "0.2.0"
+description = "Simultaneously control multiple GoPro's as webcams"
+authors = ["Tim Camise <tcamise@gopro.com>"]
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+opencv-python = "^4"
+requests = "^2"
+tk = "^0"
+Pillow = "^11"
+
+[tool.poetry.group.dev.dependencies]
+black = "*"
+mypy = "*"
+rinohtype = "^0.5.4"
+
+[tool.poetry.scripts]
+start-webcam = "multi_webcam.examples.start_webcam:entrypoint"
+single-webcam = "multi_webcam.examples.single_webcam:entrypoint"
+multi-webcam = "multi_webcam.examples.multiple_webcams:entrypoint"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"

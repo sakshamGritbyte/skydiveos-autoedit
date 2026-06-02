@@ -44,3 +44,10 @@ warn_redundant_casts = true
 disallow_untyped_defs = true
 no_implicit_optional = true
 exclude = ["vendor/"]
+
+# The Open GoPro SDK is an optional, hardware-only dependency that /ingest
+# imports lazily (see ingest/camera.py). It is not installed in CI, so let mypy
+# treat it as untyped rather than erroring on the missing import.
+[[tool.mypy.overrides]]
+module = "open_gopro.*"
+ignore_missing_imports = true

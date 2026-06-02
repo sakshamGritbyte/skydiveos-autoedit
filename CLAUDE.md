@@ -52,6 +52,9 @@ Built as a module inside SkydiveOS. Replaces our current dependency on Shred.
 
 ## Bash Commands
 - `pip install -r requirements.txt` — install Python deps
+- `python -m ingest.pull --camera <id>` — pull a camera's jumps into raw-storage and enqueue them
+- `python -m ingest.pull --camera <id> --pair` — one-time BLE pairing for a camera
+- `uv pip install ./vendor/OpenGoPro/demos/python/sdk_wireless_camera_control` — install the hardware-only Open GoPro SDK (needed only for live ingest)
 - `pytest tests/ -v` — run all pipeline tests
 - `python scripts/process_jump.py <path/to/raw.mp4>` — end-to-end on a sample file
 - `python scripts/replay_edl.py <job_id>` — re-render from a saved EDL

@@ -61,6 +61,8 @@ Built as a module inside SkydiveOS. Replaces our current dependency on Shred.
 - `python -m render <source.mp4> --job-id <id> --customer "<name>"` — render an EDL (the job's saved `edl.json`, or `--edl <path>`) to `jobs/{id}/final.mp4` at 1080p/h264/30fps; intro/outro from `/templates`, music via `--music <name>`, caption font override with `$RENDER_FONT`
 - `python scripts/replay_edl.py <job_id>` — re-render from a saved EDL
 - `ffmpeg -version` — must be 6.0+ for our speed-ramp filter
+- `uvicorn api.app:app --reload` — serve the /api FastAPI service (OpenAPI docs at `/docs`); SkydiveOS calls it to create jobs, upload footage, review, approve, and stream previews
+- `celery -A api.celery_app.celery_app worker -l info` — run the worker that executes the async pipeline tasks /api enqueues (set `CELERY_TASK_ALWAYS_EAGER=1` to run tasks inline without a worker, for a single-process demo)
 - `npm run dev` — local SkydiveOS API + review UI
 - `npm test` — Jest tests for API/UI
 

@@ -8,12 +8,15 @@ dependencies = [
     "anthropic>=0.40.0",
     "boto3>=1.34.0",
     "celery>=5.4.0",
+    "fastapi>=0.115.0",
     "mediapipe>=0.10.0",
     "moviepy>=1.0.3",
     "numpy>=1.24.0",
     "opencv-python>=4.9.0",
     "pydantic>=2.0.0",
+    "python-multipart>=0.0.9",
     "redis>=5.0.0",
+    "uvicorn[standard]>=0.30.0",
 ]
 
 [dependency-groups]
@@ -57,4 +60,9 @@ ignore_missing_imports = true
 # MediaPipe ships no type stubs / py.typed marker; /analysis imports it lazily.
 [[tool.mypy.overrides]]
 module = "mediapipe.*"
+ignore_missing_imports = true
+
+# Celery ships no py.typed marker; /api's Celery app + tasks import it.
+[[tool.mypy.overrides]]
+module = "celery.*"
 ignore_missing_imports = true

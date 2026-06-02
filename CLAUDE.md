@@ -55,6 +55,7 @@ Built as a module inside SkydiveOS. Replaces our current dependency on Shred.
 - `python -m ingest.pull --camera <id>` — pull a camera's jumps into raw-storage and enqueue them
 - `python -m ingest.pull --camera <id> --pair` — one-time BLE pairing for a camera
 - `uv pip install ./vendor/OpenGoPro/demos/python/sdk_wireless_camera_control` — install the hardware-only Open GoPro SDK (needed only for live ingest)
+- `python -m analysis <proxy.lrv> --start <s> --end <s>` — score a proxy's freefall window (per-second smile/eye-contact/framing JSON); model auto-downloads, override with `$FACE_LANDMARKER_MODEL`
 - `pytest tests/ -v` — run all pipeline tests
 - `python scripts/process_jump.py <path/to/raw.mp4>` — end-to-end on a sample file
 - `python scripts/replay_edl.py <job_id>` — re-render from a saved EDL

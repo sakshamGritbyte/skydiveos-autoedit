@@ -1,2 +1,6 @@
 sample-data
 raw-storage
+
+# Downloaded MediaPipe model bundle (cached on demand by /analysis; see
+# analysis/models.py). It's a reproducible build artifact, not source.
+analysis/models/

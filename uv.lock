@@ -1640,6 +1640,7 @@ dependencies = [
     { name = "celery" },
     { name = "mediapipe" },
     { name = "moviepy" },
+    { name = "numpy" },
     { name = "opencv-python" },
     { name = "redis" },
 ]
@@ -1659,6 +1660,7 @@ requires-dist = [
     { name = "celery", specifier = ">=5.4.0" },
     { name = "mediapipe", specifier = ">=0.10.0" },
     { name = "moviepy", specifier = ">=1.0.3" },
+    { name = "numpy", specifier = ">=1.24.0" },
     { name = "opencv-python", specifier = ">=4.9.0" },
     { name = "redis", specifier = ">=5.0.0" },
 ]

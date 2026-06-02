@@ -10,6 +10,7 @@ dependencies = [
     "celery>=5.4.0",
     "mediapipe>=0.10.0",
     "moviepy>=1.0.3",
+    "numpy>=1.24.0",
     "opencv-python>=4.9.0",
     "redis>=5.0.0",
 ]
@@ -50,4 +51,9 @@ exclude = ["vendor/"]
 # treat it as untyped rather than erroring on the missing import.
 [[tool.mypy.overrides]]
 module = "open_gopro.*"
+ignore_missing_imports = true
+
+# MediaPipe ships no type stubs / py.typed marker; /analysis imports it lazily.
+[[tool.mypy.overrides]]
+module = "mediapipe.*"
 ignore_missing_imports = true

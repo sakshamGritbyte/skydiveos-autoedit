@@ -57,7 +57,8 @@ Built as a module inside SkydiveOS. Replaces our current dependency on Shred.
 - `uv pip install ./vendor/OpenGoPro/demos/python/sdk_wireless_camera_control` — install the hardware-only Open GoPro SDK (needed only for live ingest)
 - `python -m analysis <proxy.lrv> --start <s> --end <s>` — score a proxy's freefall window (per-second smile/eye-contact/framing JSON); model auto-downloads, override with `$FACE_LANDMARKER_MODEL`
 - `pytest tests/ -v` — run all pipeline tests
-- `python scripts/process_jump.py <path/to/raw.mp4>` — end-to-end on a sample file
+- `python scripts/process_jump.py <path/to/raw.mp4>` — end-to-end on a sample file (timeline → house-cut EDL → render `jobs/{id}/final.mp4`)
+- `python -m render <source.mp4> --job-id <id> --customer "<name>"` — render an EDL (the job's saved `edl.json`, or `--edl <path>`) to `jobs/{id}/final.mp4` at 1080p/h264/30fps; intro/outro from `/templates`, music via `--music <name>`, caption font override with `$RENDER_FONT`
 - `python scripts/replay_edl.py <job_id>` — re-render from a saved EDL
 - `ffmpeg -version` — must be 6.0+ for our speed-ramp filter
 - `npm run dev` — local SkydiveOS API + review UI

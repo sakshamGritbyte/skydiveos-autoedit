@@ -279,6 +279,17 @@ def build_filtergraph(
         music_gain=music_gain,
     )
 
+    if audio_label is not None:
+        # Pad the audio to span the *whole* video (intro + footage + outro). The
+        # ambient ends with the footage and the cards are silent, so without this
+        # the audio track is shorter than the video — which makes browsers drop or
+        # ignore audio after a seek (the media element's duration is the longer
+        # video stream). Trailing silence keeps audio_duration == video_duration.
+        state.chains.append(
+            f"[{audio_label}]apad=whole_dur={_num(total_duration)}[afull]"
+        )
+        audio_label = "afull"
+
     return FilterGraph(
         inputs=state.inputs,
         filter_complex=";".join(state.chains),
@@ -346,8 +357,16 @@ def _build_audio(
         return "mus"  # nothing to duck against -> music plays straight
 
     # Split the ambient: one copy keys the compressor, one is mixed back in so the
-    # original sound is still heard *over* the ducked music.
-    state.chains.append(f"[{ambient}]asplit=2[amb_mix][amb_key]")
+    # original sound is still heard *over* the ducked music. The key is padded to
+    # the full timeline first: sidechaincompress ends its output when the *key*
+    # ends, so an un-padded key (ambient stops with the footage) would truncate the
+    # ducked music — and thus all audio — at the end of the footage. Padding the key
+    # with trailing silence lets the music run the whole length, ducking under the
+    # footage and playing at full level under the (silent-key) outro.
+    state.chains.append(f"[{ambient}]asplit=2[amb_mix][amb_key_raw]")
+    state.chains.append(
+        f"[amb_key_raw]apad=whole_dur={_num(total_duration)}[amb_key]"
+    )
     state.chains.append(f"[mus][amb_key]sidechaincompress={_DUCK}[mus_duck]")
     state.chains.append(
         "[amb_mix][mus_duck]amix=inputs=2:duration=longest:normalize=0[aout]"

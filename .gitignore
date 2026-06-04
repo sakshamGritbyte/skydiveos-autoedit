@@ -9,3 +9,12 @@ jobs
 # Downloaded MediaPipe model bundle (cached on demand by /analysis; see
 # analysis/models.py). It's a reproducible build artifact, not source.
 analysis/models/
+
+# Node deps for the TypeScript web layer (review-ui etc).
+node_modules/
+package-lock.json
+
+# Python bytecode caches and macOS Finder cruft — build/OS artifacts, not source.
+__pycache__/
+*.pyc
+.DS_Store

@@ -132,10 +132,16 @@ def test_graph_ducks_music_under_source_audio(edl: EditDecisionList) -> None:
     fc = g.filter_complex
     # Ambient is built, split, and used to key the side-chain compressor...
     assert "sidechaincompress=" in fc
-    assert "asplit=2[amb_mix][amb_key]" in fc
+    assert "asplit=2[amb_mix][amb_key_raw]" in fc
+    # The side-chain key is padded to the full timeline so the compressor (and thus
+    # the music) runs the whole length instead of stopping with the footage.
+    assert "[amb_key_raw]apad=whole_dur=" in fc
     # ...then mixed back with the ducked music into the final audio pad.
     assert "amix=inputs=2" in fc
-    assert g.audio_label == "aout"
+    # The mix is padded to the full video length so audio_duration == video_duration
+    # (a shorter audio track makes browsers drop audio after a seek).
+    assert g.audio_label == "afull"
+    assert "[aout]apad=whole_dur=" in fc
     # Ambient sits under the body, delayed by the intro length (2000 ms).
     assert "adelay=2000:all=1" in fc
     # The music input is looped to cover the whole timeline.
@@ -148,8 +154,24 @@ def test_graph_music_plays_straight_without_source_audio(edl: EditDecisionList) 
     g = build_filtergraph(edl, "src.mp4", has_audio=False, music_path="music.mp3")
     fc = g.filter_complex
     assert "sidechaincompress=" not in fc  # nothing to duck against
-    assert g.audio_label == "mus"
+    assert g.audio_label == "afull"  # padded to the full timeline
     assert "volume=" in fc  # music level still applied
+
+
+def test_graph_audio_is_padded_to_full_video_length(edl: EditDecisionList) -> None:
+    """Every audio branch ends padded to the full timeline.
+
+    Regression for the bug where the audio stream was shorter than the video
+    (ambient ends with the footage; cards are silent), which made browsers drop
+    audio after a timeline seek. The final pad keeps audio_duration == video.
+    """
+    for has_audio, music in [(True, "m.mp3"), (False, "m.mp3"), (True, None)]:
+        g = build_filtergraph(
+            edl, "src.mp4", has_audio=has_audio, music_path=music,
+            outro_path="outro.mp4", outro_duration=3.0,
+        )
+        assert g.audio_label == "afull", (has_audio, music)
+        assert "apad=whole_dur=" in g.filter_complex
 
 
 def test_graph_is_video_only_when_silent_and_music_free(edl: EditDecisionList) -> None:

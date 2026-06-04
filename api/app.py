@@ -11,6 +11,7 @@ Endpoints (all under the OpenAPI docs at ``/docs``):
 ``POST /jobs``              open a job, get a ``job_id``
 ``POST /jobs/{id}/upload``  attach a raw MP4 (or trigger an Open GoPro pull)
 ``GET  /jobs/{id}``         current status + metadata
+``GET  /jobs/{id}/edl``     the job's persisted EDL (the review UI's timeline)
 ``POST /jobs/{id}/approve`` instructor approves → deliver
 ``POST /jobs/{id}/reject``  instructor rejects with a reason → re-queue
 ``POST /jobs/{id}/tweak``   instructor edits the EDL → re-render
@@ -30,6 +31,9 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi import Path as PathParam
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+from edl.schema import EditDecisionList
 
 from .config import Settings, get_settings
 from .jobs import REVIEWABLE, Job, JobStatus, JobStore
@@ -99,6 +103,21 @@ def create_app() -> FastAPI:
         description=API_DESCRIPTION,
         openapi_tags=TAGS_METADATA,
     )
+    
+    
+    # CORS
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "http://localhost:3000",  # React dev server
+            "http://localhost:5173",  # Vite dev server
+            "https://your-frontend-domain.com",
+        ],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
 
     @app.post(
         "/jobs",
@@ -175,6 +194,26 @@ def create_app() -> FastAPI:
     def get_job(job_id: JobId, store: StoreDep) -> JobResponse:
         """Return a job's current status and metadata."""
         return JobResponse.from_job(_load_or_404(store, job_id))
+
+    @app.get(
+        "/jobs/{job_id}/edl",
+        response_model=EditDecisionList,
+        tags=["review"],
+        summary="Get the job's current EDL",
+    )
+    def get_edl(job_id: JobId, store: StoreDep) -> EditDecisionList:
+        """Return the job's persisted EDL — the edit the review UI renders.
+
+        This is the read-side counterpart to ``POST /jobs/{id}/tweak``: the
+        instructor screen loads the composed timeline here, edits it, and posts
+        the result back. 404s until the Compose stage has written ``edl.json``
+        (e.g. while the job is still ``queued``/``processing``).
+        """
+        _load_or_404(store, job_id)
+        edl_file = store.edl_file(job_id)
+        if not edl_file.exists():
+            raise HTTPException(status_code=404, detail="no EDL yet; job not composed")
+        return EditDecisionList.model_validate_json(edl_file.read_text())
 
     @app.post(
         "/jobs/{job_id}/approve",

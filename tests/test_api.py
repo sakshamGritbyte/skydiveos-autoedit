@@ -231,6 +231,39 @@ def test_tweak_before_render_conflicts(client: TestClient) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# EDL read-back (the review UI's timeline)
+# --------------------------------------------------------------------------- #
+
+
+def test_get_edl_returns_persisted_edit(client: TestClient) -> None:
+    job_id = _create(client)
+    _mark(client, job_id, JobStatus.ready_for_review)
+    edl = EditDecisionList(
+        clips=[Clip(src_start=1.0, src_end=5.0, speed_multiplier=0.4)],
+        music="sunrise",
+    )
+    JobStore(client.jobs_root).save_edl(job_id, edl)
+
+    resp = client.get(f"/jobs/{job_id}/edl")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["music"] == "sunrise"
+    assert body["clips"][0]["src_start"] == 1.0
+    assert body["clips"][0]["speed_multiplier"] == 0.4
+    # Round-trips back through the schema (so the UI can POST it to /tweak as-is).
+    assert EditDecisionList.model_validate(body).clips[0].src_end == 5.0
+
+
+def test_get_edl_before_compose_is_404(client: TestClient) -> None:
+    job_id = _create(client)  # no edl.json written yet
+    assert client.get(f"/jobs/{job_id}/edl").status_code == 404
+
+
+def test_get_edl_unknown_job_is_404(client: TestClient) -> None:
+    assert client.get("/jobs/does-not-exist/edl").status_code == 404
+
+
+# --------------------------------------------------------------------------- #
 # Preview
 # --------------------------------------------------------------------------- #
 
@@ -267,6 +300,6 @@ def test_openapi_documents_all_endpoints(client: TestClient) -> None:
     spec = client.get("/openapi.json").json()
     paths = spec["paths"]
     assert {"/jobs", "/jobs/{job_id}", "/jobs/{job_id}/upload",
-            "/jobs/{job_id}/approve", "/jobs/{job_id}/reject",
+            "/jobs/{job_id}/edl", "/jobs/{job_id}/approve", "/jobs/{job_id}/reject",
             "/jobs/{job_id}/tweak", "/jobs/{job_id}/preview"} <= set(paths)
     assert spec["info"]["title"] == "SkydiveOS Auto-Edit API"

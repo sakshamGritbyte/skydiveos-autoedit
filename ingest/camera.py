@@ -20,6 +20,7 @@ is exercised without hardware.
 
 from __future__ import annotations
 
+import shutil
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -142,13 +143,25 @@ def _load_sdk() -> Any:
     try:
         from open_gopro import WirelessGoPro
     except ImportError as e:
-        raise CameraError(
-            "The Open GoPro SDK ('open_gopro') is not installed. It is an "
-            "optional, hardware-only dependency. Install it from the vendored copy:\n"
-            "  uv pip install "
-            "./vendor/OpenGoPro/demos/python/sdk_wireless_camera_control"
-        ) from e
+        raise CameraError(_SDK_MISSING) from e
     return WirelessGoPro
+
+
+def _load_wired_sdk() -> Any:
+    """Import and return the SDK's ``WiredGoPro`` (USB) class, or raise CameraError."""
+    try:
+        from open_gopro import WiredGoPro
+    except ImportError as e:
+        raise CameraError(_SDK_MISSING) from e
+    return WiredGoPro
+
+
+#: Shared "install the SDK" message for the wireless and wired loaders.
+_SDK_MISSING = (
+    "The Open GoPro SDK ('open_gopro') is not installed. It is an optional, "
+    "hardware-only dependency. Install it from the vendored copy:\n"
+    "  uv pip install ./vendor/OpenGoPro/demos/python/sdk_wireless_camera_control"
+)
 
 
 def _downloaded_path(resp: Any, dest: Path) -> Path:
@@ -157,30 +170,24 @@ def _downloaded_path(resp: Any, dest: Path) -> Path:
     return Path(resp.data) if resp.data else dest
 
 
-class GoProCamera(Camera):
-    """:class:`Camera` backed by a real GoPro via the Open GoPro SDK."""
+class _SdkGoProCamera(Camera):
+    """Shared base for SDK-backed cameras: list + download over the GoPro HTTP API.
 
-    def __init__(
-        self,
-        camera_id: str | None = None,
-        *,
-        wifi_interface: str | None = None,
-        sudo_password: str | None = None,
-    ) -> None:
-        self.camera_id = camera_id
-        self._wifi_interface = wifi_interface
-        self._sudo_password = sudo_password
+    The wireless (BLE+WiFi) and wired (USB) transports differ only in how the SDK
+    handle is created; once open, ``http_command`` (media list / download / thumbnail)
+    is identical. Subclasses implement :meth:`_make_gopro` to build the concrete
+    handle; everything else lives here.
+    """
+
+    def __init__(self) -> None:
         self._gopro: Any | None = None
 
+    def _make_gopro(self) -> Any:
+        """Build (but don't open) the concrete SDK handle. Implemented per transport."""
+        raise NotImplementedError
+
     async def open(self) -> None:
-        sdk = _load_sdk()
-        # Default interfaces are BLE + WIFI_AP, so open() both pairs over BLE and
-        # joins the camera's WiFi access point in one step.
-        self._gopro = sdk(
-            target=self.camera_id,
-            host_wifi_interface=self._wifi_interface,
-            host_sudo_password=self._sudo_password,
-        )
+        self._gopro = self._make_gopro()
         await self._gopro.open()
 
     async def close(self) -> None:
@@ -190,7 +197,7 @@ class GoProCamera(Camera):
 
     def _require_open(self) -> Any:
         if self._gopro is None:
-            raise CameraError("camera not open; use 'async with GoProCamera(...) as cam:'")
+            raise CameraError("camera not open; use 'async with <Camera>(...) as cam:'")
         return self._gopro
 
     async def list_videos(self) -> list[RemoteMedia]:
@@ -224,6 +231,110 @@ class GoProCamera(Camera):
             camera_file=media.camera_path, local_file=dest
         )
         return _downloaded_path(resp, dest)
+
+
+class GoProCamera(_SdkGoProCamera):
+    """:class:`Camera` backed by a real GoPro over BLE + WiFi (the wireless pull)."""
+
+    def __init__(
+        self,
+        camera_id: str | None = None,
+        *,
+        wifi_interface: str | None = None,
+        sudo_password: str | None = None,
+    ) -> None:
+        super().__init__()
+        self.camera_id = camera_id
+        self._wifi_interface = wifi_interface
+        self._sudo_password = sudo_password
+
+    def _make_gopro(self) -> Any:
+        sdk = _load_sdk()
+        # Default interfaces are BLE + WIFI_AP, so open() both pairs over BLE and
+        # joins the camera's WiFi access point in one step.
+        return sdk(
+            target=self.camera_id,
+            host_wifi_interface=self._wifi_interface,
+            host_sudo_password=self._sudo_password,
+        )
+
+
+class WiredGoProCamera(_SdkGoProCamera):
+    """:class:`Camera` backed by a real GoPro over **USB** (the kiosk pull).
+
+    Uses the SDK's :class:`~open_gopro.WiredGoPro`, which talks the same HTTP API over
+    the camera's USB-ethernet interface — so all listing/downloading is inherited from
+    :class:`_SdkGoProCamera`. ``camera_id`` is the (at least last 3 digits of the)
+    serial; ``None`` lets the SDK pick the first GoPro it finds over USB via mDNS.
+    """
+
+    def __init__(self, camera_id: str | None = None) -> None:
+        super().__init__()
+        self.camera_id = camera_id
+
+    def _make_gopro(self) -> Any:
+        wired = _load_wired_sdk()
+        return wired(serial=self.camera_id)
+
+
+class LocalSampleCamera(Camera):
+    """A no-hardware :class:`Camera` for dev/demo: "downloads" by copying a local file.
+
+    Lets auto-discovery and the whole pull path be exercised end-to-end without a
+    GoPro (used by the ``CAMERA_SCANNER=static`` simulation mode in :mod:`api.app`).
+    It reports a single synthetic recording and, on download, copies a configured
+    sample MP4 — reusing it as the LRV proxy — and writes a placeholder thumbnail, so
+    the real storage layout, manifest, idempotency, and ``ready_for_processing`` event
+    all run against actual files. The fixed filename keeps the derived job id stable,
+    so repeated pulls are idempotent (a re-pull is skipped, no duplicate job).
+    """
+
+    #: A minimal valid JPEG (SOI + EOI) for the placeholder thumbnail.
+    _PLACEHOLDER_JPEG = b"\xff\xd8\xff\xd9"
+
+    def __init__(
+        self,
+        sample_mp4: str | Path,
+        *,
+        filename: str = "GX010001.MP4",
+        created_epoch: float | None = None,
+    ) -> None:
+        self._sample = Path(sample_mp4)
+        self._filename = filename
+        self._created_epoch = created_epoch
+
+    async def open(self) -> None:
+        if not self._sample.is_file():
+            raise CameraError(
+                f"LocalSampleCamera sample file not found: {self._sample} "
+                "(set DISCOVERY_SAMPLE_MP4 to an existing MP4)"
+            )
+
+    async def close(self) -> None:
+        return None
+
+    async def list_videos(self) -> list[RemoteMedia]:
+        return [
+            RemoteMedia(
+                camera_path=f"100GOPRO/{self._filename}",
+                created_epoch=self._created_epoch,
+                size=self._sample.stat().st_size,
+                has_lrv=True,
+            )
+        ]
+
+    async def download_mp4(self, media: RemoteMedia, dest: Path) -> Path:
+        shutil.copyfile(self._sample, dest)
+        return dest
+
+    async def download_lrv(self, media: RemoteMedia, dest: Path) -> Path:
+        # Reuse the sample as its own proxy — good enough for a no-hardware demo.
+        shutil.copyfile(self._sample, dest)
+        return dest
+
+    async def download_thumbnail(self, media: RemoteMedia, dest: Path) -> Path:
+        dest.write_bytes(self._PLACEHOLDER_JPEG)
+        return dest
 
 
 async def pair(

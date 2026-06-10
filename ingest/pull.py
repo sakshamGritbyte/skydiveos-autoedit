@@ -200,6 +200,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--queue", default=None, help="Redis queue name to emit onto")
     parser.add_argument("--pair", action="store_true", help="one-time BLE pairing, then exit")
     parser.add_argument(
+        "--name", default=None, help="friendly name to record for the camera when pairing"
+    )
+    parser.add_argument(
+        "--instructor-id",
+        default=None,
+        help="instructor (SkydiveOS account) to own this camera; its auto-pulled jobs inherit it",
+    )
+    parser.add_argument(
         "--list", action="store_true", help="list card contents and exit (no download)"
     )
     parser.add_argument("--wifi-interface", default=None, help="host WiFi interface for the SDK")
@@ -222,7 +230,19 @@ def main(argv: list[str] | None = None) -> int:
             asyncio.run(
                 pair(args.camera, wifi_interface=args.wifi_interface, sudo_password=args.password)
             )
-            print(f"Paired with camera {args.camera}.")
+            # Record the pairing so auto-discovery knows this camera is ours. Imported
+            # here so a normal pull never pulls in the registry / Mongo driver.
+            from .registry import CameraRegistry
+
+            registry = CameraRegistry()
+            registry.upsert_paired(
+                args.camera, name=args.name, instructor_id=args.instructor_id
+            )
+            where = "registered for auto-discovery" if registry.enabled else (
+                "not registered (MONGO_URL unset)"
+            )
+            registry.close()
+            print(f"Paired with camera {args.camera}. ({where})")
             return 0
 
         if args.list:

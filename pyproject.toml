@@ -14,6 +14,9 @@ dependencies = [
     "numpy>=1.24.0",
     "opencv-python>=4.9.0",
     "pydantic>=2.0.0",
+    "pymongo>=4.6.0",
+    # dnspython is required by pymongo to resolve mongodb+srv:// connection URLs.
+    "dnspython>=2.6.0",
     "python-multipart>=0.0.9",
     "redis>=5.0.0",
     "uvicorn[standard]>=0.30.0",
@@ -55,6 +58,18 @@ exclude = ["vendor/"]
 # treat it as untyped rather than erroring on the missing import.
 [[tool.mypy.overrides]]
 module = "open_gopro.*"
+ignore_missing_imports = true
+
+# bleak (the BLE backend) is hardware-only and imported lazily by the camera
+# discovery scanner (see ingest/scanner.py); not installed in CI.
+[[tool.mypy.overrides]]
+module = "bleak.*"
+ignore_missing_imports = true
+
+# boto3 ships no type stubs / py.typed marker; the discovery uploader imports it
+# lazily to PUT pulled masters to S3 (see ingest/discovery.py).
+[[tool.mypy.overrides]]
+module = "boto3.*"
 ignore_missing_imports = true
 
 # MediaPipe ships no type stubs / py.typed marker; /analysis imports it lazily.

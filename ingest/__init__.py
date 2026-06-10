@@ -16,7 +16,17 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from .camera import Camera, CameraError, GoProCamera, RemoteMedia, lrv_camera_path, pair
+from .camera import (
+    Camera,
+    CameraError,
+    GoProCamera,
+    LocalSampleCamera,
+    RemoteMedia,
+    WiredGoProCamera,
+    lrv_camera_path,
+    pair,
+)
+from .discovery import CameraDiscoveryService
 from .events import (
     EVENT_NAME,
     EventEmitter,
@@ -24,6 +34,13 @@ from .events import (
     RedisEventEmitter,
     build_event,
     default_emitter,
+)
+from .registry import CameraRecord, CameraRegistry
+from .scanner import (
+    BleCameraScanner,
+    CameraScanner,
+    StaticCameraScanner,
+    UsbCameraScanner,
 )
 from .storage import destination, is_complete, jump_dir, storage_root, write_manifest
 
@@ -45,6 +62,7 @@ __all__ = [
     "Camera",
     "CameraError",
     "GoProCamera",
+    "LocalSampleCamera",
     "RemoteMedia",
     "lrv_camera_path",
     "pair",
@@ -61,4 +79,12 @@ __all__ = [
     "destination",
     "is_complete",
     "write_manifest",
+    "CameraRegistry",
+    "CameraRecord",
+    "CameraScanner",
+    "BleCameraScanner",
+    "StaticCameraScanner",
+    "UsbCameraScanner",
+    "WiredGoProCamera",
+    "CameraDiscoveryService",
 ]

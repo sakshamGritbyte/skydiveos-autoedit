@@ -1,6 +1,11 @@
 sample-data
 raw-storage
 
+# Local secrets / machine-specific runtime configuration.
+.env
+.env.*
+!.env.example
+
 # Rendered job artifacts (final.mp4 etc). The persisted EDL is the durable
 # record; rendered video is a reproducible output, not source. See /render and
 # edl.storage for the <jobs_root>/{job_id}/ layout.

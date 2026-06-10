@@ -128,6 +128,32 @@ def process_job(job_id: str) -> str:
     return job_id
 
 
+@celery_app.task(name="api.process_selfie_package")
+def process_selfie_package(job_id: str) -> str:
+    """Run the multi-clip scene pipeline for a jump (CLAUDE.md stages 2–5).
+
+    Classifies the raw GoPro clips into scenes and scores them, then emits the
+    deliverables the job's package asks for: the three videos and/or the photo set
+    (selfie → both, video_only → videos, photo_only → photos). Leaves the job
+    ``ready`` with its ``outputs`` populated. On any failure (including a
+    low-confidence scene classification) the job is marked ``failed`` with the error,
+    never left stuck in ``processing``.
+    """
+    store = _store()
+    try:
+        _ensure_repo_on_path()
+        from .selfie import run_selfie_pipeline
+
+        run_selfie_pipeline(job_id, store=store, jobs_root=get_settings().jobs_root)
+    except Exception as e:  # noqa: BLE001 - surface failures as a job status, then re-raise
+        logger.exception("selfie processing failed for job %s", job_id)
+        store.update(job_id, status=JobStatus.failed, error=str(e))
+        raise
+
+    _notify_skydiveos(store.load(job_id))
+    return job_id
+
+
 @celery_app.task(name="api.rerender_job")
 def rerender_job(job_id: str) -> str:
     """Re-render a job from its persisted (instructor-tweaked) EDL.

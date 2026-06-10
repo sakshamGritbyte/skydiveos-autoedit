@@ -22,6 +22,10 @@ class JobQueue(Protocol):
         """Queue the full edit pipeline for a freshly-sourced job."""
         ...
 
+    def enqueue_selfie_processing(self, job_id: str) -> None:
+        """Queue the multi-clip selfie-package scene pipeline for a job."""
+        ...
+
     def enqueue_rerender(self, job_id: str) -> None:
         """Queue a re-render of an already-tweaked job's persisted EDL."""
         ...
@@ -42,6 +46,11 @@ class CeleryJobQueue:
         from .tasks import process_job
 
         process_job.delay(job_id)
+
+    def enqueue_selfie_processing(self, job_id: str) -> None:
+        from .tasks import process_selfie_package
+
+        process_selfie_package.delay(job_id)
 
     def enqueue_rerender(self, job_id: str) -> None:
         from .tasks import rerender_job

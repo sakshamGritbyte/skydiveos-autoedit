@@ -1,0 +1,19 @@
+# Keep the build context (and image) small + never bake secrets/artifacts in.
+.git
+.gitignore
+.env
+.venv
+**/__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+# Local job artifacts (raw footage, renders) — never ship these in the image.
+jobs/
+# Hardware-only Open GoPro SDK: needed only for live camera pulls, not for the
+# cloud worker (which processes uploaded footage). Excluding it keeps the image lean.
+vendor/
+# Review UI build artifacts / node deps.
+review-ui/node_modules
+review-ui/dist
+node_modules

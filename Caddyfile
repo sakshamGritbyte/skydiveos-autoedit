@@ -1,0 +1,17 @@
+# Optional HTTPS front for the API. Point your domain's A-record at the VM first,
+# replace the placeholder, and add this `caddy` service to docker-compose.yml:
+#
+#   caddy:
+#     image: caddy:2-alpine
+#     ports: ["80:80", "443:443"]
+#     volumes:
+#       - ./Caddyfile:/etc/caddy/Caddyfile
+#       - caddy_data:/data
+#     depends_on: [api]
+#     restart: unless-stopped
+#
+# ...and add `caddy_data:` under the top-level `volumes:` key. Caddy auto-provisions TLS.
+
+your-domain.example.com {
+    reverse_proxy api:8000
+}

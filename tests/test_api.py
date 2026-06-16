@@ -480,6 +480,41 @@ def test_upload_non_mp4_is_422(client: TestClient, queue: FakeQueue) -> None:
     assert queue.calls == []  # nothing enqueued on a rejected upload
 
 
+def test_upload_accepts_mp4_with_lrv_proxy(client: TestClient, queue: FakeQueue) -> None:
+    # An LRV proxy may be uploaded beside its MP4; both are staged in raw/, and the
+    # job's source_path stays the MP4 master (the LRV is analysis-only).
+    job_id = _create(client)
+    resp = client.post(
+        f"/jobs/{job_id}/upload",
+        files=[
+            ("files", ("GX010001.MP4", b"master", "video/mp4")),
+            # LRV deliberately sent with a video/mp4 MIME — it must still be treated as
+            # a proxy (extension wins), never as the renderable master.
+            ("files", ("GL010001.LRV", b"proxy", "video/mp4")),
+        ],
+    )
+    assert resp.status_code == 200
+    assert resp.json()["files_received"] == 2
+    assert queue.kinds() == ["selfie"]
+
+    raw_dir = job_dir(job_id, client.jobs_root) / "raw"
+    assert {p.name for p in raw_dir.iterdir()} == {"GX010001.MP4", "GL010001.LRV"}
+    # source_path is the MP4 master, never the LRV proxy.
+    job = json.loads((job_dir(job_id, client.jobs_root) / "job.json").read_text())
+    assert job["source_path"].endswith("GX010001.MP4")
+
+
+def test_upload_lrv_only_is_422(client: TestClient, queue: FakeQueue) -> None:
+    # A proxy alone cannot be rendered/delivered — reject with a clear message.
+    job_id = _create(client)
+    resp = client.post(
+        f"/jobs/{job_id}/upload",
+        files=[("files", ("GL010001.LRV", b"proxy", "video/mp4"))],
+    )
+    assert resp.status_code == 422
+    assert queue.calls == []
+
+
 def test_upload_unknown_job_is_404(client: TestClient) -> None:
     resp = client.post(
         "/jobs/does-not-exist/upload",

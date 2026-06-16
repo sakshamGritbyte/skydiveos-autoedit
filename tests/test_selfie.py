@@ -762,22 +762,22 @@ def test_detect_deploy_offset_finds_opening_shock(monkeypatch: pytest.MonkeyPatc
     assert selfie.detect_deploy_offset(["/x/freefall.mp4"]) == 0.0
 
 
-def test_detect_deploy_ignores_freefall_buffeting(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Real tandem: violent buffeting/maneuver spikes pepper the whole freefall, then the
-    # actual opening comes late and the ride settles. The opening is the LAST sustained
-    # shock (t=20), NOT the first mid-freefall spike (t=7) — picking the first truncates
-    # the freefall to a few seconds (the bug that hid the real freefall).
+def test_detect_deploy_picks_strongest_shock(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Real tandem: the canopy opening is the HARDEST deceleration of the jump (the snap),
+    # stronger than mid-freefall buffets before it and any canopy maneuver after it.
+    # Pick the strongest sustained shock (t=19) — not the first (would truncate freefall
+    # to a mid-air buffet) nor the last (would land on a late canopy maneuver).
     g = (
-        [1.0] * 7          # 0-6: post-exit, settling toward terminal
-        + [3.0, 3.0]       # 7-8: maneuver buffet (NOT the deploy)
-        + [1.0] * 4        # 9-12
-        + [2.5, 2.5]       # 13-14: another buffet
-        + [1.0] * 5        # 15-19
-        + [2.2, 2.0]       # 20-21: the real canopy opening (last sustained shock)
-        + [1.0] * 3        # 22-24: calm canopy ride
+        [1.0] * 7          # 0-6: post-exit freefall, settling toward terminal
+        + [2.2, 2.0]       # 7-8: a freefall buffet (weaker than the opening)
+        + [1.0] * 10       # 9-18: more freefall
+        + [4.0, 3.5]       # 19-20: the canopy opening — the strongest shock
+        + [1.0] * 4        # 21-24: settling under canopy
+        + [2.1, 2.0]       # 25-26: a later canopy maneuver (weaker)
+        + [1.0] * 3        # 27-29: calm canopy ride
     )
     monkeypatch.setattr("metadata.gpmf.parse_gpmf", lambda p: _fake_gpmf(g))
-    assert selfie.detect_deploy_offset(["/x/freefall.mp4"]) == 20.0
+    assert selfie.detect_deploy_offset(["/x/freefall.mp4"]) == 19.0
 
 
 def test_canopy_opening_detected_inside_freefall_scene() -> None:

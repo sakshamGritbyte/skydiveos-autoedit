@@ -166,11 +166,27 @@ def enforce_job_ownership(
 
 
 def _is_mp4(file: UploadFile) -> bool:
-    """Whether an uploaded file is an MP4, by extension or declared content type."""
+    """Whether an uploaded file is a (renderable) MP4 master, by extension or MIME.
+
+    An ``.lrv`` proxy shares the MP4 container and may arrive with a ``video/mp4`` MIME,
+    so it's excluded explicitly here — a proxy is never a render/source master.
+    """
     name = (file.filename or "").lower()
+    if name.endswith(".lrv"):
+        return False
     if name.endswith(".mp4"):
         return True
     return file.content_type in {"video/mp4", "application/mp4"}
+
+
+def _is_lrv(file: UploadFile) -> bool:
+    """Whether an uploaded file is a GoPro LRV proxy (by extension).
+
+    Staged alongside its MP4 so the analysis stages can use it when
+    ``USE_PROXY_ANALYSIS`` is enabled (see :mod:`analysis.proxy`); never used for
+    rendering, photos, or as a job's ``source_path``.
+    """
+    return (file.filename or "").lower().endswith(".lrv")
 
 
 def _is_safe_segment(name: str) -> bool:
@@ -530,11 +546,18 @@ def create_app() -> FastAPI:
 
         if uploaded:
             for f in uploaded:
-                if not _is_mp4(f):
+                if not (_is_mp4(f) or _is_lrv(f)):
                     raise HTTPException(
                         status_code=422,
-                        detail=f"not an MP4 file: {f.filename!r}",
+                        detail=f"unsupported file (expected .mp4 or .lrv): {f.filename!r}",
                     )
+            # An LRV proxy is analysis-only; a job needs at least one MP4 master to
+            # render and deliver. Reject an LRV-only upload with a clear message.
+            if not any(_is_mp4(f) for f in uploaded):
+                raise HTTPException(
+                    status_code=422,
+                    detail="at least one .mp4 is required (an .lrv proxy alone cannot be rendered)",
+                )
 
             if job.package.is_ultimum:
                 return await _upload_ultimum(job, store, queue, uploaded, camera_role)
@@ -561,8 +584,10 @@ def create_app() -> FastAPI:
             )
 
             # The non-selfie pipelines still cut from a single ``source_path``; point
-            # them at the first uploaded clip so they keep working unchanged.
-            first_path = str(raw_dir / Path(uploaded[0].filename or "clip.mp4").name)
+            # them at the first uploaded MP4 (never an LRV proxy) so they keep working
+            # unchanged. Staged LRVs sit beside their MP4 for analysis to discover.
+            first_mp4 = next(f for f in uploaded if _is_mp4(f))
+            first_path = str(raw_dir / Path(first_mp4.filename or "clip.mp4").name)
             store.update(
                 job_id, source_path=first_path, status=JobStatus.queued, error=None
             )

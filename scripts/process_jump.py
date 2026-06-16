@@ -209,7 +209,11 @@ def process_jump(
     if edl_path is not None:
         edl = load_edl_from(edl_path)
     else:
-        timeline = extract_metadata(source)
+        # Segment off the analysis source (a validated LRV proxy when enabled+available,
+        # else the master itself). The render below always cuts from ``source`` (MP4).
+        from analysis.proxy import analysis_source
+
+        timeline = extract_metadata(analysis_source(source))
         edl = house_cut(
             timeline,
             source_duration=_probe_duration(source),

@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from analysis.proxy import analysis_source
 from edl.storage import job_dir
 
 if TYPE_CHECKING:  # types used only for annotation, never imported at runtime
@@ -217,6 +218,20 @@ class FileSignals:
     duration: float
     gpmf: GpmfSignals
     recorded_at: float = 0.0  # MP4 creation time (epoch seconds); 0 when unknown
+    #: File the *analysis* stages read for this clip — a validated LRV proxy when
+    #: ``USE_PROXY_ANALYSIS`` is on and one is available, else the MP4 (== ``path``).
+    #: Resolved in :func:`build_file_signals`. Render/photos always use ``path``.
+    analysis_path: str = ""
+
+    @property
+    def analysis_src(self) -> str:
+        """The file analysis reads (the resolved proxy, else the MP4 ``path``)."""
+        return self.analysis_path or self.path
+
+    @property
+    def has_proxy(self) -> bool:
+        """Whether a distinct (LRV) analysis source was resolved for this clip."""
+        return bool(self.analysis_path) and self.analysis_path != self.path
 
 
 def _natural_key(name: str) -> list[tuple[int, object]]:
@@ -274,16 +289,23 @@ _G = 9.80665
 
 # Exit detection: a GoPro freefall clip often starts inside the plane / at the door,
 # so the real exit is where proper acceleration collapses toward 0 g (weightless).
-_EXIT_DIP_G = 0.78    # sustained sub-g reading that marks the exit
+_EXIT_DIP_G = 0.78    # sustained sub-g reading that marks the exit (stable belly exit)
 _EXIT_PLANE_G = 0.85  # steady ~1 g that must precede the dip (we were in the plane)
+#: A near-0 g sample *inside* a payload — the weightless exit instant. A tumbling tandem
+#: keeps a ~1 g payload MEAN at the exit (drogue + rotation), so its jump shows only in
+#: the per-payload MINIMUM, not the mean; a stable exit dips the mean too. We accept
+#: either so both exit styles are detected.
+_EXIT_WEIGHTLESS_G = 0.25
 
 
 def detect_exit_offset(mp4_path: str | Path) -> float:
     """Seconds into a freefall clip where the aircraft exit happens (seam; mocked).
 
-    Finds the first sustained sub-g collapse after steady ~1 g — the moment the jumper
-    leaves the aircraft and goes weightless. Returns ``0.0`` when there is no clear dip
-    (the clip already starts in freefall, or carries no usable accelerometer).
+    Finds the first moment of weightlessness after steady ~1 g flight — the jumper
+    leaving the aircraft. Two signatures, either of which counts: the payload MEAN
+    collapsing below ~1 g (a stable belly exit) *or* a near-0 g MIN sample within the
+    payload (a tumbling tandem, whose mean stays ~1 g). Returns ``0.0`` when neither is
+    seen (the clip already starts in freefall, or carries no usable accelerometer).
     """
     try:
         from metadata.gpmf import parse_gpmf
@@ -296,12 +318,14 @@ def detect_exit_offset(mp4_path: str | Path) -> float:
     if accl is None:
         return 0.0
     means: list[float] = []
+    mins: list[float] = []
     times: list[float] = []
     for samples, t in zip(accl.payloads, accl.times, strict=False):
         if not samples:
             continue
         mags = [math.sqrt(sum(c * c for c in s[:3])) / _G for s in samples]
         means.append(statistics.fmean(mags))
+        mins.append(min(mags))
         times.append(t)
 
     if len(means) < 5:
@@ -309,7 +333,11 @@ def detect_exit_offset(mp4_path: str | Path) -> float:
     for i in range(2, len(means) - 1):
         recent = means[max(0, i - 3):i]
         was_plane = bool(recent) and statistics.fmean(recent) > _EXIT_PLANE_G
-        if was_plane and means[i] < _EXIT_DIP_G and means[i + 1] < _EXIT_DIP_G + 0.1:
+        if not was_plane:
+            continue
+        mean_dip = means[i] < _EXIT_DIP_G and means[i + 1] < _EXIT_DIP_G + 0.1
+        weightless = mins[i] < _EXIT_WEIGHTLESS_G
+        if mean_dip or weightless:
             return round(times[i], 2)
     return 0.0
 
@@ -348,29 +376,34 @@ def detect_deploy_offset(mp4_paths: Sequence[str | Path]) -> float:
     """Seconds into the freefall scene where the canopy opens (seam; mocked in tests).
 
     When a GoPro clip runs from exit straight through the canopy ride, the deployment
-    lives *inside* the freefall scene; this finds the opening shock (a sustained high-g
-    reading) so the canopy-opening beat can still be featured. ``0.0`` if none is found.
+    lives *inside* the freefall scene; this finds the opening shock so the canopy-opening
+    beat can still be featured. ``0.0`` if no opening shock is found.
 
-    Tandem freefall buffets violently — drogue dynamics and instructor maneuvers throw
-    repeated >2 g spikes the whole way down — so the *first* high-g reading is almost
-    never the opening. The canopy opening is the **last** sustained shock: after it, the
-    ride settles and never spikes that hard again. We therefore take the start of the
-    LAST run of ≥2 consecutive over-threshold samples (after the early exit region).
+    The parachute opening is the hardest deceleration of the whole jump — terminal
+    velocity bled off in a couple of seconds throws the strongest sustained g of the
+    skydive. Freefall buffeting and *later* canopy maneuvers (spirals, the landing flare)
+    also spike, but never as hard as the snap, so we take the start of the **strongest**
+    run of ≥2 consecutive over-threshold payloads — not the first (which can truncate the
+    freefall to a mid-air buffet) nor the last (which can land on a late canopy maneuver).
     """
     profile = _accel_means(list(mp4_paths))
     if len(profile) < 3:
         return 0.0
-    deploy = 0.0
+    best_start = 0.0
+    best_peak = 0.0
     i, n = 0, len(profile)
     while i < n - 1:
         t, m = profile[i]
         if t >= 5.0 and m > _DEPLOY_G and profile[i + 1][1] > _DEPLOY_G:
-            deploy = round(t, 2)
-            while i < n and profile[i][1] > _DEPLOY_G:  # skip to the end of this run
+            start, peak = t, m
+            while i < n and profile[i][1] > _DEPLOY_G:  # consume the whole run
+                peak = max(peak, profile[i][1])
                 i += 1
+            if peak > best_peak:  # the opening is the strongest shock, not the last
+                best_peak, best_start = peak, round(start, 2)
         else:
             i += 1
-    return deploy
+    return best_start
 
 
 def extract_gpmf_signals(mp4_path: str | Path) -> GpmfSignals:
@@ -440,9 +473,15 @@ def probe_duration(mp4_path: str | Path) -> float:
 
 
 def build_file_signals(mp4_path: str | Path) -> FileSignals:
-    """Assemble the classification inputs for one raw clip."""
+    """Assemble the classification inputs for one raw clip.
+
+    GPMF is read from the analysis source — a validated LRV proxy when enabled and
+    available, else the MP4 (:func:`analysis.proxy.analysis_source`). Ordering/duration
+    metadata stay on the master so the scene set the renderer cuts is unaffected.
+    """
     path = Path(mp4_path)
-    gpmf = extract_gpmf_signals(path)
+    src = analysis_source(path)  # LRV when validated+enabled, else the MP4 itself
+    gpmf = extract_gpmf_signals(src)
     return FileSignals(
         filename=path.name,
         path=str(path),
@@ -450,6 +489,7 @@ def build_file_signals(mp4_path: str | Path) -> FileSignals:
         duration=probe_duration(path),
         gpmf=gpmf,
         recorded_at=creation_time(path),
+        analysis_path=str(src),
     )
 
 
@@ -521,6 +561,75 @@ def _classify_no_gps(g: GpmfSignals, index: int, total: int) -> str:
     return "boarding"
 
 
+def _freefall_anchor_indices(signals: Sequence[FileSignals]) -> list[int]:
+    """Indices (in recording order) of clips with an unmistakable freefall accelerometer
+    signature — the anchor for GPS-less chronological classification.
+
+    Uses the same magnitude test as the GPS-less freefall rule (heavy 120 mph buffeting
+    variance, or a near-0 g exit sample) and ignores GPS, so it anchors mixed footage too.
+    """
+    return [
+        i
+        for i, s in enumerate(signals)
+        if s.gpmf.accl_mag_std > _FREEFALL_MAG_STD or s.gpmf.accl_mag_min < _FREEFALL_MAG_MIN
+    ]
+
+
+def _classify_no_gps_anchored(
+    sig: FileSignals, index: int, total: int, ff_indices: list[int]
+) -> str:
+    """GPS-less scene label using the freefall clip as a chronological anchor.
+
+    Without GPS altitude, pre-jump ground ("boarding") and post-jump ground ("canopy"/
+    landing) have overlapping accelerometer signatures, so labelling each clip in
+    isolation (:func:`_classify_no_gps`) scrambles the jump timeline once scenes are
+    emitted in fixed order. Here we anchor on the freefall clip — whose accelerometer
+    signature is unmistakable — and place every other clip by whether it was *recorded*
+    before or after it: before → intro/boarding (never canopy), the freefall span →
+    freefall, after → canopy/outro (never boarding). Recording order is reliable even
+    with no GPS, so this keeps the render chronological. Falls back to the per-clip
+    heuristic when no freefall anchor is found.
+    """
+    if not ff_indices:
+        return _classify_no_gps(sig.gpmf, index, total)
+    first_ff, last_ff = ff_indices[0], ff_indices[-1]
+    if first_ff <= index <= last_ff:
+        return "freefall"
+    if index < first_ff:
+        # Pre-jump: the opening ground interview, then boarding/plane up to the exit.
+        return "intro_interview" if index < total * 0.2 else "boarding"
+    # Post-jump (index > last_ff): the canopy ride, ending on the ground interview.
+    return "outro_interview" if index >= total * 0.8 else "canopy"
+
+
+def _assign_with_anchor(
+    signals: Sequence[FileSignals], overrides: dict[str, str], ground: float
+) -> tuple[list[tuple[str, FileSignals]], list[str]]:
+    """Label every clip, anchoring GPS-less clips to the freefall clip for chronology.
+
+    Returns ``(classified, unknown_filenames)``. An overridden clip takes its label
+    verbatim; a clip with GPS altitude uses :func:`classify_scene` unchanged; a GPS-less
+    clip uses :func:`_classify_no_gps_anchored`. Only an un-overridden GPS clip can be
+    ``"unknown"`` (the GPS-less path always resolves), so the caller's low-confidence
+    gate is unchanged for GPS footage.
+    """
+    total = len(signals)
+    ff_indices = _freefall_anchor_indices(signals)
+    classified: list[tuple[str, FileSignals]] = []
+    unknown: list[str] = []
+    for i, sig in enumerate(signals):
+        if sig.filename in overrides:
+            label = overrides[sig.filename]
+        elif sig.gpmf.has_altitude:
+            label = classify_scene(sig, i, total, ground=ground)
+            if label == "unknown":
+                unknown.append(sig.filename)
+        else:
+            label = _classify_no_gps_anchored(sig, i, total, ff_indices)
+        classified.append((label, sig))
+    return classified, unknown
+
+
 def load_scene_labels(path: str | Path) -> dict[str, str]:
     """Load optional manual scene overrides — ``{filename: scene}`` — or ``{}``.
 
@@ -570,23 +679,15 @@ def classify_files(
     overrides = load_scene_labels(labels_path or raw.parent / SCENE_LABELS_FILENAME)
 
     signals = sorted((build_file_signals(p) for p in mp4s), key=_order_key)
-    total = len(signals)
 
     # The dropzone's ground altitude = the jump's lowest GPS reading. Altitudes are
     # judged relative to it, so a dropzone at 60 m elevation isn't mistaken for "in air".
     gps_alts = [s.gpmf.altitude_mean for s in signals if s.gpmf.has_altitude]
     ground = min(gps_alts) if gps_alts else 0.0
 
-    classified: list[tuple[str, FileSignals]] = []
-    unknown: list[str] = []
-    for i, sig in enumerate(signals):
-        if sig.filename in overrides:
-            label = overrides[sig.filename]
-        else:
-            label = classify_scene(sig, i, total, ground=ground)
-            if label == "unknown":
-                unknown.append(sig.filename)
-        classified.append((label, sig))
+    # GPS-less clips are placed relative to the freefall clip (recording order is the
+    # reliable signal when there's no altitude) so the jump stays chronological.
+    classified, unknown = _assign_with_anchor(signals, overrides, ground)
 
     if len(unknown) > 2:
         raise LowConfidenceError(
@@ -625,21 +726,12 @@ def classify_camera_files(
     overrides = load_scene_labels(labels_path) if labels_path is not None else {}
 
     signals = sorted((build_file_signals(p) for p in mp4s), key=_order_key)
-    total = len(signals)
 
     gps_alts = [s.gpmf.altitude_mean for s in signals if s.gpmf.has_altitude]
     ground = min(gps_alts) if gps_alts else 0.0
 
-    classified: list[tuple[str, FileSignals]] = []
-    unknown: list[str] = []
-    for i, sig in enumerate(signals):
-        if sig.filename in overrides:
-            label = overrides[sig.filename]
-        else:
-            label = classify_scene(sig, i, total, ground=ground)
-            if label == "unknown":
-                unknown.append(sig.filename)
-        classified.append((label, sig))
+    # GPS-less clips anchored to the freefall clip so the timeline stays chronological.
+    classified, unknown = _assign_with_anchor(signals, overrides, ground)
 
     if len(unknown) > 2:
         raise LowConfidenceError(
@@ -746,6 +838,24 @@ def build_scenes(
         combined = scenes_dir / f"{label}.mp4"
         concat_scene([c.path for c in clips], combined)
 
+        # When every clip in the scene resolved to a validated LRV proxy, assemble a
+        # parallel low-res scene for the (decode-heavy) face scoring. All-or-nothing:
+        # a mixed proxy/MP4 concat would desync, so a single non-proxy clip leaves this
+        # None and scoring falls back to the MP4 ``combined_path``. Best-effort — any
+        # failure here just means scoring uses the master scene.
+        proxy_combined: Path | None = None
+        if all(c.has_proxy for c in clips):
+            try:
+                proxy_combined = concat_scene(
+                    [c.analysis_path for c in clips], scenes_dir / f"{label}.proxy.mp4"
+                )
+            except Exception as e:  # noqa: BLE001 - proxy scene is best-effort
+                logger.warning(
+                    "proxy scene build failed for %s (%r); scoring will use the MP4 scene",
+                    label, e,
+                )
+                proxy_combined = None
+
         first, last = clips[0].gpmf, clips[-1].gpmf
         needs_review = label == "unknown"
         scene: dict[str, Any] = {
@@ -764,11 +874,16 @@ def build_scenes(
                 ),
             },
         }
+        # Low-res scene the scorer reads instead of the master, when one was built.
+        # Render and photo extraction always use ``combined_path`` (the MP4).
+        if proxy_combined is not None:
+            scene["proxy_path"] = str(proxy_combined)
         if label == "freefall":
             # Where the real exit happens within the clip (it often starts in the plane)
-            # and, when the canopy ride is part of the same clip, where it opens.
-            scene["exit_offset"] = detect_exit_offset(clips[0].path)
-            scene["deploy_offset"] = detect_deploy_offset([c.path for c in clips])
+            # and, when the canopy ride is part of the same clip, where it opens. Read
+            # from the analysis source (the LRV's telemetry is identical to the master).
+            scene["exit_offset"] = detect_exit_offset(clips[0].analysis_src)
+            scene["deploy_offset"] = detect_deploy_offset([c.analysis_src for c in clips])
         scenes.append(scene)
         if needs_review:
             flagged.append(label)
@@ -819,7 +934,9 @@ def score_scenes(
     """
     scores: dict[str, list[dict[str, float]]] = {}
     for scene in manifest["scenes"]:
-        scores[scene["name"]] = score_scene(scene["combined_path"])
+        # Score the validated LRV proxy scene when one was built, else the MP4 scene.
+        # Times are identical on both, so the scores apply to the MP4 timeline as-is.
+        scores[scene["name"]] = score_scene(scene.get("proxy_path") or scene["combined_path"])
     jd = job_dir(job_id, jobs_root)
     jd.mkdir(parents=True, exist_ok=True)
     (jd / scores_name).write_text(json.dumps(scores, indent=2) + "\n")
@@ -1038,6 +1155,22 @@ def _covers(clips: Sequence[Clip], scene: str, lo: float, hi: float) -> bool:
     return any(c.scene == scene and c.src_start < hi and c.src_end > lo for c in clips)
 
 
+def _union_into(target: Sequence[Clip], extra: Sequence[Clip]) -> list[Clip]:
+    """Return ``target`` plus every window from ``extra`` it does not already cover.
+
+    Makes ``target`` a superset of ``extra``: an existing target clip wins on overlap
+    (its slow-mo / speed is preserved), and only a genuinely-missing window (same scene,
+    no overlap with anything already there) is appended. Used to keep the deliverables
+    consistent — the freefall highlight beats present in every cut, and ``full_video`` a
+    superset of the focused cuts — without ever duplicating footage.
+    """
+    out = list(target)
+    for c in extra:
+        if not _covers(out, c.scene, c.src_start, c.src_end):
+            out.append(c)
+    return out
+
+
 def _exit_offset_in(scenes: Sequence[dict[str, Any]]) -> float | None:
     """The detected exit offset within the freefall scene, or ``None`` if no freefall."""
     ff = _scene_by_name(scenes, "freefall")
@@ -1142,6 +1275,15 @@ def _ensure_story(edls: EDLResponse, manifest: dict[str, Any]) -> EDLResponse:
     full = _ensure_milestones(list(edls.full_video), scenes, exit_len=_EXIT_SEQUENCE_S)
     highs = _ensure_milestones(list(edls.highlights), scenes, exit_len=_HL_EXIT_SEQUENCE_S)
     free = _ensure_freefall_exit(list(edls.freefall), scenes)
+
+    # Cross-cut coverage (product rule): the freefall highlight beats must appear in
+    # every cut, and full_video is the COMPLETE edit — a superset of both focused cuts,
+    # so no beat that's good enough for highlights/freefall is ever missing from it.
+    #  1) the freefall cut carries every freefall beat the highlights feature, and
+    #  2) full_video unions in everything from highlights AND freefall.
+    free = _union_into(free, [c for c in highs if c.scene == "freefall"])
+    full = _union_into(_union_into(full, highs), free)
+
     return edls.model_copy(
         update={
             "full_video": _chronological(full),

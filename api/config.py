@@ -79,6 +79,12 @@ class Settings:
     s3_endpoint_url: str | None
     #: AWS region for the S3 client (``AWS_REGION`` / ``AWS_DEFAULT_REGION``).
     s3_region: str | None
+    #: Use a validated GoPro LRV proxy for the analysis stages (GPMF/segmentation/face
+    #: scoring) when available, falling back to the MP4 otherwise (``USE_PROXY_ANALYSIS``).
+    #: Off by default — analysis reads the original MP4 exactly as today. Render, photos,
+    #: thumbnails, and all deliverables always use the MP4 regardless. See
+    #: :mod:`analysis.proxy`.
+    use_proxy_analysis: bool = False
 
 
 def _flag(name: str) -> bool:
@@ -113,4 +119,5 @@ def get_settings() -> Settings:
         s3_bucket=os.environ.get("S3_BUCKET") or os.environ.get("AWS_S3_BUCKET_NAME") or None,
         s3_endpoint_url=os.environ.get("S3_ENDPOINT_URL") or None,
         s3_region=os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or None,
+        use_proxy_analysis=_flag("USE_PROXY_ANALYSIS"),
     )

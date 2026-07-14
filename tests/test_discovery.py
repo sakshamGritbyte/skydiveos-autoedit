@@ -53,14 +53,23 @@ class FakeRegistry:
         cam = self._cameras.get(camera_id)
         return cam.instructor_id if cam else None
 
-    def assign_instructor(self, camera_id: str, instructor_id: str | None) -> bool:
+    def role_for(self, camera_id: str) -> str | None:
         cam = self._cameras.get(camera_id)
+        return cam.role if cam else None
+
+    def assign_instructor(
+        self, camera_id: str, instructor_id: str | None, role: str | None = None
+    ) -> bool:
+        cam = self._cameras.get(camera_id)
+        update: dict[str, object] = {"instructor_id": instructor_id}
+        if role is not None:
+            update["role"] = role
         if cam is None:  # register-or-assign: auto-create the unknown camera
             self._cameras[camera_id] = CameraRecord(
-                camera_id=camera_id, paired_at=0.0, active=True, instructor_id=instructor_id
+                camera_id=camera_id, paired_at=0.0, active=True, **update
             )
         else:
-            self._cameras[camera_id] = cam.model_copy(update={"instructor_id": instructor_id})
+            self._cameras[camera_id] = cam.model_copy(update=update)
         return True
 
     def deactivate(self, camera_id: str) -> bool:
@@ -103,10 +112,16 @@ class _RecordingUploader:
     """Stand-in for the SkydiveOS uploader — records each hand-off instead of POSTing."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str, str | None]] = []
+        self.calls: list[tuple[str, str, str | None, str | None]] = []
 
-    def __call__(self, mp4_path: str, camera_id: str, instructor_id: str | None) -> None:
-        self.calls.append((mp4_path, camera_id, instructor_id))
+    def __call__(
+        self,
+        mp4_path: str,
+        camera_id: str,
+        instructor_id: str | None,
+        camera_role: str | None = None,
+    ) -> None:
+        self.calls.append((mp4_path, camera_id, instructor_id, camera_role))
 
 
 async def _wait_for(predicate, *, timeout: float = 3.0) -> bool:
@@ -178,7 +193,7 @@ def test_handoff_passes_camera_owner(tmp_path: Path) -> None:
         await service.stop()
 
     asyncio.run(scenario())
-    assert uploads.calls and uploads.calls[0][2] == "inst-9"  # (mp4, camera_id, instructor_id)
+    assert uploads.calls and uploads.calls[0][2] == "inst-9"  # (mp4, camera_id, instructor_id, role)
 
 
 def test_known_camera_is_pulled_and_handed_off(tmp_path: Path) -> None:
@@ -202,8 +217,33 @@ def test_known_camera_is_pulled_and_handed_off(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
     # Exactly one hand-off, with the pulled file, camera, and owning instructor.
-    assert uploads.calls == [(str(tmp_path / "GX010001.MP4"), "1234", "inst-1")]
+    assert uploads.calls == [(str(tmp_path / "GX010001.MP4"), "1234", "inst-1", None)]
     assert registry.closed is True  # stop() released the registry
+
+
+def test_camera_role_is_handed_off(tmp_path: Path) -> None:
+    """A two-camera (Ultimate) role on the camera flows through to the hand-off."""
+    uploads = _RecordingUploader()
+    registry = FakeRegistry(
+        [CameraRecord(camera_id="5678", paired_at=1.0, instructor_id="inst-2", role="external")]
+    )
+    service = CameraDiscoveryService(
+        scanner=StaticCameraScanner(["5678"]),
+        registry=registry,
+        upload=uploads,
+        pull=_make_pull(tmp_path / "GX010001.MP4"),
+        interval=0.05,
+    )
+
+    async def scenario() -> None:
+        await service.start()
+        await _wait_for(lambda: bool(uploads.calls))
+        await service.stop()
+
+    asyncio.run(scenario())
+
+    # The cameraman's "external" role is passed so SkydiveOS stages it under raw/external/.
+    assert uploads.calls == [(str(tmp_path / "GX010001.MP4"), "5678", "inst-2", "external")]
 
 
 def test_unknown_camera_is_ignored(tmp_path: Path) -> None:
@@ -367,6 +407,7 @@ def _settings(**overrides: object) -> Settings:
         camera_scanner="ble",
         discovery_fake_cameras=(),
         discovery_sample_mp4=None,
+        discovery_sample_count=1,
         enforce_instructor_auth=False,
         s3_bucket=None,
         s3_endpoint_url=None,
@@ -508,6 +549,50 @@ def test_local_sample_camera_stages_through_real_pull(tmp_path: Path) -> None:
         pull_camera("1234", camera=cam, root=tmp_path / "raw", emitter=_Capture())
     )
     assert again[0].skipped is True
+
+
+def test_local_sample_camera_reports_multiple_clips(tmp_path: Path) -> None:
+    """count>1 stages several distinct files in one pull, like a real GoPro card."""
+    sample = tmp_path / "sample.mp4"
+    sample.write_bytes(b"\x00\x11\x22\x33" * 64)
+    events: list[dict[str, object]] = []
+
+    class _Capture:
+        def emit(self, event: dict[str, object]) -> None:
+            events.append(event)
+
+    cam = LocalSampleCamera(sample, filename="GX010001.MP4", count=12)
+    jumps = asyncio.run(
+        pull_camera("1234", camera=cam, root=tmp_path / "raw", emitter=_Capture())
+    )
+
+    # Twelve distinct clips, each staged and emitted with its own incrementing name.
+    assert len(jumps) == 12
+    assert all(j.skipped is False for j in jumps)
+    job_ids = [e["job_id"] for e in events]
+    assert job_ids == [f"1234-GX0100{n:02d}" for n in range(1, 13)]
+    assert len(set(job_ids)) == 12  # no collisions
+
+
+def test_simulated_clip_count_marker_override(tmp_path: Path, monkeypatch) -> None:
+    """A per-camera marker bumps the simulated clip count (a new jump on the card)."""
+    from api.app import SIM_CLIPS_DIR, _simulated_clip_count
+
+    monkeypatch.setenv("RAW_STORAGE_ROOT", str(tmp_path))
+    settings = _settings(discovery_sample_count=12)
+
+    # No marker → the configured base count.
+    assert _simulated_clip_count(settings, "CAM1") == 12
+
+    # Marker present → it wins (operator added clips between scans).
+    marker = tmp_path / SIM_CLIPS_DIR / "CAM1"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("14")
+    assert _simulated_clip_count(settings, "CAM1") == 14
+
+    # A garbage marker is ignored, falling back to the base count (never crashes).
+    marker.write_text("oops")
+    assert _simulated_clip_count(settings, "CAM1") == 12
 
 
 # --------------------------------------------------------------------------- #

@@ -55,6 +55,10 @@ class CameraRecord(BaseModel):
     #: Instructor (SkydiveOS account) this camera belongs to. Jobs auto-pulled from
     #: it are stamped with this id, so the footage lands in that instructor's account.
     instructor_id: str | None = None
+    #: Which camera this is in a two-camera (Ultimate) jump: ``"instructor"`` (selfie
+    #: cam) or ``"external"`` (cameraman). ``None`` for a single-camera setup. Sent to
+    #: SkydiveOS as ``camera_role`` so both angles land under the right ``raw/<role>/``.
+    role: str | None = None
 
 
 class CameraRegistry:
@@ -110,14 +114,15 @@ class CameraRegistry:
         camera_id: str,
         name: str | None = None,
         instructor_id: str | None = None,
+        role: str | None = None,
     ) -> CameraRecord:
         """Record (or refresh) a successful pairing; marks the camera active.
 
         Called from the ``--pair`` flow. Refreshes ``paired_at`` and re-activates the
-        camera; only overwrites ``name``/``instructor_id`` when one is supplied (so a
-        re-pair without them keeps the existing owner). When the registry is disabled
-        this logs a warning and returns the would-be record without persisting (so
-        ``--pair`` still succeeds offline).
+        camera; only overwrites ``name``/``instructor_id``/``role`` when one is supplied
+        (so a re-pair without them keeps the existing values). When the registry is
+        disabled this logs a warning and returns the would-be record without persisting
+        (so ``--pair`` still succeeds offline).
         """
         now = self._clock()
         if not self.enabled:
@@ -127,7 +132,7 @@ class CameraRegistry:
             )
             return CameraRecord(
                 camera_id=camera_id, name=name, paired_at=now, active=True,
-                instructor_id=instructor_id,
+                instructor_id=instructor_id, role=role,
             )
 
         set_fields: dict[str, Any] = {"camera_id": camera_id, "paired_at": now, "active": True}
@@ -135,6 +140,8 @@ class CameraRegistry:
             set_fields["name"] = name
         if instructor_id is not None:
             set_fields["instructor_id"] = instructor_id
+        if role is not None:
+            set_fields["role"] = role
         coll = self._collection()
         coll.update_one({"camera_id": camera_id}, {"$set": set_fields}, upsert=True)
         return self._record(coll.find_one({"camera_id": camera_id}) or set_fields)
@@ -147,6 +154,7 @@ class CameraRegistry:
             paired_at=float(doc.get("paired_at", 0.0)),
             active=bool(doc.get("active", True)),
             instructor_id=doc.get("instructor_id"),
+            role=doc.get("role"),
         )
 
     def get(self, camera_id: str) -> CameraRecord | None:
@@ -161,22 +169,32 @@ class CameraRegistry:
         record = self.get(camera_id)
         return record.instructor_id if record else None
 
-    def assign_instructor(self, camera_id: str, instructor_id: str | None) -> bool:
-        """Set a camera's owning instructor, creating the camera if it's unknown.
+    def role_for(self, camera_id: str) -> str | None:
+        """The two-camera role of ``camera_id`` (``instructor``/``external``/``None``)."""
+        record = self.get(camera_id)
+        return record.role if record else None
+
+    def assign_instructor(
+        self, camera_id: str, instructor_id: str | None, role: str | None = None
+    ) -> bool:
+        """Set a camera's owning instructor (and optionally its role); create if unknown.
 
         Registration + assignment in one step: an unknown serial is auto-created
         (active, ``paired_at`` = now) with the given instructor, so an admin can
         register a camera straight from the UI without a separate ``--pair``. An
-        existing camera just has its ``instructor_id`` updated (other fields kept).
-        Returns ``True`` when persisted, ``False`` only when the registry is disabled
-        (``MONGO_URL`` unset).
+        existing camera just has its ``instructor_id`` (and ``role`` when supplied)
+        updated (other fields kept). Returns ``True`` when persisted, ``False`` only
+        when the registry is disabled (``MONGO_URL`` unset).
         """
         if not self.enabled:
             return False
+        set_fields: dict[str, Any] = {"instructor_id": instructor_id}
+        if role is not None:
+            set_fields["role"] = role
         self._collection().update_one(
             {"camera_id": camera_id},
             {
-                "$set": {"instructor_id": instructor_id},
+                "$set": set_fields,
                 "$setOnInsert": {
                     "camera_id": camera_id,
                     "paired_at": self._clock(),

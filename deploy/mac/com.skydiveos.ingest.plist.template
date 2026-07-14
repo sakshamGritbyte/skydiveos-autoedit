@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd service for the SkydiveOS GoPro ingest backend.
+
+  This is a TEMPLATE: __REPO_ROOT__ is substituted with the real repo path by
+  deploy/mac/load-service.sh, which writes the result to
+  ~/Library/LaunchAgents/com.skydiveos.ingest.plist and loads it.
+
+  Do not edit the installed copy by hand — re-run load-service.sh instead.
+
+  BLUETOOTH (ble mode): this runs as a LaunchAgent in the logged-in user's GUI
+  session, so the first BLE access triggers a macOS Bluetooth permission prompt
+  for the background service. Approve it (System Settings > Privacy & Security >
+  Bluetooth). The permission granted to Terminal does NOT carry over to this
+  service — until approved, the scanner runs but discovers zero cameras.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.skydiveos.ingest</string>
+
+    <!-- Run the wrapper, which cd's to the repo, fixes PATH, and starts uvicorn. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__REPO_ROOT__/deploy/mac/run.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_ROOT__</string>
+
+    <!-- Start at login and keep it alive: relaunch on crash. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Back off between rapid relaunches so a misconfig doesn't spin the CPU. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Logs: tail these to see discovery scans / pulls / errors. -->
+    <key>StandardOutPath</key>
+    <string>__REPO_ROOT__/logs/ingest.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO_ROOT__/logs/ingest.err.log</string>
+</dict>
+</plist>

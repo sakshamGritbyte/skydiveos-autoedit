@@ -208,6 +208,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="instructor (SkydiveOS account) to own this camera; its auto-pulled jobs inherit it",
     )
     parser.add_argument(
+        "--role",
+        default=None,
+        choices=["instructor", "external"],
+        help="two-camera (Ultimate) role: 'instructor' (selfie cam) or 'external' (cameraman)",
+    )
+    parser.add_argument(
         "--list", action="store_true", help="list card contents and exit (no download)"
     )
     parser.add_argument("--wifi-interface", default=None, help="host WiFi interface for the SDK")
@@ -236,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
 
             registry = CameraRegistry()
             registry.upsert_paired(
-                args.camera, name=args.name, instructor_id=args.instructor_id
+                args.camera, name=args.name, instructor_id=args.instructor_id, role=args.role
             )
             where = "registered for auto-discovery" if registry.enabled else (
                 "not registered (MONGO_URL unset)"

@@ -67,6 +67,10 @@ class Settings:
     discovery_fake_cameras: tuple[str, ...]
     #: Sample MP4 the simulation copies in place of a real download (``DISCOVERY_SAMPLE_MP4``).
     discovery_sample_mp4: str | None
+    #: How many recordings each simulated camera reports (``DISCOVERY_SAMPLE_COUNT``).
+    #: A real GoPro card holds many clips; this lets one fake camera stage several
+    #: files in one pull instead of needing one fake camera per file. Defaults to 1.
+    discovery_sample_count: int
     #: Enforce per-instructor access scoping using the identity SkydiveOS forwards
     #: (``ENFORCE_INSTRUCTOR_AUTH``). Off by default — every caller is treated as an
     #: admin, preserving the open behaviour. See :mod:`api.auth`.
@@ -115,6 +119,7 @@ def get_settings() -> Settings:
             if c.strip()
         ),
         discovery_sample_mp4=os.environ.get("DISCOVERY_SAMPLE_MP4") or None,
+        discovery_sample_count=max(1, int(os.environ.get("DISCOVERY_SAMPLE_COUNT") or 1)),
         enforce_instructor_auth=_flag("ENFORCE_INSTRUCTOR_AUTH"),
         s3_bucket=os.environ.get("S3_BUCKET") or os.environ.get("AWS_S3_BUCKET_NAME") or None,
         s3_endpoint_url=os.environ.get("S3_ENDPOINT_URL") or None,

@@ -57,9 +57,11 @@ S3_KEY_PREFIX = "raw"
 #: A coroutine that runs a pull for one camera, accepting an ``emitter=`` sink.
 #: ``ingest.pull.pull_camera`` satisfies this; tests inject a fake.
 PullFn = Callable[..., Awaitable[Any]]
-#: Hands one pulled jump to SkydiveOS: ``(mp4_path, camera_id, instructor_id) -> None``.
-#: The default (:func:`s3_notify_uploader`) PUTs to S3 then notifies; tests inject a recorder.
-UploadFn = Callable[[str, str, str | None], None]
+#: Hands one pulled jump to SkydiveOS:
+#: ``(mp4_path, camera_id, instructor_id, camera_role) -> None``. ``camera_role`` is
+#: ``instructor``/``external`` for a two-camera (Ultimate) jump, else ``None``. The
+#: default (:func:`s3_notify_uploader`) PUTs to S3 then notifies; tests inject a recorder.
+UploadFn = Callable[[str, str, str | None, str | None], None]
 
 
 def s3_notify_uploader(
@@ -94,7 +96,12 @@ def s3_notify_uploader(
             )
         return client_holder["client"]
 
-    def _upload(mp4_path: str, camera_id: str, instructor_id: str | None) -> None:
+    def _upload(
+        mp4_path: str,
+        camera_id: str,
+        instructor_id: str | None,
+        camera_role: str | None = None,
+    ) -> None:
         import httpx
 
         key = f"{key_prefix}/{camera_id}/{Path(mp4_path).name}"
@@ -103,6 +110,8 @@ def s3_notify_uploader(
         payload: dict[str, str] = {"s3_key": key, "camera_id": camera_id}
         if instructor_id is not None:
             payload["instructor_id"] = instructor_id
+        if camera_role is not None:
+            payload["camera_role"] = camera_role
         resp = httpx.post(f"{skydiveos_url.rstrip('/')}{path}", json=payload, timeout=timeout)
         resp.raise_for_status()
 
@@ -256,13 +265,20 @@ class CameraDiscoveryService:
         """
         camera_id = event["camera_id"]
         mp4 = event["files"]["mp4"]
-        # The footage lands in the account of whoever owns the camera that shot it.
+        # The footage lands in the account of whoever owns the camera that shot it;
+        # the role (instructor selfie vs external cameraman) routes the two angles of an
+        # Ultimate jump under the right raw/<role>/ on the SkydiveOS side.
         instructor_id = self._registry.instructor_for(camera_id)
+        camera_role = self._registry.role_for(camera_id)
 
-        self._upload(mp4, camera_id, instructor_id)
         logger.info(
-            "handed %s off to SkydiveOS (camera %s, instructor %s)",
-            mp4, camera_id, instructor_id,
+            "uploading %s to S3 + notifying SkydiveOS (camera %s, instructor %s, role %s) ...",
+            mp4, camera_id, instructor_id, camera_role,
+        )
+        self._upload(mp4, camera_id, instructor_id, camera_role)
+        logger.info(
+            "handed %s off to SkydiveOS (camera %s, instructor %s, role %s)",
+            mp4, camera_id, instructor_id, camera_role,
         )
 
     # --- helpers ----------------------------------------------------------- #

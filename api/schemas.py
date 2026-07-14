@@ -8,6 +8,8 @@ breaking the API (and vice versa). FastAPI renders them into the OpenAPI schema 
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from edl.schema import EditDecisionList
@@ -229,6 +231,9 @@ class AssignCameraRequest(BaseModel):
 
     #: Instructor account to own the camera (``null`` clears the assignment).
     instructor_id: str | None = Field(examples=["inst-42"])
+    #: Two-camera (Ultimate) role: ``instructor`` (selfie cam) or ``external``
+    #: (cameraman). Omit/``null`` for a single-camera setup.
+    role: Literal["instructor", "external"] | None = Field(default=None, examples=["external"])
 
 
 class RejectRequest(BaseModel):

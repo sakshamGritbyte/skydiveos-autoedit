@@ -282,11 +282,13 @@ class LocalSampleCamera(Camera):
 
     Lets auto-discovery and the whole pull path be exercised end-to-end without a
     GoPro (used by the ``CAMERA_SCANNER=static`` simulation mode in :mod:`api.app`).
-    It reports a single synthetic recording and, on download, copies a configured
-    sample MP4 — reusing it as the LRV proxy — and writes a placeholder thumbnail, so
-    the real storage layout, manifest, idempotency, and ``ready_for_processing`` event
-    all run against actual files. The fixed filename keeps the derived job id stable,
-    so repeated pulls are idempotent (a re-pull is skipped, no duplicate job).
+    It reports ``count`` synthetic recordings (a real card holds many clips) and, on
+    download, copies a configured sample MP4 — reusing it as the LRV proxy — and writes
+    a placeholder thumbnail, so the real storage layout, manifest, idempotency, and
+    ``ready_for_processing`` event all run against actual files. Filenames are derived
+    deterministically from ``filename`` (the first clip; later clips increment its
+    numeric tail), so the derived job ids are stable and repeated pulls are idempotent
+    (a re-pull is skipped, no duplicate job).
     """
 
     #: A minimal valid JPEG (SOI + EOI) for the placeholder thumbnail.
@@ -297,11 +299,31 @@ class LocalSampleCamera(Camera):
         sample_mp4: str | Path,
         *,
         filename: str = "GX010001.MP4",
+        count: int = 1,
         created_epoch: float | None = None,
     ) -> None:
         self._sample = Path(sample_mp4)
         self._filename = filename
+        self._count = max(1, count)
         self._created_epoch = created_epoch
+
+    @staticmethod
+    def _bump(filename: str, i: int) -> str:
+        """``filename`` with its trailing number advanced by ``i`` (width preserved).
+
+        ``GX010001.MP4`` + 3 → ``GX010004.MP4``. Mirrors GoPro's incrementing file
+        numbers so simulated clips get distinct, stable names like the real card.
+        """
+        stem, dot, ext = filename.rpartition(".")
+        stem = stem or filename
+        cut = len(stem)
+        while cut > 0 and stem[cut - 1].isdigit():
+            cut -= 1
+        prefix, digits = stem[:cut], stem[cut:]
+        if not digits:
+            return filename
+        bumped = f"{prefix}{int(digits) + i:0{len(digits)}d}"
+        return f"{bumped}{dot}{ext}" if dot else bumped
 
     async def open(self) -> None:
         if not self._sample.is_file():
@@ -314,13 +336,15 @@ class LocalSampleCamera(Camera):
         return None
 
     async def list_videos(self) -> list[RemoteMedia]:
+        size = self._sample.stat().st_size
         return [
             RemoteMedia(
-                camera_path=f"100GOPRO/{self._filename}",
+                camera_path=f"100GOPRO/{self._bump(self._filename, i)}",
                 created_epoch=self._created_epoch,
-                size=self._sample.stat().st_size,
+                size=size,
                 has_lrv=True,
             )
+            for i in range(self._count)
         ]
 
     async def download_mp4(self, media: RemoteMedia, dest: Path) -> Path:

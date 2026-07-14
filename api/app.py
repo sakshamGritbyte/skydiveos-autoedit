@@ -352,11 +352,43 @@ def _build_pull(settings: Settings) -> Callable[..., Awaitable[Any]] | None:
         from ingest.camera import LocalSampleCamera
         from ingest.pull import pull_camera
 
-        # A distinct filename per camera so two simulated cameras don't collide.
-        cam = LocalSampleCamera(sample, filename=f"GX0100{camera_id[-2:].zfill(2)}.MP4")
+        # A distinct filename per camera so two simulated cameras don't collide; each
+        # reports its current clip count (read fresh per pull) like a real card. Bumping
+        # the count between scans simulates a new jump landing on the same camera — the
+        # running discovery loop then picks up only the new clips on its next sweep.
+        cam = LocalSampleCamera(
+            sample,
+            filename=f"GX0100{camera_id[-2:].zfill(2)}.MP4",
+            count=_simulated_clip_count(settings, camera_id),
+        )
         return await pull_camera(camera_id, camera=cam, emitter=emitter)
 
     return _simulated_pull
+
+
+#: Per-camera override file for the simulated clip count (``scripts/sim_add_clip.py``
+#: writes it). Lives outside ``<camera_id>/`` so clearing staged footage leaves it.
+SIM_CLIPS_DIR = ".sim_clips"
+
+
+def _simulated_clip_count(settings: Settings, camera_id: str) -> int:
+    """How many clips a simulated camera reports, resolved fresh on every pull.
+
+    Defaults to ``DISCOVERY_SAMPLE_COUNT``; a per-camera marker file
+    (``<raw-storage>/.sim_clips/<camera_id>``) overrides it when present. Because this
+    is read each pull, bumping the marker (see ``scripts/sim_add_clip.py``) makes a
+    live discovery loop detect the new clips on its next scan — no restart needed.
+    """
+    from ingest.storage import storage_root
+
+    base = settings.discovery_sample_count
+    try:
+        marker = storage_root() / SIM_CLIPS_DIR / camera_id
+        if marker.is_file():
+            return max(1, int(marker.read_text().strip()))
+    except (ValueError, OSError):
+        pass
+    return base
 
 
 @asynccontextmanager
@@ -1040,7 +1072,7 @@ def create_app() -> FastAPI:
         footage lands in that account. Returns the updated camera list; 503 only if the
         registry is disabled (``MONGO_URL`` unset).
         """
-        if not registry.assign_instructor(camera_id, body.instructor_id):
+        if not registry.assign_instructor(camera_id, body.instructor_id, role=body.role):
             raise HTTPException(status_code=503, detail="camera registry is disabled")
         return _cameras_response(registry, principal)
 

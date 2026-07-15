@@ -22,6 +22,15 @@ dependencies = [
     "uvicorn[standard]>=0.30.0",
 ]
 
+[project.optional-dependencies]
+# Read-only diagnostics under /scripts (e.g. diagnose_external_scoring.py):
+# pull persisted job artifacts from S3 and plot them. Not needed by the pipeline.
+# Install with: uv pip install -e ".[diag]"
+diag = [
+    "matplotlib>=3.8",
+    "boto3>=1.34",
+]
+
 [dependency-groups]
 dev = [
     "mypy>=1.10.0",

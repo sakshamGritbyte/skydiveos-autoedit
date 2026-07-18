@@ -299,7 +299,9 @@ def _stub_scene_assembly(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(selfie, "concat_scene", fake_concat)
     monkeypatch.setattr(selfie, "detect_exit_offset", lambda src: 5.0)
-    monkeypatch.setattr(selfie, "detect_deploy_offset", lambda srcs: 40.0)
+    monkeypatch.setattr(
+        selfie, "detect_deploy_offset", lambda srcs, exit_offset=0.0: 40.0
+    )
 
 
 def test_landing_rename_and_flagged(

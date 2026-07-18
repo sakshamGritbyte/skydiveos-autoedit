@@ -357,6 +357,14 @@ _DEPLOY_CONFIRM_END_S = 8.0
 _DEPLOY_CONFIRM_MIN_TAIL_S = 4.0
 #: Tolerance (g) around ``_CANOPY_MAG_MEAN`` for the post-shock mean to read as canopy.
 _CANOPY_MAG_MEAN_TOL = 0.35
+#: Physically-plausible freefall duration (s) between the aircraft exit and the canopy
+#: opening, used to disambiguate accelerometer shock candidates when GPS altitude is
+#: absent. Typical tandem/solo jumps freefall ~45–75 s; bounded generously. Applied
+#: ONLY when ``exit_offset`` is known AND the legacy strongest-shock pick lands outside
+#: this window (i.e. the old logic locked onto a mid-freefall jolt or a post-opening
+#: canopy surge rather than the opening itself).
+_FREEFALL_MIN_S = 40.0
+_FREEFALL_MAX_S = 80.0
 
 
 def _accel_means(mp4_paths: Sequence[str | Path]) -> list[tuple[float, float]]:
@@ -417,7 +425,9 @@ def _confirms_canopy(profile: Sequence[tuple[float, float]], start: float) -> bo
     return mad < _CANOPY_MAG_STD
 
 
-def detect_deploy_offset(mp4_paths: Sequence[str | Path]) -> float:
+def detect_deploy_offset(
+    mp4_paths: Sequence[str | Path], exit_offset: float = 0.0
+) -> float:
     """Seconds into the freefall scene where the canopy opens (seam; mocked in tests).
 
     When a GoPro clip runs from exit straight through the canopy ride, the deployment
@@ -426,14 +436,20 @@ def detect_deploy_offset(mp4_paths: Sequence[str | Path]) -> float:
 
     The parachute opening throws a large, sustained deceleration, but it is **not** always
     the hardest of the jump: on tandems a mid-freefall jolt (drogue snatch, a maneuver,
-    turbulence) can out-spike the real main opening. So we collect every sustained shock
-    (≥2 consecutive over-threshold payloads) and, evaluating **strongest-first**, return
-    the first one *confirmed* by a smooth canopy signature in the seconds after it (see
-    ``_confirms_canopy``) — the buffeting continues after a false shock but not after a
-    real opening. Strongest-first keeps a genuinely-strongest opening winning while still
-    letting a strong-but-false spike be skipped for a weaker, confirmed one. If nothing
-    confirms (degraded/short GPMF, or the canopy ride runs off the end of the clip), we
-    fall back to the strongest shock — never regressing to 0.0 — and log a warning.
+    turbulence) can out-spike the real main opening, and a post-opening canopy surge or
+    toggle input can too. We collect every sustained shock (>=2 consecutive over-threshold
+    payloads).
+
+    Selection is strongest-first, confirmed by a smooth canopy signature after it
+    (``_confirms_canopy``). But on GPS-less footage the true opening's immediate aftermath
+    is itself turbulent and can *fail* confirmation, letting the search drift to a later,
+    smoother shock. So when ``exit_offset`` is known we apply a physics prior: a real
+    opening lands ``_FREEFALL_MIN_S``–``_FREEFALL_MAX_S`` after exit. **Only if the
+    strongest-first pick lands outside that window** do we re-select among in-window
+    candidates (earliest confirmed, else the earliest in-window shock). If the pick is
+    already in-window, or no ``exit_offset`` is supplied, behaviour is unchanged. If
+    nothing confirms and no prior applies we fall back to the strongest shock — never
+    regressing to 0.0 — and log a warning.
     """
     profile = _accel_means(list(mp4_paths))
     if len(profile) < 3:
@@ -452,17 +468,40 @@ def detect_deploy_offset(mp4_paths: Sequence[str | Path]) -> float:
             i += 1
     if not candidates:
         return 0.0
+
+    # Legacy pick: strongest-first, confirmation-gated (strongest shock if none confirm).
+    legacy: float | None = None
     for start, _peak in sorted(candidates, key=lambda c: c[1], reverse=True):
         if _confirms_canopy(profile, start):
-            logger.info("deploy: confirmed canopy opening at %.2fs", start)
-            return round(start, 2)
-    strongest = max(candidates, key=lambda c: c[1])[0]
-    logger.warning(
-        "deploy: no candidate confirmed a canopy signature; "
-        "falling back to strongest shock at %.2fs",
-        strongest,
-    )
-    return round(strongest, 2)
+            legacy = start
+            break
+    if legacy is None:
+        legacy = max(candidates, key=lambda c: c[1])[0]
+
+    # Physics-prior guard: only override when the legacy pick is implausibly early/late.
+    if exit_offset > 0.0:
+        lo, hi = exit_offset + _FREEFALL_MIN_S, exit_offset + _FREEFALL_MAX_S
+        in_window = sorted(s for s, _ in candidates if lo <= s <= hi)
+        if not (lo <= legacy <= hi) and in_window:
+            confirmed = [s for s in in_window if _confirms_canopy(profile, s)]
+            chosen = confirmed[0] if confirmed else in_window[0]
+            logger.info(
+                "deploy: legacy pick %.2fs outside freefall window [%.1f, %.1f]; "
+                "re-selected %.2fs (%s)",
+                legacy, lo, hi, chosen,
+                "confirmed-in-window" if confirmed else "earliest-in-window",
+            )
+            return round(chosen, 2)
+
+    if _confirms_canopy(profile, legacy):
+        logger.info("deploy: confirmed canopy opening at %.2fs", legacy)
+    else:
+        logger.warning(
+            "deploy: no candidate confirmed a canopy signature; "
+            "falling back to strongest shock at %.2fs",
+            legacy,
+        )
+    return round(legacy, 2)
 
 
 def extract_gpmf_signals(mp4_path: str | Path) -> GpmfSignals:
@@ -975,7 +1014,10 @@ def build_scenes(
             # and, when the canopy ride is part of the same clip, where it opens. Read
             # from the analysis source (the LRV's telemetry is identical to the master).
             scene["exit_offset"] = detect_exit_offset(clips[0].analysis_src)
-            scene["deploy_offset"] = detect_deploy_offset([c.analysis_src for c in clips])
+            scene["deploy_offset"] = detect_deploy_offset(
+                [c.analysis_src for c in clips],
+                exit_offset=scene["exit_offset"],
+            )
         scenes.append(scene)
         if needs_review:
             flagged.append(label)
@@ -1061,15 +1103,29 @@ Apply slow motion (speed_multiplier 0.4) only to SHORT high-value beats (~1 s ea
 never to a whole scene: the aircraft exit (at the freefall scene's exit_offset), the best
 freefall smiles, and the canopy deployment (at the freefall scene's deploy_offset).
 
-The aircraft ENTRY (boarding — walking up to and climbing into the plane, e.g. up the
-staircase) is the HEAD of the "boarding"/"plane" scene (src_start near 0). Always include
-the first few seconds of that scene as the entry milestone in full_video and highlights,
-EVEN IF its face scores are low — the jumper is usually turned away while boarding, so it
-will not show up in scored_seconds, but it is a mandatory story beat.
+The aircraft ENTRY (walking up to and climbing into the plane, e.g. up the staircase)
+is a mandatory story beat. It appears in ONE of two places depending on how the footage
+was cut:
+  (a) when a separate "boarding"/"plane" scene exists, the entry is the HEAD of that
+      scene (src_start near 0); OR
+  (b) when the interview and the walk-to-plane are one continuous clip (no distinct
+      boarding scene, or the boarding scene's head is NOT the entry), the entry is the
+      TAIL of the "intro_interview" scene — the seconds AFTER the sit-down interview
+      ends, where the jumper stands, walks to the aircraft and climbs in.
+Pick whichever location actually shows the walk-up/climb-in. Include ~3 s of it as the
+entry milestone in full_video and highlights, EVEN IF its face scores are low — the
+jumper is usually turned away while boarding, so it will not show up in scored_seconds.
+Do NOT substitute a static ground/aircraft establishing shot (e.g. a shot of the plane
+or tail with no person approaching it) for the entry — if neither location shows an
+actual walk-up/climb-in, omit the entry beat rather than inserting filler.
 
 A scene may carry "file_offsets": where each raw source file begins (seconds) inside the
-concatenated scene. The plane-entry moment is the HEAD of the FIRST source file (its
-offset), which is not always the combined scene's head — use file_offsets to target it.
+concatenated scene. When "intro_interview" has MULTIPLE source files, the sit-down
+interview is the FIRST file and the walk-to-plane / aircraft ENTRY is the SECOND file —
+target the entry at the offset where that second file begins (its file_offsets value),
+NOT at the scene head (0.0) and NOT at the first file. If there is only one source file,
+fall back to the scene TAIL as described above. Use these offsets to place the entry
+milestone precisely.
 A scene named "landing" is ground/touchdown footage (the run-out and reaction); it is the
 outro-side milestone before the outro interview — never treat it as freefall or
 canopy-ride material.
@@ -1079,9 +1135,12 @@ BOTH highlights and freefall — it begins at the freefall scene's exit_offset (
 The door / exit-prep (approaching the door, looking out) is the few seconds just BEFORE
 exit_offset (the tail of the aircraft scene when there is a separate "boarding"/"plane").
 
-Milestone-first: include every available mandatory moment BEFORE adding score-based
-filler — aircraft entry, inside the aircraft, door/exit-prep, exit/jump, freefall,
-deployment, landing, outro.
+Milestone-first: include every mandatory moment that is ACTUALLY PRESENT in the footage
+BEFORE adding score-based filler — aircraft entry, inside the aircraft, door/exit-prep,
+exit/jump, freefall, deployment, landing, outro. A milestone is "present" only if the
+footage genuinely shows it; never fabricate a milestone from an unrelated static/scenery
+shot (aerial ground, empty sky, a parked/framed aircraft with no action). When in doubt,
+prefer omitting a beat over inserting a zero-value clip.
 
 full_video:
   All present scenes in order. Trim to stay under 4 minutes. Slow-mo the exit (at
@@ -1178,18 +1237,67 @@ def _extract_json(text: str) -> str:
 _ENTRY_HEAD_S = 2.0
 
 
-def _ensure_aircraft_entry(edls: EDLResponse, manifest: dict[str, Any]) -> EDLResponse:
-    """Guarantee the aircraft-entry beat (head of the boarding/plane scene) is in the
-    full video and highlights — a deterministic backstop for the compose rules.
+def _intro_entry_clip(scenes: Sequence[dict[str, Any]]) -> Clip | None:
+    """Entry beat when the walk-to-plane is the SECOND source file of intro_interview.
 
-    Boarding the plane (walking up the staircase, climbing in) is the start of the
-    boarding scene, but it scores low (the jumper is turned away) so the model can drop
-    it. Here we inject the first few seconds of the boarding (or plane) scene when it's
-    absent — in jump order for the full video, right after the intro for highlights. A
-    no-op when the beat is already present (e.g. the offline house cut), so it's safe to
-    run on every compose.
+    Some external footage records the sit-down interview and the walk-up/climb-in as one
+    continuous take split into GoPro chapter files: file[0] = interview, file[1] = entry.
+    In that layout the entry is not a separate boarding scene (its face scores ~0 and it
+    sits mid-intro), so we target file[1]'s offset. Returns None unless intro_interview
+    exists with >=2 source files.
+    """
+    intro = _scene_by_name(scenes, "intro_interview")
+    if intro is None:
+        return None
+    offsets = intro.get("file_offsets") or []
+    if len(offsets) < 2:
+        return None
+    start = round(float(offsets[1].get("offset") or 0.0), 2)
+    if start <= 0.0:
+        return None
+    return _window(intro, start, _MILESTONE_S)
+
+
+def _ensure_aircraft_entry(edls: EDLResponse, manifest: dict[str, Any]) -> EDLResponse:
+    """Guarantee the aircraft-entry beat is in the full video and highlights — a
+    deterministic backstop for the compose rules.
+
+    Boarding the plane scores low (the jumper is turned away), so the model can drop it.
+    We inject it when absent. The entry lives in one of two layouts:
+      * a dedicated "boarding"/"plane" scene → its head; OR
+      * the SECOND source file of a multi-file "intro_interview" (interview + walk-up in
+        one continuous take) → that file's offset (see :func:`_intro_entry_clip`).
+    The intro-file layout takes precedence when present, because in that case the
+    boarding-scene head (if any) is an unrelated establishing shot, not the entry. A
+    no-op when the beat is already present (e.g. the offline house cut).
     """
     scenes = manifest.get("scenes", [])
+
+    intro_entry = _intro_entry_clip(scenes)
+    if intro_entry is not None:
+        name = intro_entry.scene            # "intro_interview"
+        anchor = intro_entry.src_start      # the second file's offset (e.g. 40.157)
+        entry = intro_entry
+
+        def _has_entry(clips: Sequence[Clip]) -> bool:
+            # entry already there if any intro clip covers the second-file region
+            return any(
+                c.scene == name and c.src_start <= anchor + 0.5 <= c.src_end
+                for c in clips
+            )
+
+        def _after_intro_head(clips: Sequence[Clip]) -> list[Clip]:
+            # place the entry after the leading intro-interview beat(s), before later scenes
+            i = 0
+            while i < len(clips) and clips[i].scene == name:
+                i += 1
+            return [*clips[:i], entry, *clips[i:]]
+
+        full = list(edls.full_video) if _has_entry(edls.full_video) else _after_intro_head(edls.full_video)
+        highs = list(edls.highlights) if _has_entry(edls.highlights) else _after_intro_head(edls.highlights)
+        return edls.model_copy(update={"full_video": full, "highlights": highs})
+
+    # --- fallback: dedicated boarding/plane scene head (original behaviour) ---
     entry_scene = _scene_by_name(scenes, "boarding") or _scene_by_name(scenes, "plane")
     if entry_scene is None:
         return edls

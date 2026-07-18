@@ -842,6 +842,59 @@ def test_deploy_candidate_too_near_eof_unconfirmed(
     assert "falling back to strongest shock" in caplog.text
 
 
+def _profile_with_shocks(
+    shocks: list[tuple[int, int, float]],
+) -> list[tuple[float, float]]:
+    """Calm ~1 g baseline (0..129 s) with sustained >_DEPLOY_G runs injected.
+    `shocks` = list of (start, end_inclusive, g)."""
+    prof: list[tuple[float, float]] = [(float(t), 1.0) for t in range(130)]
+    for start, end, g in shocks:
+        prof = [((t, g) if start <= t <= end else (t, m)) for t, m in prof]
+    return prof
+
+
+# Mirrors real job ecec7512…: shocks at 61 / 91 / 97 / 108, exit at 27.
+# Only 108 passes _confirms_canopy (smooth after); 91 is the real opening but its
+# turbulent aftermath fails confirmation. Freefall window [67, 107] excludes 61 and 108.
+_JOB_SHOCKS = [(61, 62, 1.62), (91, 92, 1.74), (97, 104, 2.84), (108, 110, 2.01)]
+
+
+def test_deploy_prior_recovers_opening_when_legacy_is_late(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prof = _profile_with_shocks(_JOB_SHOCKS)
+    monkeypatch.setattr(selfie, "_accel_means", lambda paths: prof)
+    # Only the 108 s surge confirms; the true 91 s opening does not.
+    monkeypatch.setattr(
+        selfie, "_confirms_canopy", lambda profile, start: abs(start - 108) < 0.5
+    )
+    assert selfie.detect_deploy_offset(["x.mp4"], exit_offset=27.0) == 91.0
+
+
+def test_deploy_unchanged_without_exit_offset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prof = _profile_with_shocks(_JOB_SHOCKS)
+    monkeypatch.setattr(selfie, "_accel_means", lambda paths: prof)
+    monkeypatch.setattr(
+        selfie, "_confirms_canopy", lambda profile, start: abs(start - 108) < 0.5
+    )
+    # No exit_offset → legacy strongest-confirmed shock, i.e. 108.
+    assert selfie.detect_deploy_offset(["x.mp4"]) == 108.0
+
+
+def test_deploy_prior_no_op_when_legacy_already_in_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # If the confirmed pick is already physically plausible, the prior must NOT override.
+    prof = _profile_with_shocks([(61, 62, 1.62), (91, 92, 1.74), (97, 104, 2.84)])
+    monkeypatch.setattr(selfie, "_accel_means", lambda paths: prof)
+    monkeypatch.setattr(
+        selfie, "_confirms_canopy", lambda profile, start: abs(start - 91) < 0.5
+    )
+    assert selfie.detect_deploy_offset(["x.mp4"], exit_offset=27.0) == 91.0
+
+
 def test_canopy_opening_detected_inside_freefall_scene() -> None:
     # No separate canopy scene: the canopy ride is part of the 110 s freefall clip, with
     # the opening detected at 86 s. It must still be featured as a beat, and freefall
@@ -977,6 +1030,59 @@ def test_ensure_aircraft_entry_is_noop_when_present() -> None:
     out = selfie._ensure_aircraft_entry(edls, manifest)
     assert len([c for c in out.full_video if c.scene == "boarding"]) == 1
     assert len([c for c in out.highlights if c.scene == "boarding"]) == 1
+
+
+def _intro_entry_manifest(intro_files: list[dict[str, Any]]) -> dict[str, Any]:
+    scenes = [
+        {"name": "intro_interview", "duration": 49.333, "file_offsets": intro_files},
+        {"name": "boarding", "duration": 37.237, "file_offsets": [{"file": "b.MP4", "offset": 0.0}]},
+        {"name": "freefall", "duration": 112.0},
+        {"name": "canopy", "duration": 18.0},
+    ]
+    return {"scenes": scenes}
+
+
+def test_entry_from_intro_second_file_when_multifile() -> None:
+    # Real ecec/ba38 layout: intro is interview(0.0) + walk-up(40.157).
+    m = _intro_entry_manifest(
+        [{"file": "a.MP4", "offset": 0.0}, {"file": "b.MP4", "offset": 40.157}]
+    )
+    edls = EDLResponse(
+        full_video=[Clip(scene="intro_interview", src_start=0.0, src_end=8.0),
+                    Clip(scene="freefall", src_start=27.0, src_end=30.0)],
+        highlights=[Clip(scene="intro_interview", src_start=0.0, src_end=8.0),
+                    Clip(scene="freefall", src_start=27.0, src_end=30.0)],
+        freefall=[Clip(scene="freefall", src_start=27.0, src_end=30.0)],
+    )
+    out = selfie._ensure_aircraft_entry(edls, m)
+    # entry injected from intro_interview at ~40.157, NOT boarding 0-3
+    hi_intro = [c for c in out.highlights if c.scene == "intro_interview"]
+    assert any(abs(c.src_start - 40.157) < 0.1 for c in hi_intro)
+    assert not any(c.scene == "boarding" and c.src_start == 0.0 for c in out.highlights)
+
+
+def test_entry_falls_back_to_boarding_head_when_intro_single_file() -> None:
+    m = _intro_entry_manifest([{"file": "a.MP4", "offset": 0.0}])  # single-file intro
+    edls = EDLResponse(
+        full_video=[Clip(scene="intro_interview", src_start=0.0, src_end=8.0)],
+        highlights=[Clip(scene="intro_interview", src_start=0.0, src_end=8.0)],
+        freefall=[Clip(scene="freefall", src_start=27.0, src_end=30.0)],
+    )
+    out = selfie._ensure_aircraft_entry(edls, m)
+    assert any(c.scene == "boarding" and c.src_start == 0.0 for c in out.highlights)
+
+
+def test_entry_noop_when_already_present() -> None:
+    m = _intro_entry_manifest(
+        [{"file": "a.MP4", "offset": 0.0}, {"file": "b.MP4", "offset": 40.157}]
+    )
+    edls = EDLResponse(
+        full_video=[Clip(scene="intro_interview", src_start=39.0, src_end=43.0)],
+        highlights=[Clip(scene="intro_interview", src_start=39.0, src_end=43.0)],
+        freefall=[Clip(scene="freefall", src_start=27.0, src_end=30.0)],
+    )
+    out = selfie._ensure_aircraft_entry(edls, m)
+    assert len([c for c in out.highlights if c.scene == "intro_interview"]) == 1  # no dup
 
 
 def _full_journey_manifest() -> dict[str, Any]:

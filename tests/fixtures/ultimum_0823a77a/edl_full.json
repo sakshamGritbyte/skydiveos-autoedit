@@ -1,0 +1,198 @@
+[
+  {
+    "scene": "intro_interview",
+    "src_start": 0.0,
+    "src_end": 44.139654379058236,
+    "speed_multiplier": 1.0,
+    "camera": "external"
+  },
+  {
+    "scene": "boarding",
+    "src_start": 0.0,
+    "src_end": 33.3170151848254,
+    "speed_multiplier": 1.0,
+    "camera": "external"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 0.0,
+    "src_end": 28.03,
+    "speed_multiplier": 1.0,
+    "camera": "instructor"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 0.0,
+    "src_end": 27.03,
+    "speed_multiplier": 1.0,
+    "camera": "external"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 28.03,
+    "src_end": 29.03,
+    "speed_multiplier": 0.4,
+    "camera": "instructor"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 27.03,
+    "src_end": 28.03,
+    "speed_multiplier": 0.4,
+    "camera": "external"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 29.03,
+    "src_end": 44.0,
+    "speed_multiplier": 1.0,
+    "camera": "instructor"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 28.0,
+    "src_end": 29.0,
+    "speed_multiplier": 0.4,
+    "camera": "external"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 44.0,
+    "src_end": 45.0,
+    "speed_multiplier": 0.4,
+    "camera": "instructor"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 29.0,
+    "src_end": 31.0,
+    "speed_multiplier": 1.0,
+    "camera": "external"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 45.0,
+    "src_end": 57.0,
+    "speed_multiplier": 1.0,
+    "camera": "instructor"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 31.0,
+    "src_end": 32.0,
+    "speed_multiplier": 0.4,
+    "camera": "external"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 57.0,
+    "src_end": 58.0,
+    "speed_multiplier": 0.4,
+    "camera": "instructor"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 32.0,
+    "src_end": 34.0,
+    "speed_multiplier": 1.0,
+    "camera": "external"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 58.0,
+    "src_end": 70.0,
+    "speed_multiplier": 1.0,
+    "camera": "instructor"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 34.0,
+    "src_end": 35.0,
+    "speed_multiplier": 0.4,
+    "camera": "external"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 70.0,
+    "src_end": 71.0,
+    "speed_multiplier": 0.4,
+    "camera": "instructor"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 35.0,
+    "src_end": 97.1,
+    "speed_multiplier": 1.0,
+    "camera": "external"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 71.0,
+    "src_end": 79.08,
+    "speed_multiplier": 1.0,
+    "camera": "instructor"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 97.1,
+    "src_end": 98.1,
+    "speed_multiplier": 0.4,
+    "camera": "external"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 79.08,
+    "src_end": 80.08,
+    "speed_multiplier": 0.4,
+    "camera": "instructor"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 98.1,
+    "src_end": 100.95403650493378,
+    "speed_multiplier": 1.0,
+    "camera": "external"
+  },
+  {
+    "scene": "freefall",
+    "src_start": 80.08,
+    "src_end": 94.761,
+    "speed_multiplier": 1.0,
+    "camera": "instructor"
+  },
+  {
+    "scene": "canopy",
+    "src_start": 0.0,
+    "src_end": 1.0,
+    "speed_multiplier": 0.4,
+    "camera": "instructor"
+  },
+  {
+    "scene": "canopy",
+    "src_start": 0.0,
+    "src_end": 1.0,
+    "speed_multiplier": 0.4,
+    "camera": "external"
+  },
+  {
+    "scene": "canopy",
+    "src_start": 1.0,
+    "src_end": 23.59,
+    "speed_multiplier": 1.0,
+    "camera": "instructor"
+  },
+  {
+    "scene": "canopy",
+    "src_start": 1.0,
+    "src_end": 16.10959149240759,
+    "speed_multiplier": 1.0,
+    "camera": "external"
+  },
+  {
+    "scene": "outro_interview",
+    "src_start": 0.0,
+    "src_end": 15.479702438774988,
+    "speed_multiplier": 1.0,
+    "camera": "external"
+  }
+]

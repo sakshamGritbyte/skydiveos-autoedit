@@ -1,0 +1,85 @@
+{
+  "scenes": [
+    {
+      "name": "intro_interview",
+      "source_files": [
+        "GX015165.MP4",
+        "GX015166.MP4"
+      ],
+      "combined_path": "jobs/21cdb2c510b64dceaae9d6656cbd32c0/scenes/intro_interview.mp4",
+      "duration": 50.802,
+      "needs_review": false,
+      "gpmf_signals": {
+        "altitude_mean": 0.0,
+        "altitude_delta": 0.0,
+        "accl_z_mean": 0.156
+      },
+      "proxy_path": "jobs/21cdb2c510b64dceaae9d6656cbd32c0/scenes/intro_interview.proxy.mp4"
+    },
+    {
+      "name": "boarding",
+      "source_files": [
+        "GX015167.MP4",
+        "GX015168.MP4",
+        "GX015169.MP4"
+      ],
+      "combined_path": "jobs/21cdb2c510b64dceaae9d6656cbd32c0/scenes/boarding.mp4",
+      "duration": 44.411,
+      "needs_review": false,
+      "gpmf_signals": {
+        "altitude_mean": 0.0,
+        "altitude_delta": 0.0,
+        "accl_z_mean": -0.108
+      },
+      "proxy_path": "jobs/21cdb2c510b64dceaae9d6656cbd32c0/scenes/boarding.proxy.mp4"
+    },
+    {
+      "name": "freefall",
+      "source_files": [
+        "GX015170.MP4"
+      ],
+      "combined_path": "jobs/21cdb2c510b64dceaae9d6656cbd32c0/scenes/freefall.mp4",
+      "duration": 82.549,
+      "needs_review": false,
+      "gpmf_signals": {
+        "altitude_mean": 0.0,
+        "altitude_delta": 0.0,
+        "accl_z_mean": 0.312
+      },
+      "proxy_path": "jobs/21cdb2c510b64dceaae9d6656cbd32c0/scenes/freefall.proxy.mp4",
+      "exit_offset": 25.02,
+      "deploy_offset": 75.08
+    },
+    {
+      "name": "canopy",
+      "source_files": [
+        "GX015171.MP4"
+      ],
+      "combined_path": "jobs/21cdb2c510b64dceaae9d6656cbd32c0/scenes/canopy.mp4",
+      "duration": 7.541,
+      "needs_review": false,
+      "gpmf_signals": {
+        "altitude_mean": 0.0,
+        "altitude_delta": 0.0,
+        "accl_z_mean": 2.08
+      },
+      "proxy_path": "jobs/21cdb2c510b64dceaae9d6656cbd32c0/scenes/canopy.proxy.mp4"
+    },
+    {
+      "name": "outro_interview",
+      "source_files": [
+        "GX015172.MP4"
+      ],
+      "combined_path": "jobs/21cdb2c510b64dceaae9d6656cbd32c0/scenes/outro_interview.mp4",
+      "duration": 11.144,
+      "needs_review": false,
+      "gpmf_signals": {
+        "altitude_mean": 0.0,
+        "altitude_delta": 0.0,
+        "accl_z_mean": -0.864
+      },
+      "proxy_path": "jobs/21cdb2c510b64dceaae9d6656cbd32c0/scenes/outro_interview.proxy.mp4"
+    }
+  ],
+  "flagged": []
+}

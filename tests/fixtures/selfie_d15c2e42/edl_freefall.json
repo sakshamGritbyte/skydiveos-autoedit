@@ -1,0 +1,65 @@
+[
+  {
+    "scene": "freefall",
+    "src_start": 26.0,
+    "src_end": 30.03,
+    "speed_multiplier": 1.0,
+    "camera": null
+  },
+  {
+    "scene": "freefall",
+    "src_start": 30.03,
+    "src_end": 31.03,
+    "speed_multiplier": 0.4,
+    "camera": null
+  },
+  {
+    "scene": "freefall",
+    "src_start": 31.03,
+    "src_end": 42.0,
+    "speed_multiplier": 1.0,
+    "camera": null
+  },
+  {
+    "scene": "freefall",
+    "src_start": 44.0,
+    "src_end": 47.0,
+    "speed_multiplier": 1.0,
+    "camera": null
+  },
+  {
+    "scene": "freefall",
+    "src_start": 46.0,
+    "src_end": 47.0,
+    "speed_multiplier": 0.4,
+    "camera": null
+  },
+  {
+    "scene": "freefall",
+    "src_start": 52.0,
+    "src_end": 54.0,
+    "speed_multiplier": 1.0,
+    "camera": null
+  },
+  {
+    "scene": "freefall",
+    "src_start": 53.0,
+    "src_end": 54.0,
+    "speed_multiplier": 0.4,
+    "camera": null
+  },
+  {
+    "scene": "freefall",
+    "src_start": 57.0,
+    "src_end": 59.0,
+    "speed_multiplier": 1.0,
+    "camera": null
+  },
+  {
+    "scene": "freefall",
+    "src_start": 61.06,
+    "src_end": 62.06,
+    "speed_multiplier": 0.4,
+    "camera": null
+  }
+]

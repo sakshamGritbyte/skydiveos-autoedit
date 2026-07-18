@@ -37,7 +37,12 @@ Built as a module inside SkydiveOS. Replaces our current dependency on Shred.
 1. **Ingest** — pull MP4 + LRV (proxy) + GPMF from camera via Open GoPro
 2. **Segment** — parse GPMF accelerometer/GPS → identify exit, freefall, deploy, landing timestamps
 3. **Score** — run MediaPipe on the LRV proxy *only during freefall* (saves 95% compute) to score per-second highlights (smile, eye contact, in-frame)
-4. **Compose** — send timeline + scores + customer metadata to Claude API → receive JSON EDL
+4. **Compose** — send timeline + scores + customer metadata to Claude API → receive JSON
+   EDL → `_ensure_story` (milestone/order backstop) → **deterministic post-validation
+   (`edl/validate.py:validate_and_repair`) repairs EVERY deliverable before it's
+   persisted** (freefall window `[E−8, D+3]`, mandatory deploy/boarding/intro beats,
+   dedupe, chronological order, multi-cam pacing). Repairs are logged at INFO and written
+   to `jobs/<id>/validation_report.json`.
 5. **Render** — execute EDL against full-res MP4 with FFmpeg: trim, speed ramps, intro/outro, music
 6. **Review** — instructor approves or tweaks in web UI
 7. **Deliver** — push final MP4 to customer (email link, WhatsApp, QR)
@@ -70,6 +75,33 @@ Built as a module inside SkydiveOS. Replaces our current dependency on Shred.
   file's real duration so the video/audio streams can't desync (frozen frame, audio
   continues). Photo selection has a `backfill` mode: when faces aren't detected (distant
   footage scores 0), it ranks all frames by image quality so the set still reaches ~50.
+- **Deterministic EDL validation** (`edl/validate.py:validate_and_repair`): the compose
+  output (Claude *or* the house cut) is UNTRUSTED — on real jobs it dropped the
+  deployment beat, bled landing footage into freefall cuts, skipped the plane-entry and
+  the highlights intro, and produced duplicate / ping-ponging multi-cam interleaves. So
+  the milestones are owned by code, not the LLM: `validate_and_repair(edl, deliverable,
+  manifest, *, manifest_by_camera=None)` runs at every persist site (`compose_edls` for
+  single-cam; the combo and per-camera freefall sites in `run_ultimum_pipeline`) and
+  repairs each deliverable *before* it's written. It is **pure** — plain-dict clips in,
+  `(clips, repair-log)` out, no I/O, and it MUST NOT import `api.*` (`api.selfie` imports
+  it — the reverse is circular). Freefall-type cuts (`freefall`, `external_freefall`,
+  `chute_libre_selfie`) are clamped to `[exit_offset−8, deploy_offset+3]`, get a forced
+  deployment beat at `deploy_offset`, and drop ALL non-freefall scenes; `full_video` /
+  `highlights` get the deploy beat + boarding-entry (+ intro for highlights); multi-cam
+  combos additionally enforce ≥1.5 s shots (0.4× beats exempt), ≥3 s between camera
+  switches, and exit-anchored cross-camera alignment. `replay_*` re-renders EDLs that
+  were already validated at first compose, so it doesn't re-run the validator.
+- **Scene manifests** now record per-source-file `file_offsets`
+  (`[{"file","offset"}, …]`, cumulative seconds within the concatenated scene): the
+  plane-entry moment is usually the head of ONE mid-scene file, not the combined scene's
+  head, so compose and the boarding rule target files by offset. A post-freefall scene
+  the telemetry classifier called `canopy` whose `gpmf_signals.accl_z_mean` exceeds
+  `_LANDING_ACCL_Z_MEAN` (1.5 — signed; observed ~2.08/3.52 on real landing footage vs
+  ~1.0–1.2 under a flying canopy, and freefall's large negative never qualifies) is
+  really the touchdown and is renamed `canopy`→`landing`, added to the manifest's
+  `flagged` list (reason `auto-renamed canopy->landing (accl signature)`) so it surfaces
+  for instructor review. `landing` is the outro-side milestone; canopy references in the
+  editor stay tied to the freefall scene's `deploy_offset`.
 - Ultimate uploads carry a `camera_role` (`instructor`/`external`); clips stage under
   `raw/<role>/` (two GoPros emit colliding filenames). Processing auto-enqueues only
   once both role folders are populated. Music/original-audio rules: full video keeps
@@ -131,6 +163,8 @@ Built as a module inside SkydiveOS. Replaces our current dependency on Shred.
 - Don't use Higgsfield, Runway, Sora, or any generative video tool — customers want their REAL face, not a stylized version
 - Don't render until the instructor has approved — wasted GPU time
 - Don't skip the review gate even when the model is good (5-star reviews depend on this)
+- Don't persist an EDL that hasn't passed `validate_and_repair`; don't make it do I/O or import `api.*` (keep it pure and dependency-light — `api.selfie` imports it)
+- Don't mine a "deployment" beat from the `canopy`/`landing` scene — it's positionally unreliable; the deploy beat comes from the freefall scene at `deploy_offset`
 
 ## Workflow Rules
 - Before writing new code, read related modules to understand existing patterns

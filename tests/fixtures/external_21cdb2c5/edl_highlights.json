@@ -1,0 +1,114 @@
+[
+  {
+    "scene": "intro_interview",
+    "src_start": 0.0,
+    "src_end": 8.0,
+    "speed_multiplier": 1.0,
+    "camera": null
+  },
+  {
+    "scene": "boarding",
+    "src_start": 0.0,
+    "src_end": 3.0,
+    "speed_multiplier": 1.0,
+    "camera": null
+  },
+  {
+    "scene": "boarding",
+    "src_start": 20.7055,
+    "src_end": 23.7055,
+    "speed_multiplier": 1.0,
+    "camera": null
+  },
+  {
+    "scene": "boarding",
+    "src_start": 36.411,
+    "src_end": 44.411,
+    "speed_multiplier": 1.0,
+    "camera": null
+  },
+  {
+    "scene": "freefall",
+    "src_start": 25.02,
+    "src_end": 26.02,
+    "speed_multiplier": 0.4,
+    "camera": null
+  },
+  {
+    "scene": "freefall",
+    "src_start": 26.02,
+    "src_end": 31.02,
+    "speed_multiplier": 1.0,
+    "camera": null
+  },
+  {
+    "scene": "freefall",
+    "src_start": 31.02,
+    "src_end": 32.0,
+    "speed_multiplier": 1.0,
+    "camera": null
+  },
+  {
+    "scene": "freefall",
+    "src_start": 32.0,
+    "src_end": 33.0,
+    "speed_multiplier": 0.4,
+    "camera": null
+  },
+  {
+    "scene": "freefall",
+    "src_start": 33.0,
+    "src_end": 33.5,
+    "speed_multiplier": 1.0,
+    "camera": null
+  },
+  {
+    "scene": "freefall",
+    "src_start": 35.5,
+    "src_end": 37.0,
+    "speed_multiplier": 1.0,
+    "camera": null
+  },
+  {
+    "scene": "freefall",
+    "src_start": 37.0,
+    "src_end": 38.0,
+    "speed_multiplier": 0.4,
+    "camera": null
+  },
+  {
+    "scene": "freefall",
+    "src_start": 38.0,
+    "src_end": 38.5,
+    "speed_multiplier": 1.0,
+    "camera": null
+  },
+  {
+    "scene": "canopy",
+    "src_start": 0.0,
+    "src_end": 1.0,
+    "speed_multiplier": 0.4,
+    "camera": null
+  },
+  {
+    "scene": "canopy",
+    "src_start": 1.0,
+    "src_end": 2.5,
+    "speed_multiplier": 1.0,
+    "camera": null
+  },
+  {
+    "scene": "canopy",
+    "src_start": 4.541,
+    "src_end": 7.541,
+    "speed_multiplier": 1.0,
+    "camera": null
+  },
+  {
+    "scene": "outro_interview",
+    "src_start": 0.0,
+    "src_end": 2.0,
+    "speed_multiplier": 1.0,
+    "camera": null
+  }
+]

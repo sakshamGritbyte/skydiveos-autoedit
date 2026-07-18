@@ -1,0 +1,80 @@
+{
+  "scenes": [
+    {
+      "name": "intro_interview",
+      "source_files": [
+        "GX010052.MP4",
+        "GX010053.MP4"
+      ],
+      "combined_path": "jobs/d15c2e4260e943b2b49acaca30f578ea/scenes/intro_interview.mp4",
+      "duration": 69.97,
+      "needs_review": false,
+      "gpmf_signals": {
+        "altitude_mean": 0.0,
+        "altitude_delta": 0.0,
+        "accl_z_mean": 0.01
+      }
+    },
+    {
+      "name": "boarding",
+      "source_files": [
+        "GX010054.MP4",
+        "GX010055.MP4",
+        "GX010056.MP4"
+      ],
+      "combined_path": "jobs/d15c2e4260e943b2b49acaca30f578ea/scenes/boarding.mp4",
+      "duration": 40.173,
+      "needs_review": false,
+      "gpmf_signals": {
+        "altitude_mean": 0.0,
+        "altitude_delta": 0.0,
+        "accl_z_mean": 0.293
+      }
+    },
+    {
+      "name": "freefall",
+      "source_files": [
+        "GX010057.MP4"
+      ],
+      "combined_path": "jobs/d15c2e4260e943b2b49acaca30f578ea/scenes/freefall.mp4",
+      "duration": 85.319,
+      "needs_review": false,
+      "gpmf_signals": {
+        "altitude_mean": 0.0,
+        "altitude_delta": 0.0,
+        "accl_z_mean": -5.082
+      },
+      "exit_offset": 30.03,
+      "deploy_offset": 61.06
+    },
+    {
+      "name": "canopy",
+      "source_files": [
+        "GX010058.MP4"
+      ],
+      "combined_path": "jobs/d15c2e4260e943b2b49acaca30f578ea/scenes/canopy.mp4",
+      "duration": 18.585,
+      "needs_review": false,
+      "gpmf_signals": {
+        "altitude_mean": 0.0,
+        "altitude_delta": 0.0,
+        "accl_z_mean": 3.523
+      }
+    },
+    {
+      "name": "outro_interview",
+      "source_files": [
+        "GX010059.MP4"
+      ],
+      "combined_path": "jobs/d15c2e4260e943b2b49acaca30f578ea/scenes/outro_interview.mp4",
+      "duration": 21.221,
+      "needs_review": false,
+      "gpmf_signals": {
+        "altitude_mean": 0.0,
+        "altitude_delta": 0.0,
+        "accl_z_mean": 0.098
+      }
+    }
+  ],
+  "flagged": []
+}

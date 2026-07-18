@@ -42,6 +42,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from analysis.proxy import analysis_source
 from edl.storage import job_dir
+from edl.validate import validate_and_repair
 
 if TYPE_CHECKING:  # types used only for annotation, never imported at runtime
     from anthropic.types import MessageParam
@@ -94,11 +95,13 @@ SCENE_ORDER: tuple[str, ...] = (
     "plane",
     "freefall",
     "canopy",
+    "landing",
     "outro_interview",
 )
 SCENE_WEIGHTS: dict[str, float] = {
     "freefall": 1.0,
     "canopy": 0.8,
+    "landing": 0.8,
     "intro_interview": 0.6,
     "outro_interview": 0.6,
     "boarding": 0.4,
@@ -500,6 +503,13 @@ _FREEFALL_MAG_STD = 0.5     # heavy variance = the 120 mph freefall buffeting
 _FREEFALL_MAG_MIN = 0.3     # a near-0 g sample = the exit / unloaded freefall moment
 _CANOPY_MAG_MEAN = 1.15     # sustained >1 g under an open canopy
 _CANOPY_MAG_STD = 0.25      # gentle canopy swinging (below freefall's chaos)
+#: Mean vertical acceleration (signed, g) above which a post-freefall scene the
+#: telemetry classifier called "canopy" is really LANDING footage — the run-out /
+#: slide / touchdown impact. Observed ~2.08 / 3.52 g on real landing clips vs
+#: ~0.1-0.3 g on ground scenes and ~1.0-1.2 g under a flying canopy; freefall's
+#: large NEGATIVE mean never qualifies (this is a signed ``>`` test). Renamed scenes
+#: are flagged for instructor review rather than silently reclassified.
+_LANDING_ACCL_Z_MEAN = 1.5
 
 
 def classify_scene(sig: FileSignals, index: int, total: int, *, ground: float = 0.0) -> str:
@@ -833,9 +843,27 @@ def build_scenes(
 
     scenes: list[dict[str, Any]] = []
     flagged: list[str] = []
+    freefall_index = ordered.index("freefall") if "freefall" in ordered else -1
     for label in ordered:
         clips = sorted(by_scene[label], key=_order_key)
-        combined = scenes_dir / f"{label}.mp4"
+
+        # A post-freefall "canopy" scene whose vertical acceleration shows the landing
+        # signature (run-out / touchdown impact) is really LANDING footage, not the
+        # canopy ride — the classifier misplaces it positionally. Rename it so the
+        # editor and the EDL validator never mine a "deployment" beat from landing
+        # footage, and flag the rename for instructor review.
+        accl_z = round(statistics.fmean([c.gpmf.accl_z_mean for c in clips]), 3)
+        display_name = label
+        if (
+            label == "canopy"
+            and freefall_index >= 0
+            and ordered.index(label) > freefall_index
+            and accl_z > _LANDING_ACCL_Z_MEAN
+        ):
+            display_name = "landing"
+            flagged.append("auto-renamed canopy->landing (accl signature)")
+
+        combined = scenes_dir / f"{display_name}.mp4"
         concat_scene([c.path for c in clips], combined)
 
         # When every clip in the scene resolved to a validated LRV proxy, assemble a
@@ -847,31 +875,39 @@ def build_scenes(
         if all(c.has_proxy for c in clips):
             try:
                 proxy_combined = concat_scene(
-                    [c.analysis_path for c in clips], scenes_dir / f"{label}.proxy.mp4"
+                    [c.analysis_path for c in clips], scenes_dir / f"{display_name}.proxy.mp4"
                 )
             except Exception as e:  # noqa: BLE001 - proxy scene is best-effort
                 logger.warning(
                     "proxy scene build failed for %s (%r); scoring will use the MP4 scene",
-                    label, e,
+                    display_name, e,
                 )
                 proxy_combined = None
 
         first, last = clips[0].gpmf, clips[-1].gpmf
         needs_review = label == "unknown"
+        # Where each raw source file begins inside the concatenated scene (seconds).
+        # The plane-entry moment is often the head of ONE mid-scene file rather than the
+        # combined scene's head, so the compose prompt and the EDL validator target files
+        # by offset rather than trusting the whole-scene head.
+        file_offsets: list[dict[str, Any]] = []
+        cum = 0.0
+        for c in clips:
+            file_offsets.append({"file": c.filename, "offset": round(cum, 3)})
+            cum += c.duration
         scene: dict[str, Any] = {
-            "name": label,
+            "name": display_name,
             "source_files": [c.filename for c in clips],
             "combined_path": str(combined),
             "duration": round(sum(c.duration for c in clips), 3),
             "needs_review": needs_review,
+            "file_offsets": file_offsets,
             "gpmf_signals": {
                 "altitude_mean": round(
                     statistics.fmean([c.gpmf.altitude_mean for c in clips]), 3
                 ),
                 "altitude_delta": round(last.altitude_last - first.altitude_first, 3),
-                "accl_z_mean": round(
-                    statistics.fmean([c.gpmf.accl_z_mean for c in clips]), 3
-                ),
+                "accl_z_mean": accl_z,
             },
         }
         # Low-res scene the scorer reads instead of the master, when one was built.
@@ -975,6 +1011,13 @@ the first few seconds of that scene as the entry milestone in full_video and hig
 EVEN IF its face scores are low — the jumper is usually turned away while boarding, so it
 will not show up in scored_seconds, but it is a mandatory story beat.
 
+A scene may carry "file_offsets": where each raw source file begins (seconds) inside the
+concatenated scene. The plane-entry moment is the HEAD of the FIRST source file (its
+offset), which is not always the combined scene's head — use file_offsets to target it.
+A scene named "landing" is ground/touchdown footage (the run-out and reaction); it is the
+outro-side milestone before the outro interview — never treat it as freefall or
+canopy-ride material.
+
 The aircraft exit / jump is one of the most important moments and MUST always appear in
 BOTH highlights and freefall — it begins at the freefall scene's exit_offset (NOT ts 0).
 The door / exit-prep (approaching the door, looking out) is the few seconds just BEFORE
@@ -994,9 +1037,10 @@ seconds of freefall STARTING AT exit_offset (exit → jump → initial freefall 
 stabilisation). Include it in full BEFORE adding any AI-scored moments.
 
 highlights:
-  Under 1 minute. Include each milestone first (entry, inside, door, the continuous exit
-  sequence, deployment, landing, outro), then fill remaining time with the best freefall
-  beats (all BETWEEN exit_offset and deploy_offset). Slow-mo the exit and the top peaks.
+  Under 1 minute. Include each milestone first (intro_interview, entry, inside, door, the
+  continuous exit sequence, deployment, landing, outro), then fill remaining time with the
+  best freefall beats (all BETWEEN exit_offset and deploy_offset). Slow-mo the exit and the
+  top peaks. Always lead with a >=3 s intro_interview beat when that scene exists.
 
 freefall:
   Under 1:15, and ENTIRELY within the aerial window. Lead with the door/exit-prep (the
@@ -1036,6 +1080,8 @@ def _build_compose_prompt(
             "duration": s["duration"],
             "weight": SCENE_WEIGHTS.get(s["name"], 0.3),
         }
+        if s.get("file_offsets"):
+            entry["file_offsets"] = s["file_offsets"]
         if s["name"] == "freefall":
             # The freefall clip starts inside the aircraft and runs through the canopy
             # ride; the real aerial window is exit_offset → deploy_offset. Hand the model
@@ -1212,22 +1258,28 @@ def _has_canopy_opening(clips: Sequence[Clip], scenes: Sequence[dict[str, Any]])
     return _covers(clips, first.scene, first.src_start - 0.5, first.src_end + 0.5)
 
 
+def _post_jump_ground(scenes: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+    """The touchdown scene: the "landing" scene when the classifier flagged one
+    (see ``_LANDING_ACCL_Z_MEAN``), else the tail of the "canopy" scene."""
+    return _scene_by_name(scenes, "landing") or _scene_by_name(scenes, "canopy")
+
+
 def _landing_block(scenes: Sequence[dict[str, Any]]) -> list[Clip]:
-    """The landing beat — the tail of the canopy scene — or [] when there's no canopy."""
-    canopy = _scene_by_name(scenes, "canopy")
-    if canopy is None:
+    """The landing beat — the tail of the touchdown scene — or [] when absent."""
+    ground = _post_jump_ground(scenes)
+    if ground is None:
         return []
-    cdur = max(float(canopy["duration"]), 0.1)
-    return [_window(canopy, cdur - _MILESTONE_S, _MILESTONE_S)]
+    gdur = max(float(ground["duration"]), 0.1)
+    return [_window(ground, gdur - _MILESTONE_S, _MILESTONE_S)]
 
 
 def _has_landing(clips: Sequence[Clip], scenes: Sequence[dict[str, Any]]) -> bool:
-    """Whether the landing (canopy-tail) beat is already present."""
-    canopy = _scene_by_name(scenes, "canopy")
-    if canopy is None:
+    """Whether the landing (touchdown-tail) beat is already present."""
+    ground = _post_jump_ground(scenes)
+    if ground is None:
         return True
-    cdur = max(float(canopy["duration"]), 0.1)
-    return _covers(clips, "canopy", cdur - _MILESTONE_S - 1.0, cdur)
+    gdur = max(float(ground["duration"]), 0.1)
+    return _covers(clips, ground["name"], gdur - _MILESTONE_S - 1.0, gdur)
 
 
 def _ensure_milestones(
@@ -1339,8 +1391,55 @@ def compose_edls(
     # ran — every milestone present (entry, exit/jump, canopy opening, landing) and every
     # deliverable in chronological jump order, so the model can't scramble the story.
     edls = _ensure_story(edls, manifest)
+
+    # Deterministic post-validation: the compose output is untrusted, so repair each
+    # deliverable against the mandatory milestones + shot rules BEFORE persisting.
+    repairs: dict[str, list[str]] = {}
+    fixed: dict[str, list[Clip]] = {}
+    for deliverable, field in (
+        ("full_video", "full_video"),
+        ("highlights", "highlights"),
+        ("freefall", "freefall"),
+    ):
+        clips, log = _validated(getattr(edls, field), deliverable, manifest)
+        fixed[field] = clips
+        repairs[deliverable] = log
+    edls = edls.model_copy(update=fixed)
     _persist_edls(edls, job_id, jobs_root)
+    _write_validation_report(job_dir(job_id, jobs_root), repairs)
     return edls
+
+
+def _validated(
+    clips: Sequence[Clip],
+    deliverable: str,
+    manifest: dict[str, Any],
+    manifest_by_camera: dict[str, dict[str, Any]] | None = None,
+) -> tuple[list[Clip], list[str]]:
+    """Run :func:`edl.validate.validate_and_repair` over a deliverable's clips.
+
+    Round-trips through the plain-dict shape the validator (and the persisted
+    ``edl_*.json``) uses, logs each repair at INFO, and re-validates back into
+    :class:`Clip`. Never raises for a repaired-away deliverable — the validator's
+    own guard keeps at least one clip.
+    """
+    repaired, log = validate_and_repair(
+        [c.model_dump() for c in clips],
+        deliverable,
+        manifest,
+        manifest_by_camera=manifest_by_camera,
+    )
+    for line in log:
+        logger.info("EDL validation repair [%s]: %s", deliverable, line)
+    return [Clip.model_validate(c) for c in repaired], log
+
+
+def _write_validation_report(jd: Path, repairs: dict[str, list[str]]) -> None:
+    """Persist the per-deliverable repair log beside the EDLs (a job artifact)."""
+    jd.mkdir(parents=True, exist_ok=True)
+    (jd / "validation_report.json").write_text(
+        json.dumps({"repairs": repairs}, indent=2) + "\n"
+    )
 
 
 def _persist_edls(edls: EDLResponse, job_id: str, jobs_root: str | Path | None) -> None:
@@ -1651,7 +1750,7 @@ def _highlight_milestones(
     intro = _scene_by_name(scenes, "intro_interview")
     boarding = _scene_by_name(scenes, "boarding")
     plane = _scene_by_name(scenes, "plane")
-    canopy = _scene_by_name(scenes, "canopy")
+    ground = _post_jump_ground(scenes)  # "landing" if flagged, else the canopy tail
     ff = _scene_by_name(scenes, "freefall")
     outro = _scene_by_name(scenes, "outro_interview")
     aircraft = _aircraft_before_freefall(scenes)
@@ -1684,9 +1783,9 @@ def _highlight_milestones(
     opening = _canopy_opening(scenes)
     if opening:
         out.append(opening)
-    if canopy is not None:    # landing reaction (tail of the canopy scene)
-        cdur = max(float(canopy["duration"]), 0.1)
-        out.append([_window(canopy, cdur - _MILESTONE_S, _MILESTONE_S)])
+    if ground is not None:    # landing reaction (tail of the touchdown scene)
+        gdur = max(float(ground["duration"]), 0.1)
+        out.append([_window(ground, gdur - _MILESTONE_S, _MILESTONE_S)])
     if outro is not None:     # the outro moment
         out.append([_window(outro, 0.0, 2.0)])
     return out
@@ -1898,7 +1997,7 @@ def _audio_markers(
         if music_start is None and clip.scene in _MUSIC_START_SCENES:
             music_start = t
         if canopy_start is None:
-            if clip.scene == "canopy":
+            if clip.scene in ("canopy", "landing"):
                 canopy_start = t
             elif (
                 deploy_offset > 0
@@ -2769,6 +2868,18 @@ def run_ultimum_pipeline(
         role_manifests, role_scores,
         target_duration=job.target_duration, profile=load_style_profile(jobs_root),
     )
+    # Deterministic post-validation before persistence (as for the single-cam packages).
+    # Camera-tagged combo clips resolve their own camera's exit/deploy offsets via
+    # ``manifest_by_camera``; the shared ``manifest`` is only a fallback for untagged clips.
+    combo_manifest = role_manifests.get("instructor") or next(iter(role_manifests.values()))
+    repairs: dict[str, list[str]] = {}
+    full_clips, repairs["full_video"] = _validated(
+        edls.full_video, "full_video", combo_manifest, role_manifests
+    )
+    high_clips, repairs["highlights"] = _validated(
+        edls.highlights, "highlights", combo_manifest, role_manifests
+    )
+    edls = edls.model_copy(update={"full_video": full_clips, "highlights": high_clips})
     _persist_clips(jd, ULTIMUM_EDL_FILES["full_video"], edls.full_video)
     _persist_clips(jd, ULTIMUM_EDL_FILES["highlights"], edls.highlights)
 
@@ -2798,6 +2909,9 @@ def run_ultimum_pipeline(
     for deliverable, role in ULTIMUM_FREEFALL_ROLE.items():
         role_manifest = role_manifests[role]
         clips = _curated_freefall(role_manifest["scenes"], role_scores[role])
+        # These cuts are single-camera (clips carry no camera tag); the role manifest
+        # supplies that camera's exit/deploy offsets for the freefall-window rules.
+        clips, repairs[deliverable] = _validated(clips, deliverable, role_manifest)
         _persist_clips(jd, ULTIMUM_EDL_FILES[deliverable], clips)
         clips = apply_exclusions(
             EDLResponse(full_video=clips, highlights=clips, freefall=clips), exclusions
@@ -2807,6 +2921,8 @@ def run_ultimum_pipeline(
             booking=booking, music_path=music[deliverable], music_only=True,
         )
         outputs[deliverable] = str(jd / f"{deliverable}.mp4")
+
+    _write_validation_report(jd, repairs)
 
     # --- Photos across the whole jump, mined from BOTH cameras' scenes (namespaced so
     #     they don't collide). Backfill guarantees a full ~50 set even when the distant

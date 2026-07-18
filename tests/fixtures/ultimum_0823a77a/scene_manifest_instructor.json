@@ -1,0 +1,37 @@
+{
+  "scenes": [
+    {
+      "name": "freefall",
+      "source_files": [
+        "GX015312.MP4"
+      ],
+      "combined_path": "jobs/0823a77a737548f9b055db9089f9ab4c/scenes_instructor/freefall.mp4",
+      "duration": 94.761,
+      "needs_review": false,
+      "gpmf_signals": {
+        "altitude_mean": 0.0,
+        "altitude_delta": 0.0,
+        "accl_z_mean": -5.121
+      },
+      "proxy_path": "jobs/0823a77a737548f9b055db9089f9ab4c/scenes_instructor/freefall.proxy.mp4",
+      "exit_offset": 28.03,
+      "deploy_offset": 79.08
+    },
+    {
+      "name": "canopy",
+      "source_files": [
+        "GX015313.MP4"
+      ],
+      "combined_path": "jobs/0823a77a737548f9b055db9089f9ab4c/scenes_instructor/canopy.mp4",
+      "duration": 23.59,
+      "needs_review": false,
+      "gpmf_signals": {
+        "altitude_mean": 0.0,
+        "altitude_delta": 0.0,
+        "accl_z_mean": 1.061
+      },
+      "proxy_path": "jobs/0823a77a737548f9b055db9089f9ab4c/scenes_instructor/canopy.proxy.mp4"
+    }
+  ],
+  "flagged": []
+}

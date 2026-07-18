@@ -449,6 +449,56 @@ def test_score_scenes_writes_valid_structure(
     assert saved == scores
 
 
+def _dispatch_manifest(tmp_path: Path) -> dict[str, Any]:
+    return {
+        "scenes": [{"name": "freefall", "combined_path": str(tmp_path / "freefall.mp4")}],
+        "flagged": [],
+    }
+
+
+def test_score_scenes_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """external_scorer=True routes to the YOLO scorer; False routes to score_scene."""
+    from analysis import external_score
+
+    calls = {"face": 0, "external": 0}
+    monkeypatch.setattr(
+        selfie, "score_scene", lambda path, **kw: calls.__setitem__("face", calls["face"] + 1) or []
+    )
+    monkeypatch.setattr(
+        external_score,
+        "score_scene_external",
+        lambda path, **kw: calls.__setitem__("external", calls["external"] + 1) or [],
+    )
+
+    selfie.score_scenes(_dispatch_manifest(tmp_path), "ext_job", tmp_path, external_scorer=True)
+    assert calls == {"face": 0, "external": 1}
+
+    selfie.score_scenes(_dispatch_manifest(tmp_path), "face_job", tmp_path, external_scorer=False)
+    assert calls == {"face": 1, "external": 1}
+
+
+def test_score_scenes_default_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Omitting external_scorer scores via score_scene exactly as before (regression)."""
+    from analysis import external_score
+
+    face_calls = {"n": 0}
+    monkeypatch.setattr(
+        selfie, "score_scene", lambda path, **kw: face_calls.__setitem__("n", face_calls["n"] + 1) or []
+    )
+
+    def _boom(path: str | Path, **kw: Any) -> list[dict[str, float]]:
+        raise AssertionError("external scorer must not run on the default path")
+
+    monkeypatch.setattr(external_score, "score_scene_external", _boom)
+
+    selfie.score_scenes(_dispatch_manifest(tmp_path), "default_job", tmp_path)
+    assert face_calls["n"] == 1
+
+
 # --------------------------------------------------------------------------- #
 # Step 3: compose three EDLs
 # --------------------------------------------------------------------------- #

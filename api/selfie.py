@@ -925,18 +925,31 @@ def score_scenes(
     jobs_root: str | Path | None = None,
     *,
     scores_name: str = "scores.json",
+    external_scorer: bool = False,
 ) -> dict[str, list[dict[str, float]]]:
     """Score every scene in the manifest and write ``scores.json``.
 
     ``scores_name`` defaults to the combined set's scores; the Ultimate package writes
     a per-camera ``scores_<role>.json`` so the second scene set's scores don't clobber
     the first.
+
+    ``external_scorer`` picks a *source-aware* scorer: the default MediaPipe face
+    scorer (:func:`score_scene`) suits the instructor selfie cam, but distant
+    external-cameraman footage scores no faces, so the ``external`` package /
+    Ultimate ``external`` camera use the YOLO body scorer
+    (:func:`analysis.external_score.score_scene_external`) instead. Both emit the
+    identical scores schema, so this only changes *how* seconds are scored.
     """
+    if external_scorer:
+        from analysis.external_score import score_scene_external as scorer
+    else:
+        scorer = score_scene
+
     scores: dict[str, list[dict[str, float]]] = {}
     for scene in manifest["scenes"]:
         # Score the validated LRV proxy scene when one was built, else the MP4 scene.
         # Times are identical on both, so the scores apply to the MP4 timeline as-is.
-        scores[scene["name"]] = score_scene(scene.get("proxy_path") or scene["combined_path"])
+        scores[scene["name"]] = scorer(scene.get("proxy_path") or scene["combined_path"])
     jd = job_dir(job_id, jobs_root)
     jd.mkdir(parents=True, exist_ok=True)
     (jd / scores_name).write_text(json.dumps(scores, indent=2) + "\n")
@@ -2393,8 +2406,12 @@ def run_selfie_pipeline(
     classified = classify_files(store.raw_dir(job_id))
     manifest = build_scenes(job_id, classified, jobs_root)
 
-    # Step 2 — per-second MediaPipe scoring (drives both the EDLs and the photo ranking).
-    scores = score_scenes(manifest, job_id, jobs_root)
+    # Step 2 — per-second scoring (drives both the EDLs and the photo ranking). The
+    # external (camera-flyer) package uses the YOLO body scorer: its distant footage
+    # scores no faces for the MediaPipe scorer.
+    scores = score_scenes(
+        manifest, job_id, jobs_root, external_scorer=(package == Package.external)
+    )
 
     outputs: dict[str, str] = {}
 
@@ -2593,7 +2610,11 @@ def _build_role_scene_set(
         scenes_subdir=f"scenes_{role}",
         manifest_name=_ULTIMUM_ROLE_MANIFEST[role],
     )
-    scores = score_scenes(manifest, job_id, jobs_root, scores_name=f"scores_{role}.json")
+    scores = score_scenes(
+        manifest, job_id, jobs_root,
+        scores_name=f"scores_{role}.json",
+        external_scorer=(role == "external"),
+    )
     return manifest, scores
 
 

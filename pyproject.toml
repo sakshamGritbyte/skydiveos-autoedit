@@ -19,6 +19,9 @@ dependencies = [
     "dnspython>=2.6.0",
     "python-multipart>=0.0.9",
     "redis>=5.0.0",
+    # YOLO person detector for source-aware scoring of external-cameraman footage
+    # (analysis/external_score.py). opencv is already a dep (see opencv-python above).
+    "ultralytics>=8.2",
     "uvicorn[standard]>=0.30.0",
 ]
 
@@ -89,4 +92,10 @@ ignore_missing_imports = true
 # Celery ships no py.typed marker; /api's Celery app + tasks import it.
 [[tool.mypy.overrides]]
 module = "celery.*"
+ignore_missing_imports = true
+
+# ultralytics (YOLO) ships no type stubs / py.typed marker; /analysis imports it
+# lazily for source-aware external-cameraman scoring (analysis/external_score.py).
+[[tool.mypy.overrides]]
+module = "ultralytics.*"
 ignore_missing_imports = true

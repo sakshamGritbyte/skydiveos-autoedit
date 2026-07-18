@@ -36,7 +36,7 @@ Built as a module inside SkydiveOS. Replaces our current dependency on Shred.
 ## Pipeline Stages (in order)
 1. **Ingest** — pull MP4 + LRV (proxy) + GPMF from camera via Open GoPro
 2. **Segment** — parse GPMF accelerometer/GPS → identify exit, freefall, deploy, landing timestamps
-3. **Score** — run MediaPipe on the LRV proxy *only during freefall* (saves 95% compute) to score per-second highlights (smile, eye contact, in-frame)
+3. **Score** — run MediaPipe on the LRV proxy *only during freefall* (saves 95% compute) to score per-second highlights (smile, eye contact, in-frame). **Source-aware:** the MediaPipe face scorer suits the instructor selfie cam; distant external-cameraman footage scores no faces, so those scenes use a YOLO *body* scorer instead (see Key Conventions).
 4. **Compose** — send timeline + scores + customer metadata to Claude API → receive JSON EDL
 5. **Render** — execute EDL against full-res MP4 with FFmpeg: trim, speed ramps, intro/outro, music
 6. **Review** — instructor approves or tweaks in web UI
@@ -62,6 +62,24 @@ Built as a module inside SkydiveOS. Replaces our current dependency on Shred.
   scene set (`scenes_<role>/`, no combined concat); combo clips carry a `camera` tag that
   resolves to that camera's file at render. It is NOT a new editing pipeline; deliverables
   come from feeding the EXISTING functions different footage, never from forking the editor.
+- **Source-aware scene scoring** (`api.selfie.score_scenes(external_scorer=...)`):
+  the default MediaPipe face scorer (`score_scene`) is tuned for the instructor
+  selfie cam, where the customer's face fills the frame. On external-cameraman
+  footage the tandem is far from the lens, so the face scorer silently returns
+  near-zero rows. The `external` package (and Ultimate's `external` camera) instead
+  route to a YOLO person-detector body scorer
+  (`analysis.external_score.score_scene_external`). It emits the **exact same four
+  `scores.json` fields** so nothing downstream changes — body geometry is *mapped*
+  onto them: `face_in_frame` <- `clamp01(subject_size / 0.10)` (person filling ≥10%
+  of frame reads as fully in-frame for a distant cam), `face_centered` <- largest
+  box centred in the middle 60%×60%, `eye_contact` <- `both_visible` (exactly two
+  well-separated people = an engaging tandem shot), `smile` <- `0.0` (undetectable
+  at distance; downstream `.get("smile", 0.0)` paths tolerate zeros). A frame with
+  no person detected scores 0.0 on all four. `score_scenes` defaults to
+  `external_scorer=False`, so every other call path (`selfie`, `video_only`,
+  `photo_only`, the instructor camera) is byte-identical. Never modify
+  `analysis/score.py` or `analysis/__init__.py` (`FreefallScorer`/`score_freefall`
+  serve the separate single-master pipeline).
 - `selfie` and the camera-flyer `external` package compose videos deterministically
   (house cut, `compose_edls(use_ai=...)`); distant cameraman footage scores too few
   faces for the AI editor to sequence reliably. `_ensure_story` then guarantees every

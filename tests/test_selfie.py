@@ -11,6 +11,7 @@ parallel render fan-out, and photo selection — without the heavy deps.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -778,6 +779,67 @@ def test_detect_deploy_picks_strongest_shock(monkeypatch: pytest.MonkeyPatch) ->
     )
     monkeypatch.setattr("metadata.gpmf.parse_gpmf", lambda p: _fake_gpmf(g))
     assert selfie.detect_deploy_offset(["/x/freefall.mp4"]) == 19.0
+
+
+def test_deploy_rejects_midfreefall_spike_confirms_later_opening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A mid-freefall jolt (t=61) out-spikes the real main opening (t=74) — the exact
+    # b0b3176f… failure. The strong t=61 shock is followed by CONTINUED freefall
+    # buffeting (alternating 0.5/2.0 g chaos), the weaker t=74 shock by a SMOOTH ~1.15 g
+    # canopy ride. Strongest-first evaluation rejects t=61 (chaos) and confirms t=74.
+    g = (
+        [1.0] * 61                                    # 0-60: freefall
+        + [4.0, 3.5]                                  # 61-62: strong FALSE shock
+        + [0.5, 2.0, 0.5, 2.0, 0.5, 2.0,
+           0.5, 2.0, 0.5, 2.0, 0.5]                   # 63-73: buffeting continues
+        + [2.5, 2.2]                                  # 74-75: the real (weaker) opening
+        + [1.15] * 8                                  # 76-83: smooth canopy ride
+    )
+    monkeypatch.setattr("metadata.gpmf.parse_gpmf", lambda p: _fake_gpmf(g))
+    assert selfie.detect_deploy_offset(["/x/freefall.mp4"]) == 74.0
+
+
+def test_deploy_keeps_current_behavior_when_only_one_confirmed_shock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # One clean opening at t=40 followed by a smooth canopy ride (enough tail to judge):
+    # confirmed via the canopy signature, returns the same value the old code would.
+    g = [1.0] * 40 + [2.2, 2.0, 1.9] + [1.15] * 8
+    monkeypatch.setattr("metadata.gpmf.parse_gpmf", lambda p: _fake_gpmf(g))
+    assert selfie.detect_deploy_offset(["/x/freefall.mp4"]) == 40.0
+
+
+def test_deploy_fallback_when_no_candidate_confirmed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Every shock (t=5 weak, t=13 strongest) is followed by continued chaos — nothing
+    # looks like a canopy. Rather than regress to 0.0, fall back to the strongest shock
+    # (t=13) and log a warning naming the fallback path.
+    g = (
+        [1.0] * 5
+        + [2.2, 2.0]                                  # 5-6: weak shock
+        + [2.0, 0.5, 2.0, 0.5, 2.0, 0.5]             # 7-12: chaos (ends low, isolates below)
+        + [4.0, 3.5]                                  # 13-14: strongest shock
+        + [0.5, 2.0, 0.5, 2.0, 0.5, 2.0, 0.5, 2.0]   # 15-22: chaos continues
+    )
+    monkeypatch.setattr("metadata.gpmf.parse_gpmf", lambda p: _fake_gpmf(g))
+    with caplog.at_level(logging.WARNING, logger="api.selfie"):
+        assert selfie.detect_deploy_offset(["/x/freefall.mp4"]) == 13.0
+    assert "falling back to strongest shock" in caplog.text
+
+
+def test_deploy_candidate_too_near_eof_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The opening at t=40 has only ~3 s of telemetry after it — too little to confirm a
+    # canopy ride. It's unconfirmed, so we fall back to the strongest shock (still t=40)
+    # and warn, rather than trusting an unverifiable window.
+    g = [1.0] * 40 + [2.2, 2.0, 1.9, 1.0]
+    monkeypatch.setattr("metadata.gpmf.parse_gpmf", lambda p: _fake_gpmf(g))
+    with caplog.at_level(logging.WARNING, logger="api.selfie"):
+        assert selfie.detect_deploy_offset(["/x/freefall.mp4"]) == 40.0
+    assert "falling back to strongest shock" in caplog.text
 
 
 def test_canopy_opening_detected_inside_freefall_scene() -> None:

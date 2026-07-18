@@ -348,6 +348,15 @@ def detect_exit_offset(mp4_path: str | Path) -> float:
 # Deployment detection: the parachute opening is a large, *sustained* high-g shock
 # (several g held for a couple seconds) — distinct from the brief spikes of freefall.
 _DEPLOY_G = 1.6
+#: Candidate-confirmation window (seconds after a shock) and the minimum telemetry
+#: tail needed to judge it. A real opening is followed by a smooth canopy ride, so we
+#: inspect the magnitude over [shock+3s, shock+8s]; a shock with less than 4s of
+#: telemetry after it (too near the end of the clip) can't be confirmed.
+_DEPLOY_CONFIRM_LAG_S = 3.0
+_DEPLOY_CONFIRM_END_S = 8.0
+_DEPLOY_CONFIRM_MIN_TAIL_S = 4.0
+#: Tolerance (g) around ``_CANOPY_MAG_MEAN`` for the post-shock mean to read as canopy.
+_CANOPY_MAG_MEAN_TOL = 0.35
 
 
 def _accel_means(mp4_paths: Sequence[str | Path]) -> list[tuple[float, float]]:
@@ -375,6 +384,39 @@ def _accel_means(mp4_paths: Sequence[str | Path]) -> list[tuple[float, float]]:
     return out
 
 
+def _confirms_canopy(profile: Sequence[tuple[float, float]], start: float) -> bool:
+    """True when the accelerometer just after ``start`` looks like an open canopy.
+
+    A real parachute opening is followed by a smooth ~1.15 g ride; a false mid-freefall
+    shock (drogue, maneuver, turbulence) is followed by continued buffeting. Over the
+    window ``[start + _DEPLOY_CONFIRM_LAG_S, start + _DEPLOY_CONFIRM_END_S]`` we require
+    the magnitude MEAN to sit in the canopy band (``_CANOPY_MAG_MEAN`` ±
+    ``_CANOPY_MAG_MEAN_TOL``) AND the spread to be canopy-tight. A candidate with under
+    ``_DEPLOY_CONFIRM_MIN_TAIL_S`` of telemetry after it can't be judged → unconfirmed.
+
+    Spread is the **median** absolute deviation (MAD), deliberately *not* the stdev.
+    On the real job that motivated this (b0b3176f…, the t=19-shaped fixture), an isolated
+    canopy-maneuver spike lands inside the opening's window and pushes the population
+    stdev to 0.4958 g — a mere 0.004 under the 0.5 g freefall-chaos threshold, and it
+    flips to a *reject* under sample stdev. MAD ignores that lone outlier (0.000 g here,
+    0.750 g under genuine continued chaos), so the smooth-vs-chaotic split has real
+    margin. Do NOT "simplify" this back to ``statistics.pstdev``/``stdev``.
+    """
+    if not profile or profile[-1][0] - start < _DEPLOY_CONFIRM_MIN_TAIL_S:
+        return False
+    window = [
+        m for t, m in profile
+        if start + _DEPLOY_CONFIRM_LAG_S <= t <= start + _DEPLOY_CONFIRM_END_S
+    ]
+    if len(window) < 2:
+        return False
+    if abs(statistics.fmean(window) - _CANOPY_MAG_MEAN) > _CANOPY_MAG_MEAN_TOL:
+        return False
+    median = statistics.median(window)
+    mad = statistics.median([abs(m - median) for m in window])
+    return mad < _CANOPY_MAG_STD
+
+
 def detect_deploy_offset(mp4_paths: Sequence[str | Path]) -> float:
     """Seconds into the freefall scene where the canopy opens (seam; mocked in tests).
 
@@ -382,18 +424,21 @@ def detect_deploy_offset(mp4_paths: Sequence[str | Path]) -> float:
     lives *inside* the freefall scene; this finds the opening shock so the canopy-opening
     beat can still be featured. ``0.0`` if no opening shock is found.
 
-    The parachute opening is the hardest deceleration of the whole jump — terminal
-    velocity bled off in a couple of seconds throws the strongest sustained g of the
-    skydive. Freefall buffeting and *later* canopy maneuvers (spirals, the landing flare)
-    also spike, but never as hard as the snap, so we take the start of the **strongest**
-    run of ≥2 consecutive over-threshold payloads — not the first (which can truncate the
-    freefall to a mid-air buffet) nor the last (which can land on a late canopy maneuver).
+    The parachute opening throws a large, sustained deceleration, but it is **not** always
+    the hardest of the jump: on tandems a mid-freefall jolt (drogue snatch, a maneuver,
+    turbulence) can out-spike the real main opening. So we collect every sustained shock
+    (≥2 consecutive over-threshold payloads) and, evaluating **strongest-first**, return
+    the first one *confirmed* by a smooth canopy signature in the seconds after it (see
+    ``_confirms_canopy``) — the buffeting continues after a false shock but not after a
+    real opening. Strongest-first keeps a genuinely-strongest opening winning while still
+    letting a strong-but-false spike be skipped for a weaker, confirmed one. If nothing
+    confirms (degraded/short GPMF, or the canopy ride runs off the end of the clip), we
+    fall back to the strongest shock — never regressing to 0.0 — and log a warning.
     """
     profile = _accel_means(list(mp4_paths))
     if len(profile) < 3:
         return 0.0
-    best_start = 0.0
-    best_peak = 0.0
+    candidates: list[tuple[float, float]] = []  # (start, peak) per sustained shock
     i, n = 0, len(profile)
     while i < n - 1:
         t, m = profile[i]
@@ -402,11 +447,22 @@ def detect_deploy_offset(mp4_paths: Sequence[str | Path]) -> float:
             while i < n and profile[i][1] > _DEPLOY_G:  # consume the whole run
                 peak = max(peak, profile[i][1])
                 i += 1
-            if peak > best_peak:  # the opening is the strongest shock, not the last
-                best_peak, best_start = peak, round(start, 2)
+            candidates.append((start, peak))
         else:
             i += 1
-    return best_start
+    if not candidates:
+        return 0.0
+    for start, _peak in sorted(candidates, key=lambda c: c[1], reverse=True):
+        if _confirms_canopy(profile, start):
+            logger.info("deploy: confirmed canopy opening at %.2fs", start)
+            return round(start, 2)
+    strongest = max(candidates, key=lambda c: c[1])[0]
+    logger.warning(
+        "deploy: no candidate confirmed a canopy signature; "
+        "falling back to strongest shock at %.2fs",
+        strongest,
+    )
+    return round(strongest, 2)
 
 
 def extract_gpmf_signals(mp4_path: str | Path) -> GpmfSignals:

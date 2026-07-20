@@ -82,6 +82,38 @@ def test_freefall_no_trailing_scenes() -> None:
     assert out2[0]["src_start"] >= 20.03 - 1e-6  # leading clip kept at/after E-8
 
 
+def test_story_cut_freefall_window_clamped() -> None:
+    # Regression: full_video / highlights (story cuts) also carry freefall footage, so
+    # the aerial window [E-8, D+3] must clamp their freefall clips too — pre-exit aircraft
+    # and post-opening scenery bled into full_video (job dc26cb4d). Non-freefall clips in
+    # a story cut pass through untouched.
+    manifest = _fx("external_21cdb2c5/scene_manifest.json")  # E=25.02, D=75.08 -> [17.02, 78.08]
+    edl = [
+        # non-freefall story clip: must be left alone (no freefall anchors to clamp to).
+        {"scene": "boarding", "src_start": 0.0, "src_end": 4.0,
+         "speed_multiplier": 1.0, "camera": None},
+        # pre-exit aircraft footage -> clamped up to the exit lead E-8.
+        {"scene": "freefall", "src_start": 0.0, "src_end": 25.02,
+         "speed_multiplier": 1.0, "camera": None},
+        # post-opening scenery -> clamped down to the deploy tail D+3.
+        {"scene": "freefall", "src_start": 68.07, "src_end": 82.549,
+         "speed_multiplier": 1.0, "camera": None},
+    ]
+    out, log = validate_and_repair(edl, "full_video", manifest)
+
+    freefall = [c for c in out if c["scene"] == "freefall"]
+    for c in freefall:  # every freefall clip inside [E-8, D+3] = [17.02, 78.08]
+        assert c["src_start"] >= 17.02 - 1e-6
+        assert c["src_end"] <= 78.08 + 1e-6
+    # The pre-exit clip's head is trimmed to the lead-in; the late scenery's tail to D+3.
+    assert any(c["src_start"] == pytest.approx(17.02) for c in freefall)
+    assert any(c["src_end"] == pytest.approx(78.08) for c in freefall)
+    # The boarding (non-freefall) clip survives unchanged.
+    assert {"scene": "boarding", "src_start": 0.0, "src_end": 4.0,
+            "speed_multiplier": 1.0, "camera": None} in out
+    assert any("freefall window" in line for line in log)
+
+
 # --------------------------------------------------------------------------- #
 # Story deliverables: boarding + intro
 # --------------------------------------------------------------------------- #
@@ -232,14 +264,23 @@ def test_ultimum_min_shot_and_switch_rate() -> None:
         t += _out_dur(c)
     assert early <= allowed_early
 
-    # (c) No source range was retimed: every kept clip is an input range or a merge of
-    #     contiguous input ranges of the same (camera, scene).
+    # (c) No source range was retimed: every kept clip is either an input range / a merge
+    #     of contiguous input ranges (boundaries match originals), or a freefall-window
+    #     clamp — a sub-range trimmed inside a single original range of the same
+    #     (camera, scene). A genuinely shifted clip lands outside its originals and fails
+    #     both checks.
     for c in out:
         key = (c.get("camera"), c["scene"])
-        starts = {round(s, 6) for s, _ in original.get(key, [])}
-        ends = {round(e, 6) for _, e in original.get(key, [])}
-        assert round(c["src_start"], 6) in starts
-        assert round(c["src_end"], 6) in ends
+        ranges = original.get(key, [])
+        starts = {round(s, 6) for s, _ in ranges}
+        ends = {round(e, 6) for _, e in ranges}
+        exact_or_merge = (
+            round(c["src_start"], 6) in starts and round(c["src_end"], 6) in ends
+        )
+        clamped_subrange = any(
+            os - 1e-6 <= c["src_start"] and c["src_end"] <= oe + 1e-6 for os, oe in ranges
+        )
+        assert exact_or_merge or clamped_subrange
 
 
 # --------------------------------------------------------------------------- #

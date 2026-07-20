@@ -348,6 +348,12 @@ def detect_exit_offset(mp4_path: str | Path) -> float:
 # Deployment detection: the parachute opening is a large, *sustained* high-g shock
 # (several g held for a couple seconds) — distinct from the brief spikes of freefall.
 _DEPLOY_G = 1.6
+#: Second-sample floor for a shock onset. A canopy opening can be a brief, soft spike whose
+#: peak clears _DEPLOY_G by a hair and whose next sample already dips; requiring two full
+#: over-_DEPLOY_G samples drops such openings entirely. We instead require one clear peak
+#: over _DEPLOY_G followed by a still-elevated sample over this soft floor (0.85x). Kept above
+#: typical belly-freefall magnitude (~1.0-1.3 g) so mid-freefall noise does not become a shock.
+_DEPLOY_SOFT_G = round(_DEPLOY_G * 0.85, 3)   # 1.36 g
 #: Candidate-confirmation window (seconds after a shock) and the minimum telemetry
 #: tail needed to judge it. A real opening is followed by a smooth canopy ride, so we
 #: inspect the magnitude over [shock+3s, shock+8s]; a shock with less than 4s of
@@ -441,15 +447,16 @@ def detect_deploy_offset(
     payloads).
 
     Selection is strongest-first, confirmed by a smooth canopy signature after it
-    (``_confirms_canopy``). But on GPS-less footage the true opening's immediate aftermath
-    is itself turbulent and can *fail* confirmation, letting the search drift to a later,
-    smoother shock. So when ``exit_offset`` is known we apply a physics prior: a real
-    opening lands ``_FREEFALL_MIN_S``–``_FREEFALL_MAX_S`` after exit. **Only if the
-    strongest-first pick lands outside that window** do we re-select among in-window
-    candidates (earliest confirmed, else the earliest in-window shock). If the pick is
-    already in-window, or no ``exit_offset`` is supplied, behaviour is unchanged. If
-    nothing confirms and no prior applies we fall back to the strongest shock — never
-    regressing to 0.0 — and log a warning.
+    (``_confirms_canopy``). But the opening is the **first** sustained shock of the
+    descent, not necessarily the hardest: a later, harder shock (canopy-flight
+    turbulence, a maneuver, toggle input) must not win just because it is stronger or the
+    strongest-first search reached it first. So when ``exit_offset`` is known we apply a
+    physics prior: a real opening lands ``_FREEFALL_MIN_S``–``_FREEFALL_MAX_S`` after
+    exit. Within that window we prefer the **earliest confirmed** shock (else the earliest
+    in-window shock), regardless of where the strongest-first pick landed. Only if the
+    window is empty, or no ``exit_offset`` is supplied, does the strongest-first pick
+    stand. If nothing confirms and no prior applies we fall back to the strongest shock —
+    never regressing to 0.0 — and log a warning.
     """
     profile = _accel_means(list(mp4_paths))
     if len(profile) < 3:
@@ -458,9 +465,12 @@ def detect_deploy_offset(
     i, n = 0, len(profile)
     while i < n - 1:
         t, m = profile[i]
-        if t >= 5.0 and m > _DEPLOY_G and profile[i + 1][1] > _DEPLOY_G:
+        # Shock onset: one clear peak over _DEPLOY_G with the next sample still elevated
+        # (over the soft floor). This admits brief, soft canopy openings — a single strong
+        # sample flanked by a dip — that a strict two-over-_DEPLOY_G rule would discard.
+        if t >= 5.0 and m > _DEPLOY_G and profile[i + 1][1] > _DEPLOY_SOFT_G:
             start, peak = t, m
-            while i < n and profile[i][1] > _DEPLOY_G:  # consume the whole run
+            while i < n and profile[i][1] > _DEPLOY_SOFT_G:  # consume while elevated
                 peak = max(peak, profile[i][1])
                 i += 1
             candidates.append((start, peak))
@@ -478,19 +488,27 @@ def detect_deploy_offset(
     if legacy is None:
         legacy = max(candidates, key=lambda c: c[1])[0]
 
-    # Physics-prior guard: only override when the legacy pick is implausibly early/late.
+    # Physics-prior guard. The opening is the FIRST sustained shock of the descent; a
+    # later, harder shock (canopy-flight turbulence, a maneuver, toggle input) must not
+    # win just because it is stronger or the strongest-first search reached it first.
+    # Within the plausible freefall window [exit+MIN, exit+MAX], prefer the EARLIEST
+    # confirmed shock; fall back to the earliest in-window shock; only if the window is
+    # empty do we keep the legacy strongest-first pick (e.g. an out-of-window opening or
+    # a jump with no in-window candidate).
     if exit_offset > 0.0:
         lo, hi = exit_offset + _FREEFALL_MIN_S, exit_offset + _FREEFALL_MAX_S
         in_window = sorted(s for s, _ in candidates if lo <= s <= hi)
-        if not (lo <= legacy <= hi) and in_window:
+        if in_window:
             confirmed = [s for s in in_window if _confirms_canopy(profile, s)]
             chosen = confirmed[0] if confirmed else in_window[0]
-            logger.info(
-                "deploy: legacy pick %.2fs outside freefall window [%.1f, %.1f]; "
-                "re-selected %.2fs (%s)",
-                legacy, lo, hi, chosen,
-                "confirmed-in-window" if confirmed else "earliest-in-window",
-            )
+            if abs(chosen - legacy) > 0.01:
+                logger.info(
+                    "deploy: legacy pick %.2fs superseded by earliest %s in freefall "
+                    "window [%.1f, %.1f]: %.2fs",
+                    legacy,
+                    "confirmed shock" if confirmed else "shock",
+                    lo, hi, chosen,
+                )
             return round(chosen, 2)
 
     if _confirms_canopy(profile, legacy):

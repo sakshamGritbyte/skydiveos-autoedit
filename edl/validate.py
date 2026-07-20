@@ -241,9 +241,18 @@ def _clamp_freefall_window(
     manifest: dict[str, Any],
     manifest_by_camera: dict[str, dict[str, Any]] | None,
 ) -> tuple[list[ClipDict], list[str]]:
-    """Clamp freefall clips to ``[E - 8, D + 3]`` (door/exit-prep to opening shock)."""
+    """Clamp freefall clips to ``[E - 8, D + 3]`` (door/exit-prep to opening shock).
+
+    Only clips *of the freefall scene* are clamped — every other scene passes through
+    untouched. Freefall-only cuts run ``_drop_non_freefall`` first (so this is a no-op
+    guard there), but story cuts (``full_video``/``highlights``) legitimately keep
+    intro/boarding/landing/outro clips, which must NOT be clamped to the aerial window.
+    """
     kept, log = [], []
     for c in clips:
+        if c["scene"] != _FREEFALL_SCENE:
+            kept.append(c)
+            continue
         anchors = _ff_anchors(_manifest_for(c, manifest, manifest_by_camera))
         if anchors is None:
             kept.append(c)
@@ -701,7 +710,14 @@ def validate_and_repair(
         return fixed
 
     if deliverable in FREEFALL_DELIVERABLES:
+        # Freefall-only cuts contain nothing but the freefall scene.
         clips = _apply(_drop_non_freefall(clips))
+    if deliverable in FREEFALL_DELIVERABLES or deliverable in _STORY_DELIVERABLES:
+        # The aerial-freefall window (exit -> deploy, with lead/tail allowance) applies to
+        # every deliverable that carries freefall footage: story cuts (full_video, highlights)
+        # must not show pre-exit aircraft footage or post-opening scenery either.
+        # _clamp_freefall_window only clamps freefall-scene clips, so intro/boarding/landing/
+        # outro clips in story cuts pass through untouched.
         clips = _apply(_clamp_freefall_window(clips, manifest, manifest_by_camera))
     clips = _apply(_dedupe(clips))
     clips = _apply(_sort_chronological(clips, ranks, multicam))

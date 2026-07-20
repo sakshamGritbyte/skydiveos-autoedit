@@ -483,6 +483,7 @@ def create_app() -> FastAPI:
         allow_origins=[
             "http://localhost:3000",  # React dev server
             "http://localhost:5173",  # Vite dev server
+            "https://dev.ultimatedzm.com",  # dev frontend
             "https://ultimatedzm.com",  # production frontend
             "https://www.ultimatedzm.com",
         ],

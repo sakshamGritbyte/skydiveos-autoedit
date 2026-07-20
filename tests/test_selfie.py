@@ -895,6 +895,55 @@ def test_deploy_prior_no_op_when_legacy_already_in_window(
     assert selfie.detect_deploy_offset(["x.mp4"], exit_offset=27.0) == 91.0
 
 
+def test_deploy_prefers_earliest_confirmed_in_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Job 87034c: opening 67 (1.66g) then harder canopy-flight shocks 75-78 (up to 2.8g),
+    # all confirming. exit=25 => window [65,105]. Earliest confirmed (67) must win.
+    prof = _profile_with_shocks([(53, 54, 1.62), (67, 68, 1.66), (75, 78, 2.81)])
+    monkeypatch.setattr(selfie, "_accel_means", lambda paths: prof)
+    monkeypatch.setattr(selfie, "_confirms_canopy", lambda profile, s: True)  # all confirm
+    assert selfie.detect_deploy_offset(["x.mp4"], exit_offset=25.02) == 67.0
+
+
+def test_deploy_ba38_still_91(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Previous job: 61/91/97 unconfirmed, 108 confirmed & out-of-window (window [67,107]).
+    # No confirmed-in-window => earliest in-window (91) wins. Must stay 91.
+    prof = _profile_with_shocks([(61, 62, 1.62), (91, 92, 1.74), (97, 104, 2.84), (108, 110, 2.01)])
+    monkeypatch.setattr(selfie, "_accel_means", lambda paths: prof)
+    monkeypatch.setattr(selfie, "_confirms_canopy", lambda profile, s: abs(s - 108) < 0.5)
+    assert selfie.detect_deploy_offset(["x.mp4"], exit_offset=27.03) == 91.0
+
+
+def test_deploy_soft_single_sample_opening_becomes_candidate(monkeypatch):
+    # Job 87034c: opening is a soft single-sample spike (67 s = 1.66 g) flanked by ~1.4 g,
+    # then a harder canopy-flight cluster at 75-78 s. exit=25 => window [65,105].
+    # The soft-floor onset must surface 67 as a candidate; earliest-confirmed-in-window
+    # then picks it over the 75 cluster.
+    prof = [(float(t), 1.05) for t in range(26, 62)]
+    prof += [(62., 1.45), (63., 1.30), (64., 1.45), (65., 1.42), (66., 1.40),
+             (67., 1.66), (68., 1.40), (69., 1.59), (70., 1.49), (71., 1.28),
+             (72., 1.52), (73., 1.16), (74., 1.27),
+             (75., 1.97), (76., 2.40), (77., 2.81), (78., 1.99), (79., 1.57)]
+    prof += [(float(t), 1.0) for t in range(80, 90)]
+    monkeypatch.setattr(selfie, "_accel_means", lambda paths: prof)
+    monkeypatch.setattr(selfie, "_confirms_canopy", lambda profile, s: True)
+    assert selfie.detect_deploy_offset(["x.mp4"], exit_offset=25.02) == 67.0
+
+
+def test_deploy_soft_floor_excludes_midfreefall_spike(monkeypatch):
+    # A lone mid-freefall spike (53 s, next sample 1.30 < 1.36 soft floor) must NOT become a
+    # candidate; the sustained opening at 91 remains the pick (ba38-style).
+    prof = [(float(t), 1.05) for t in range(26, 53)]
+    prof += [(53., 1.62), (54., 1.30)]                       # lone spike, next dips below soft
+    prof += [(float(t), 1.1) for t in range(55, 91)]
+    prof += [(91., 1.74), (92., 1.71), (93., 1.30)]          # sustained opening
+    prof += [(float(t), 1.0) for t in range(94, 100)]
+    monkeypatch.setattr(selfie, "_accel_means", lambda paths: prof)
+    monkeypatch.setattr(selfie, "_confirms_canopy", lambda profile, s: abs(s - 91) < 0.6)
+    assert selfie.detect_deploy_offset(["x.mp4"], exit_offset=27.03) == 91.0
+
+
 def test_canopy_opening_detected_inside_freefall_scene() -> None:
     # No separate canopy scene: the canopy ride is part of the 110 s freefall clip, with
     # the opening detected at 86 s. It must still be featured as a beat, and freefall

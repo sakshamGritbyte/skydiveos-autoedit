@@ -718,6 +718,51 @@ def test_detect_exit_offset_zero_when_no_dip(monkeypatch: pytest.MonkeyPatch) ->
     assert selfie.detect_exit_offset("/x/freefall.mp4") == 0.0
 
 
+def _fake_gpmf_meanmin(series: list[tuple[float, float]]) -> Any:
+    """A GpmfData whose per-second ACCL payloads have the given (mean, min) magnitude (g).
+
+    Each payload is five samples: four at a solved-for high value plus one at the min, so
+    the payload's magnitude mean is exactly ``mean`` and its min exactly ``mn`` — letting a
+    test drive the mean and min independently (a door-shake is low-min but ~1g-mean)."""
+    from metadata.gpmf import GpmfData, StreamSamples
+
+    payloads = []
+    for mean, mn in series:
+        hi = (5 * mean - mn) / 4  # four @ hi + one @ mn averages to exactly `mean`
+        payloads.append([(hi * 9.80665, 0.0, 0.0)] * 4 + [(mn * 9.80665, 0.0, 0.0)])
+    times = [float(t) for t in range(len(series))]
+    accl = StreamSamples(fourcc="ACCL", payloads=payloads, times=times)
+    return GpmfData(streams={"ACCL": accl}, duration_s=float(len(series)))
+
+
+def test_exit_ignores_door_shake_min_spikes(monkeypatch: pytest.MonkeyPatch) -> None:
+    # External-cameraman pattern (job bccfae94): low-min spikes at t=27-32 while the mean
+    # stays ~1g (shaking at the open door, still on the plane), then the real exit at t=40
+    # where mean AND min collapse. Must return 40, not the first door-shake at 27.
+    plane = [(1.0, 0.9)] * 24  # t=0..23 steady ~1g flight
+    door = [
+        (0.95, 0.88), (0.97, 0.88), (1.06, 0.48), (1.16, 0.13), (1.06, 0.36), (1.10, 0.35),
+        (1.30, 0.19), (1.14, 0.14), (1.07, 0.19), (1.06, 0.34), (0.97, 0.42), (0.93, 0.39),
+        (0.97, 0.30), (1.04, 0.50), (1.05, 0.51), (1.03, 0.44), (0.41, 0.08), (0.31, 0.11),
+    ]  # t=24..41; real exit at t=40 (index 16 of `door`)
+    data = _fake_gpmf_meanmin(plane + door)
+    monkeypatch.setattr("metadata.gpmf.parse_gpmf", lambda p: data)
+    assert selfie.detect_exit_offset("/x/external.mp4") == 40.0
+
+
+def test_exit_still_detects_genuine_tumbling_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Instructor pattern: the mean collapses to 0.57 (< plane 0.85) at t=29 — a genuine exit
+    # the mean-guard must NOT suppress. Returns 29 (regression against over-tightening).
+    plane = [(1.0, 0.9)] * 24
+    tumble = [
+        (1.02, 0.9), (1.10, 0.9), (1.16, 0.9), (1.11, 0.9), (1.03, 0.5),
+        (0.57, 0.3), (0.40, 0.2), (0.78, 0.3), (0.73, 0.3), (0.81, 0.3),
+    ]  # t=24..33; exit at t=29
+    data = _fake_gpmf_meanmin(plane + tumble)
+    monkeypatch.setattr("metadata.gpmf.parse_gpmf", lambda p: data)
+    assert selfie.detect_exit_offset("/x/instructor.mp4") == 29.0
+
+
 def test_exit_offset_drives_freefall_and_highlights() -> None:
     # The freefall clip starts inside the plane; the real exit is at 20 s.
     manifest = {

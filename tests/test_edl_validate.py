@@ -84,15 +84,15 @@ def test_freefall_no_trailing_scenes() -> None:
 
 def test_story_cut_freefall_window_clamped() -> None:
     # Regression: full_video / highlights (story cuts) also carry freefall footage, so
-    # the aerial window [E-8, D+3] must clamp their freefall clips too — pre-exit aircraft
+    # the aerial window [E-0, D+3] must clamp their freefall clips too — pre-exit aircraft
     # and post-opening scenery bled into full_video (job dc26cb4d). Non-freefall clips in
     # a story cut pass through untouched.
-    manifest = _fx("external_21cdb2c5/scene_manifest.json")  # E=25.02, D=75.08 -> [17.02, 78.08]
+    manifest = _fx("external_21cdb2c5/scene_manifest.json")  # E=25.02, D=75.08 -> [25.02, 78.08]
     edl = [
         # non-freefall story clip: must be left alone (no freefall anchors to clamp to).
         {"scene": "boarding", "src_start": 0.0, "src_end": 4.0,
          "speed_multiplier": 1.0, "camera": None},
-        # pre-exit aircraft footage -> clamped up to the exit lead E-8.
+        # pre-exit aircraft footage -> dropped (entirely before exit).
         {"scene": "freefall", "src_start": 0.0, "src_end": 25.02,
          "speed_multiplier": 1.0, "camera": None},
         # post-opening scenery -> clamped down to the deploy tail D+3.
@@ -102,11 +102,11 @@ def test_story_cut_freefall_window_clamped() -> None:
     out, log = validate_and_repair(edl, "full_video", manifest)
 
     freefall = [c for c in out if c["scene"] == "freefall"]
-    for c in freefall:  # every freefall clip inside [E-8, D+3] = [17.02, 78.08]
-        assert c["src_start"] >= 17.02 - 1e-6
+    for c in freefall:  # every freefall clip inside [E-0, D+3] = [25.02, 78.08]
+        assert c["src_start"] >= 25.02 - 1e-6
         assert c["src_end"] <= 78.08 + 1e-6
-    # The pre-exit clip's head is trimmed to the lead-in; the late scenery's tail to D+3.
-    assert any(c["src_start"] == pytest.approx(17.02) for c in freefall)
+    # The pre-exit clip is dropped entirely; the late scenery's tail is clamped to D+3.
+    assert not any(float(c["src_start"]) < 25.02 for c in freefall)
     assert any(c["src_end"] == pytest.approx(78.08) for c in freefall)
     # The boarding (non-freefall) clip survives unchanged.
     assert {"scene": "boarding", "src_start": 0.0, "src_end": 4.0,
@@ -194,6 +194,48 @@ def test_boarding_fallback_without_file_offsets() -> None:
     ]
     _, log2 = validate_and_repair(compliant, "highlights", manifest)
     assert not any("boarding" in line for line in log2)
+
+
+def test_highlights_intro_entry_beat_injected_multicam() -> None:
+    # intro spans two files: interview (0.0) + aircraft entry (40.924). Highlights that only
+    # has the head interview clip must gain the entry beat at the second file's offset.
+    manifest_ext = {
+        "scenes": [
+            {
+                "name": "intro_interview",
+                "duration": 50.802,
+                "file_offsets": [
+                    {"file": "A.MP4", "offset": 0.0},
+                    {"file": "B.MP4", "offset": 40.924},
+                ],
+            },
+            {"name": "freefall", "exit_offset": 27.03, "deploy_offset": 91.09,
+             "duration": 112.0},
+        ]
+    }
+    manifest = {"scenes": manifest_ext["scenes"]}
+    edl = [
+        {"scene": "intro_interview", "src_start": 0.0, "src_end": 8.0,
+         "speed_multiplier": 1.0, "camera": "external"},
+    ]
+    repaired, log = validate_and_repair(
+        edl, "highlights", manifest,
+        manifest_by_camera={"external": manifest_ext, "instructor": manifest_ext},
+    )
+    intro_clips = [c for c in repaired if c["scene"] == "intro_interview"]
+    # head (0-8) kept AND an entry clip covering 40.924 added
+    assert any(c["src_start"] <= 40.924 <= c["src_end"] for c in intro_clips), intro_clips
+    assert any("aircraft entry" in line for line in log)
+
+
+def test_highlights_intro_single_file_no_entry_beat() -> None:
+    # intro is one continuous file (no separate entry) -> no entry beat injected.
+    manifest = {"scenes": [{"name": "intro_interview", "duration": 20.0,
+                            "file_offsets": [{"file": "A.MP4", "offset": 0.0}]}]}
+    edl = [{"scene": "intro_interview", "src_start": 0.0, "src_end": 8.0,
+            "speed_multiplier": 1.0, "camera": None}]
+    repaired, log = validate_and_repair(edl, "highlights", manifest)
+    assert not any("aircraft entry" in line for line in log)
 
 
 # --------------------------------------------------------------------------- #

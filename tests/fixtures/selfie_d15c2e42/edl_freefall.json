@@ -1,13 +1,6 @@
 [
   {
     "scene": "freefall",
-    "src_start": 26.0,
-    "src_end": 30.03,
-    "speed_multiplier": 1.0,
-    "camera": null
-  },
-  {
-    "scene": "freefall",
     "src_start": 30.03,
     "src_end": 31.03,
     "speed_multiplier": 0.4,

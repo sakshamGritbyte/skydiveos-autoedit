@@ -339,7 +339,10 @@ def detect_exit_offset(mp4_path: str | Path) -> float:
         if not was_plane:
             continue
         mean_dip = means[i] < _EXIT_DIP_G and means[i + 1] < _EXIT_DIP_G + 0.1
-        weightless = mins[i] < _EXIT_WEIGHTLESS_G
+        # A near-0g min marks a tumbling exit ONLY if the payload mean is also leaving
+        # plane ~1g. A cameraman jerking at the open door throws brief low-min spikes
+        # while the mean stays ~1g (still on the aircraft); those must not read as the exit.
+        weightless = mins[i] < _EXIT_WEIGHTLESS_G and means[i] < _EXIT_PLANE_G
         if mean_dip or weightless:
             return round(times[i], 2)
     return 0.0

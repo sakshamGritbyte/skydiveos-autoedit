@@ -43,7 +43,7 @@ _INTRO_SCENE = "intro_interview"
 _SLOWMO = 0.4
 
 #: The door/exit-prep allowance kept before the detected exit in freefall cuts.
-_EXIT_LEAD_S = 8.0
+_EXIT_LEAD_S = 0.0
 #: Opening-shock allowance kept after the detected deploy in freefall cuts.
 _DEPLOY_TAIL_S = 3.0
 #: The injected deployment beat spans [D - 1, D + 2] at 0.4x.
@@ -496,35 +496,78 @@ def _require_intro(
                 break
     if intro is None:
         return list(clips), []
-    if any(
-        c["scene"] == _INTRO_SCENE and _src_len(c) >= _INTRO_MIN_S - _EPS for c in clips
-    ):
-        return list(clips), []
 
     dur = max(float(intro.get("duration", 0.0)), 0.1)
-    head_end = min(_INTRO_MIN_S, dur)
     out = list(clips)
-    # A shorter intro clip already at the head gets extended instead of duplicated.
-    for i, c in enumerate(out):
-        if c["scene"] == _INTRO_SCENE and float(c["src_start"]) < head_end:
-            grown = {**c, "src_end": min(float(c["src_start"]) + _INTRO_MIN_S, dur)}
-            out[i] = grown
-            return out, [
-                f"extended intro clip {_fmt(c)} -> "
-                f"[{float(grown['src_start']):.2f}, {float(grown['src_end']):.2f}]"
-                f" — highlights intro must run >= {_INTRO_MIN_S:g}s"
-            ]
-    beat: ClipDict = {
-        "scene": _INTRO_SCENE,
-        "src_start": 0.0,
-        "src_end": head_end,
-        "speed_multiplier": 1.0,
-        "camera": cam,
-    }
-    return (
-        _insert_chronological(out, beat, ranks),
-        [f"injected intro head {_fmt(beat)} — highlights lacked a >={_INTRO_MIN_S:g}s intro clip"],
+    log: list[str] = []
+
+    # (1) Head interview beat — an intro clip of >= _INTRO_MIN_S near the scene head.
+    has_head = any(
+        c["scene"] == _INTRO_SCENE
+        and float(c["src_start"]) < _INTRO_MIN_S
+        and _src_len(c) >= _INTRO_MIN_S - _EPS
+        for c in out
     )
+    if not has_head:
+        head_end = min(_INTRO_MIN_S, dur)
+        grew = False
+        # A shorter intro clip already at the head gets extended instead of duplicated.
+        for i, c in enumerate(out):
+            if c["scene"] == _INTRO_SCENE and float(c["src_start"]) < head_end:
+                grown = {**c, "src_end": min(float(c["src_start"]) + _INTRO_MIN_S, dur)}
+                out[i] = grown
+                log.append(
+                    f"extended intro clip {_fmt(c)} -> "
+                    f"[{float(grown['src_start']):.2f}, {float(grown['src_end']):.2f}]"
+                    f" — highlights intro must run >= {_INTRO_MIN_S:g}s"
+                )
+                grew = True
+                break
+        if not grew:
+            beat: ClipDict = {
+                "scene": _INTRO_SCENE,
+                "src_start": 0.0,
+                "src_end": head_end,
+                "speed_multiplier": 1.0,
+                "camera": cam,
+            }
+            out = _insert_chronological(out, beat, ranks)
+            log.append(
+                f"injected intro head {_fmt(beat)} — highlights lacked a "
+                f">={_INTRO_MIN_S:g}s intro clip"
+            )
+
+    # (2) Aircraft-entry beat — when the intro spans >= 2 source files, the entry (boarding
+    # the plane) lives at the second file's offset, not the scene head. The head-interview
+    # clip does not cover it, so guarantee it explicitly (mirrors single-cam _intro_entry_clip
+    # and the file_offsets handling in _require_boarding).
+    offsets = intro.get("file_offsets") or []
+    if len(offsets) >= 2:
+        entry_lo = float(offsets[1]["offset"])
+        entry_hi = min(entry_lo + _INTRO_MIN_S, dur)
+        if entry_hi - entry_lo >= _INTRO_MIN_S - _EPS:
+            covered = any(
+                c["scene"] == _INTRO_SCENE
+                and float(c["src_start"]) <= entry_lo + _EPS
+                and float(c["src_end"]) >= entry_lo + _EPS
+                for c in out
+            )
+            if not covered:
+                entry: ClipDict = {
+                    "scene": _INTRO_SCENE,
+                    "src_start": entry_lo,
+                    "src_end": entry_hi,
+                    "speed_multiplier": 1.0,
+                    "camera": cam,
+                }
+                out = _insert_chronological(out, entry, ranks)
+                log.append(
+                    f"injected aircraft entry {_fmt(entry)} — highlights lacked the "
+                    f"intro entry beat at file '{offsets[1].get('file', '?')}' "
+                    f"(offset {entry_lo:.2f})"
+                )
+
+    return out, log
 
 
 def _anchored(

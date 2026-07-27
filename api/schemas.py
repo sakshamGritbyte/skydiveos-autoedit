@@ -28,6 +28,7 @@ class CreateJobRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     customer_name: str | None = Field(default=None, examples=["Jane Doe"])
+    customer_email: str | None = Field(default=None, examples=["jane@example.com"])
     jump_date: str | None = Field(default=None, examples=["2026-06-02"])
     camera_id: str | None = Field(default=None, examples=["1234"])
     music: str | None = Field(default=None, examples=["sunrise"])
@@ -45,6 +46,7 @@ class JobResponse(BaseModel):
     job_id: str
     status: JobStatus
     customer_name: str
+    customer_email: str | None
     jump_date: str | None
     camera_id: str | None
     music: str | None
@@ -57,6 +59,8 @@ class JobResponse(BaseModel):
     error: str | None
     #: Rendered deliverables, present (non-null) only once status == ready.
     outputs: dict[str, str] | None
+    #: Presigned customer download links, present only once status == delivered.
+    delivery_links: dict[str, str] | None
     created_at: float
     updated_at: float
 
@@ -67,6 +71,7 @@ class JobResponse(BaseModel):
             job_id=job.job_id,
             status=job.status,
             customer_name=job.customer_name,
+            customer_email=job.customer_email,
             jump_date=job.jump_date,
             camera_id=job.camera_id,
             music=job.music,
@@ -77,6 +82,7 @@ class JobResponse(BaseModel):
             reject_reason=job.reject_reason,
             error=job.error,
             outputs=job.outputs,
+            delivery_links=job.delivery_links,
             created_at=job.created_at,
             updated_at=job.updated_at,
         )

@@ -68,3 +68,15 @@ def resolve_music(name: str | None = None, root: str | Path | None = None) -> Pa
         if name in (track.name, track.stem):
             return track
     return None
+
+
+def list_music(root: str | Path | None = None) -> list[Path]:
+    """Every backing track in ``templates/music/``, sorted (deterministic order).
+
+    The default pool a job's music is drawn from when its booking names none. Empty
+    when the directory is absent or holds no audio.
+    """
+    music_dir = templates_root(root) / MUSIC_DIRNAME
+    if not music_dir.is_dir():
+        return []
+    return sorted(p for p in music_dir.iterdir() if p.suffix.lower() in _MUSIC_SUFFIXES)

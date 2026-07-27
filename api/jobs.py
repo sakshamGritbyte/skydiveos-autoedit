@@ -161,6 +161,9 @@ class Job(BaseModel):
 
     # Inputs needed to (re-)run the pipeline and burn the intro card.
     customer_name: str = "Valued Skydiver"
+    #: Where the delivery email goes. ``None`` → the delivery step can't email; it
+    #: still generates links and reports them to SkydiveOS (which knows the booking).
+    customer_email: str | None = None
     jump_date: str | None = None  # ISO date burned onto the intro (None → today at render)
     camera_id: str | None = None  # set when the source came from an Open GoPro pull
     source_path: str | None = None  # full-res master MP4 the render cuts from
@@ -180,6 +183,10 @@ class Job(BaseModel):
     # Rendered deliverables, set when status == ready (selfie package). Maps a
     # deliverable name (full_video / highlights / freefall / photos) to its path.
     outputs: dict[str, str] | None = None
+
+    #: Presigned download links sent to the customer, set when status == delivered.
+    #: Maps deliverable name → URL (expires after ``DELIVERY_LINK_TTL_DAYS``).
+    delivery_links: dict[str, str] | None = None
 
     created_at: float = 0.0
     updated_at: float = 0.0

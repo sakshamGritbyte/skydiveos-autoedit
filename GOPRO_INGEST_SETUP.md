@@ -153,7 +153,8 @@ npm start
 
 4. Pair each GoPro to an instructor — from the UI:
      Frontend → Staff → open an instructor → "GoPro Camera" section → "Pair GoPro"
-     → type the serial (e.g. TESTGOPRO001) → Pair
+     → type the serial (e.g. TESTGOPRO001; real cameras: the LAST 4 DIGITS of the
+       serial, e.g. 4313 — the same id used with --pair on the CLI) → Pair
    This updates BOTH the AI backend allow-list and the instructor's account.
 
    [REAL cameras only — once per camera, on the client computer:]
@@ -235,6 +236,8 @@ clips are never re-pulled.
 | `Address already in use` (port 8000) | An old AI backend is still running | `fuser -k 8000/tcp`, then start again |
 | Media appears but **no preview** | (Fixed) raw videos had no preview key | The detail dialog now streams the original MP4; ensure the frontend is up to date |
 | Serial change in `.env` ignored | Settings are cached at startup | Restart the AI backend after editing its `.env` |
+| `RuntimeError: The Wifi driver ... only supports en_US` (or `KeyError: 'LANG'`) | GoPro SDK requires `LANG=en_US*`; non-English Macs set another locale, launchd sets none | Prefix manual commands with `LANG=en_US.UTF-8`; the service sets it automatically (`deploy/mac/run.sh`) |
+| `Failed to find a device in 15 seconds. Retrying …` (camera IS in pairing mode) | Wrong camera id: cameras advertise as `GoPro <last-4-digits>`, so a full serial never matches; or Bluetooth permission not granted | Use the last 4 digits of the serial everywhere (CLI **and** UI pairing); allow Terminal under Privacy & Security → Bluetooth; keep the camera on its pairing screen |
 
 ### Three things that must always be true
 1. The serial in the camera registry **= the serial paired to an instructor** in SkydiveOS.
@@ -269,8 +272,12 @@ bash deploy/mac/install.sh          # Homebrew + python@3.11 + ffmpeg + uv;
 # → edit .env (S3_BUCKET, AWS_* keys, SKYDIVEOS_API_BASE=<EC2 url>, MONGO_URL,
 #   ENABLE_AUTO_DISCOVERY=1, CAMERA_SCANNER=ble)
 # → System Settings > Privacy & Security > Bluetooth > enable Terminal
-# → pair each camera once (via the .venv):
-uv run python -m ingest.pull --camera <serial> --pair --name "<label>" --instructor-id <id>
+# → pair each camera once (via the .venv). The camera id is the LAST 4 DIGITS of
+#   the serial — what the camera advertises as "GoPro XXXX" (serial C3504224544313
+#   → id 4313); a full serial is auto-shortened with a warning. The LANG prefix is
+#   required on a non-English Mac — the GoPro SDK parses CLI output and insists on
+#   en_US:
+LANG=en_US.UTF-8 uv run python -m ingest.pull --camera <last-4-digits> --pair --name "<label>" --instructor-id <id>
 bash deploy/mac/load-service.sh     # run as a launchd service (auto-start on boot,
                                     # relaunch on crash); logs in ./logs/
 # → FIRST scan: approve the macOS Bluetooth prompt for the *service* (Terminal's

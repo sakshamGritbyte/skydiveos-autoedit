@@ -38,6 +38,12 @@ class JobQueue(Protocol):
         """Queue an Open GoPro pull to source a job from a camera."""
         ...
 
+    def enqueue_s3_ingest(
+        self, job_id: str, s3_key: str, camera_role: str | None = None
+    ) -> None:
+        """Queue a download of a raw master already staged in S3 (auto-discovery path)."""
+        ...
+
 
 class CeleryJobQueue:
     """Production :class:`JobQueue` — dispatches to the Celery tasks via ``.delay``."""
@@ -66,3 +72,10 @@ class CeleryJobQueue:
         from .tasks import pull_camera_job
 
         pull_camera_job.delay(job_id, camera_id)
+
+    def enqueue_s3_ingest(
+        self, job_id: str, s3_key: str, camera_role: str | None = None
+    ) -> None:
+        from .tasks import ingest_s3_job
+
+        ingest_s3_job.delay(job_id, s3_key, camera_role)

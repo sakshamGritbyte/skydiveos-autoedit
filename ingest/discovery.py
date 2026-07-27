@@ -20,7 +20,8 @@ The loop, end to end:
    *newly downloaded* jump (already-staged jumps emit nothing, which naturally
    dedupes hand-offs across scans). Those events are routed to an in-process queue
    instead of Redis; a second loop drains them and, *after* the pull, uploads the
-   MP4 to S3 and POSTs a small JSON ``{s3_key, camera_id, instructor_id}`` to
+   MP4 to S3 and POSTs a small JSON
+   ``{s3_key, camera_id, instructor_id?, camera_role?, captured_at?}`` to
    SkydiveOS (``{SKYDIVEOS}/api/media/raw-upload``). SkydiveOS creates the media record
    from the key — large videos never stream through the web layer, and discovery
    never creates a job itself.
@@ -51,6 +52,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_INTERVAL = 30.0
 #: SkydiveOS path the S3-key notification is POSTed to (it creates the media record).
 RAW_UPLOAD_PATH = "/api/media/raw-upload"
+#: Event key counting failed hand-off attempts (see ``_schedule_handoff_retry``).
+_HANDOFF_ATTEMPTS_KEY = "_handoff_attempts"
+
+#: Ceiling on the exponential backoff between hand-off retries, in seconds.
+_HANDOFF_MAX_DELAY = 300.0
+
 #: S3 key prefix for pulled raw masters: ``{prefix}/{camera_id}/{filename}``.
 S3_KEY_PREFIX = "raw"
 
@@ -64,6 +71,67 @@ PullFn = Callable[..., Awaitable[Any]]
 UploadFn = Callable[[str, str, str | None, str | None], None]
 
 
+def _probe_capture_time(mp4_path: str, *, clock_tz: str | None = None) -> str | None:
+    """Best-effort ISO-8601 UTC capture time from the MP4 container (``creation_time``).
+
+    The deterministic footage→booking match on the SkydiveOS side keys on
+    ``camera_id`` + *when the jump was filmed*; the MP4's ``creation_time`` tag (set by
+    the GoPro at recording start) is that wall-clock in one ``ffprobe`` call, no GPMF
+    parse needed. Returns ``None`` — never raises — when the tag is missing, ffprobe is
+    unavailable, or the file is unreadable, so a hand-off is never blocked by it (the
+    matcher then falls back to its load-window logic).
+
+    ``clock_tz`` (an IANA name, e.g. ``America/Toronto``) handles the GoPro quirk that
+    ``creation_time`` is the camera's LOCAL wall-clock mislabelled ``Z``: when given, the
+    timestamp is reinterpreted as local time in that zone and converted to TRUE UTC, so
+    the value SkydiveOS receives is a real instant. Omit it only if the cameras' clocks
+    are actually set to UTC.
+    """
+    import json
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format_tags=creation_time",
+                "-of", "json",
+                mp4_path,
+            ],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout
+        raw = json.loads(out).get("format", {}).get("tags", {}).get("creation_time")
+        if not raw:
+            return None
+        return _to_true_utc(raw, clock_tz)
+    except Exception as e:  # noqa: BLE001 - capture time is optional; never block a hand-off
+        logger.warning("could not read capture time from %s: %r", mp4_path, e)
+        return None
+
+
+def _to_true_utc(raw: str, clock_tz: str | None) -> str:
+    """Reinterpret a GoPro ``creation_time`` as true UTC using ``clock_tz``.
+
+    Without ``clock_tz`` the tag is passed through unchanged (assumed already UTC). With
+    it, the wall-clock digits are treated as local time in that zone (the trailing ``Z``
+    or offset the GoPro/ffprobe wrote is a lie) and converted to UTC. Best-effort: any
+    parse/zone error returns ``raw`` so a hand-off is never blocked by it.
+    """
+    if not clock_tz:
+        return raw
+    import re
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    try:
+        naive = re.sub(r"(Z|[+-]\d{2}:?\d{2})$", "", raw)  # drop the misleading tz label
+        local = datetime.fromisoformat(naive).replace(tzinfo=ZoneInfo(clock_tz))
+        return local.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    except Exception as e:  # noqa: BLE001 - never block a hand-off on a tz/parse hiccup
+        logger.warning("could not convert capture time %r via %s: %r", raw, clock_tz, e)
+        return raw
+
+
 def s3_notify_uploader(
     skydiveos_url: str,
     *,
@@ -74,14 +142,18 @@ def s3_notify_uploader(
     key_prefix: str = S3_KEY_PREFIX,
     path: str = RAW_UPLOAD_PATH,
     timeout: float = 30.0,
+    clock_tz: str | None = None,
 ) -> UploadFn:
     """Build the default uploader: PUT the pulled MP4 to S3, then notify SkydiveOS.
 
     Uploads the file to ``s3://{bucket}/{key_prefix}/{camera_id}/{name}`` (boto3's
     ``upload_file`` multiparts large videos automatically), then POSTs a small JSON
-    ``{s3_key, camera_id, instructor_id}`` to ``{skydiveos_url}{path}`` — SkydiveOS
-    creates the media record from the key, so big files never stream through the web
-    layer. The S3 client is created once on first use (``boto3``/``httpx`` imported
+    ``{s3_key, camera_id, instructor_id?, camera_role?, captured_at?}`` to
+    ``{skydiveos_url}{path}`` — SkydiveOS creates the media record from the key, so big
+    files never stream through the web layer. ``captured_at`` (the MP4's ISO-8601 UTC
+    ``creation_time``) lets SkydiveOS match the footage to the right jump/booking
+    deterministically by camera + capture time; it is omitted when unreadable. The S3
+    client is created once on first use (``boto3``/``httpx`` imported
     lazily); pass ``s3_client`` to inject a fake in tests. Raises on a non-2xx
     notify response so the caller can log a failed hand-off.
     """
@@ -112,6 +184,9 @@ def s3_notify_uploader(
             payload["instructor_id"] = instructor_id
         if camera_role is not None:
             payload["camera_role"] = camera_role
+        captured_at = _probe_capture_time(mp4_path, clock_tz=clock_tz)
+        if captured_at is not None:
+            payload["captured_at"] = captured_at
         resp = httpx.post(f"{skydiveos_url.rstrip('/')}{path}", json=payload, timeout=timeout)
         resp.raise_for_status()
 
@@ -157,6 +232,8 @@ class CameraDiscoveryService:
         pull: PullFn | None = None,
         interval: float = DEFAULT_INTERVAL,
         install_signal_handlers: bool = False,
+        handoff_retry_delay: float = 10.0,
+        handoff_max_attempts: int = 10,
     ) -> None:
         self._scanner = scanner
         self._registry = registry
@@ -164,6 +241,8 @@ class CameraDiscoveryService:
         self._pull = pull if pull is not None else _default_pull
         self._interval = interval
         self._install_signal_handlers = install_signal_handlers
+        self._handoff_retry_delay = handoff_retry_delay
+        self._handoff_max_attempts = handoff_max_attempts
 
         self._events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._emitter: _QueueEventEmitter | None = None
@@ -172,6 +251,8 @@ class CameraDiscoveryService:
         #: One pull at a time: a host can join only one camera's WiFi AP at once.
         self._pull_lock = asyncio.Lock()
         self._tasks: list[asyncio.Task[None]] = []
+        #: Sleeping hand-off retries (see :meth:`_schedule_handoff_retry`).
+        self._retry_tasks: set[asyncio.Task[None]] = set()
         self._stopping = asyncio.Event()
         self._started = False
 
@@ -195,10 +276,11 @@ class CameraDiscoveryService:
         if not self._started:
             return
         self._stopping.set()
-        for task in self._tasks:
+        for task in [*self._tasks, *self._retry_tasks]:
             task.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        await asyncio.gather(*self._tasks, *self._retry_tasks, return_exceptions=True)
         self._tasks = []
+        self._retry_tasks.clear()
         self._started = False
         try:
             self._registry.close()
@@ -252,7 +334,43 @@ class CameraDiscoveryService:
             try:
                 await asyncio.to_thread(self._materialize, event)
             except Exception as e:  # noqa: BLE001 - a bad event must not stop the loop
-                logger.exception("failed to hand pulled file off to SkydiveOS: %r", e)
+                self._schedule_handoff_retry(event, e)
+
+    def _schedule_handoff_retry(self, event: dict[str, Any], error: Exception) -> None:
+        """Requeue a failed hand-off with backoff instead of dropping it.
+
+        A hand-off needs the internet (registry owner lookup, S3 upload, SkydiveOS
+        notify) — exactly what a WiFi-only host loses while its radio is joined to a
+        camera's access point during a pull, which is also when these events arrive.
+        Staged jumps are never re-emitted (pulls are idempotent), so a dropped event
+        would strand the footage locally forever; retry until the network is back.
+        """
+        attempt = int(event.get(_HANDOFF_ATTEMPTS_KEY, 0)) + 1
+        mp4 = event.get("files", {}).get("mp4", "<unknown>")
+        if attempt >= self._handoff_max_attempts:
+            logger.exception(
+                "hand-off to SkydiveOS failed %d times, giving up on %s: %r. The file "
+                "is still staged locally; delete its jump folder under raw-storage and "
+                "bring the camera back in range to re-pull and retry.",
+                attempt, mp4, error,
+            )
+            return
+        event[_HANDOFF_ATTEMPTS_KEY] = attempt
+        delay = min(self._handoff_retry_delay * 2 ** (attempt - 1), _HANDOFF_MAX_DELAY)
+        logger.warning(
+            "hand-off to SkydiveOS failed (%r); retry %d/%d in %.0fs for %s",
+            error, attempt, self._handoff_max_attempts, delay, mp4,
+        )
+        task = asyncio.create_task(
+            self._requeue_after(event, delay), name="discovery-handoff-retry"
+        )
+        self._retry_tasks.add(task)
+        task.add_done_callback(self._retry_tasks.discard)
+
+    async def _requeue_after(self, event: dict[str, Any], delay: float) -> None:
+        await self._sleep_interruptibly(delay)
+        if not self._stopping.is_set():
+            self._events.put_nowait(event)
 
     def _materialize(self, event: dict[str, Any]) -> None:
         """Hand one pulled jump to SkydiveOS, which owns job creation.

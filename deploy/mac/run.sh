@@ -14,6 +14,11 @@ cd "${REPO_ROOT}"
 # launchd starts with a bare PATH; add the usual Homebrew + uv locations.
 export PATH="/opt/homebrew/bin:/usr/local/bin:${HOME}/.local/bin:${PATH}"
 
+# The Open GoPro SDK parses `networksetup` CLI output and refuses to start unless
+# LANG starts with en_US (raises on a French Mac; KeyErrors under launchd, which
+# sets no LANG at all). macOS CLI output is English regardless, so forcing is safe.
+export LANG=en_US.UTF-8
+
 HOST="${INGEST_HOST:-0.0.0.0}"
 PORT="${INGEST_PORT:-8000}"
 

@@ -75,14 +75,18 @@ class CameraRegistry:
         self,
         mongo_url: str | None = None,
         *,
-        db_name: str = DEFAULT_DB,
+        db_name: str | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         #: ``None`` (no explicit url and no ``MONGO_URL``) disables the registry.
         self._mongo_url = (
             mongo_url if mongo_url is not None else (os.environ.get("MONGO_URL") or None)
         )
-        self._db_name = db_name
+        # Resolve the database like the URL: explicit arg, else env, else default.
+        # The --pair CLI constructs the registry with no args, so ignoring MONGO_DB
+        # here would write pairings into a different database than the discovery
+        # service (which passes settings.mongo_db) reads its allow-list from.
+        self._db_name = db_name or os.environ.get("MONGO_DB") or DEFAULT_DB
         self._clock = clock
         self._client: Any | None = None
         self._coll: Any | None = None

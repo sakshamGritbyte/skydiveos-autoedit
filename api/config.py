@@ -89,10 +89,49 @@ class Settings:
     #: thumbnails, and all deliverables always use the MP4 regardless. See
     #: :mod:`analysis.proxy`.
     use_proxy_analysis: bool = False
+    #: Fully-automatic delivery (``AUTO_DELIVER``): when a render finishes, the job is
+    #: auto-approved and delivery is enqueued immediately — no instructor tap. Off by
+    #: default, preserving the review gate; the dropzone opts in per deployment.
+    auto_deliver: bool = False
+    #: SMTP transport for the customer delivery email (``SMTP_HOST`` / ``SMTP_PORT`` /
+    #: ``SMTP_USER`` / ``SMTP_PASSWORD``). ``smtp_host=None`` disables sending (links
+    #: are still generated and reported to SkydiveOS).
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_user: str | None = None
+    smtp_password: str | None = None
+    #: Upgrade the SMTP connection with STARTTLS (``SMTP_STARTTLS``, default on —
+    #: matches port 587 submission; disable only for a local relay).
+    smtp_starttls: bool = True
+    #: From address on delivery emails (``DELIVERY_FROM_EMAIL``; falls back to
+    #: ``SMTP_USER``).
+    delivery_from_email: str | None = None
+    #: Lifetime of the presigned download links, in days (``DELIVERY_LINK_TTL_DAYS``).
+    #: Capped at 7 — the S3 SigV4 maximum for IAM-key presigning.
+    delivery_link_ttl_days: float = 7.0
+    #: Seconds an ``ultimum`` (two-camera) job waits for its SECOND camera's footage
+    #: before a watchdog fails it (``ULTIMUM_SECOND_CAMERA_TIMEOUT_S``, default 1h).
+    #: Stops a mis-mapped package or a never-arriving second camera from stranding the
+    #: job in ``queued`` forever. See :func:`api.tasks.ultimum_watchdog_job`.
+    ultimum_second_camera_timeout_s: float = 3600.0
+    #: Shared secret sent on the status callback to SkydiveOS's receiver
+    #: (``AUTO_EDIT_CALLBACK_TOKEN``); SkydiveOS optionally verifies it inbound. Sent as
+    #: the ``X-Auto-Edit-Token`` header when set; ``None`` → no token header (open).
+    auto_edit_callback_token: str | None = None
+    #: IANA timezone the GoPro cameras' clocks are set to (``CAMERA_CLOCK_TZ``, e.g.
+    #: ``America/Toronto``). GoPro writes the camera's LOCAL wall-clock into the MP4's
+    #: ``creation_time`` and ffprobe mislabels it ``Z`` (UTC); when this is set, discovery
+    #: reinterprets that timestamp as local time here and emits a TRUE-UTC ``captured_at``
+    #: so SkydiveOS's DZ-local footage↔booking match lines up. ``None`` → pass the tag
+    #: through as-is (assume it is already UTC).
+    camera_clock_tz: str | None = None
 
 
-def _flag(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+def _flag(name: str, *, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
 
 
 @lru_cache(maxsize=1)
@@ -125,4 +164,19 @@ def get_settings() -> Settings:
         s3_endpoint_url=os.environ.get("S3_ENDPOINT_URL") or None,
         s3_region=os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or None,
         use_proxy_analysis=_flag("USE_PROXY_ANALYSIS"),
+        auto_deliver=_flag("AUTO_DELIVER"),
+        smtp_host=os.environ.get("SMTP_HOST") or None,
+        smtp_port=int(os.environ.get("SMTP_PORT") or 587),
+        smtp_user=os.environ.get("SMTP_USER") or None,
+        smtp_password=os.environ.get("SMTP_PASSWORD") or None,
+        smtp_starttls=_flag("SMTP_STARTTLS", default=True),
+        delivery_from_email=os.environ.get("DELIVERY_FROM_EMAIL") or None,
+        delivery_link_ttl_days=min(
+            7.0, float(os.environ.get("DELIVERY_LINK_TTL_DAYS") or 7.0)
+        ),
+        ultimum_second_camera_timeout_s=float(
+            os.environ.get("ULTIMUM_SECOND_CAMERA_TIMEOUT_S") or 3600.0
+        ),
+        auto_edit_callback_token=os.environ.get("AUTO_EDIT_CALLBACK_TOKEN") or None,
+        camera_clock_tz=os.environ.get("CAMERA_CLOCK_TZ") or None,
     )

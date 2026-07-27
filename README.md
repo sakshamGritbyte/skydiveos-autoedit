@@ -12,7 +12,10 @@ goes to an instructor review screen, then to the customer.
 `Ingest → Segment → Score → Compose → Render → Review → Deliver`
 
 See [CLAUDE.md](./CLAUDE.md) for the full stage-by-stage description, repo
-layout, and project conventions.
+layout, and project conventions, and
+[SKYDIVEOS_INTEGRATION.md](./SKYDIVEOS_INTEGRATION.md) for the REST contract
+SkydiveOS drives this module with (create job → attach footage → auto-deliver →
+status callbacks).
 
 ## Quick start
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -224,12 +225,57 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+#: A camera id ending in 4+ digits — treated as a full serial to be shortened.
+_TRAILING_SERIAL_DIGITS = re.compile(r"(\d{4,})$")
+
+
+def _normalize_camera_id(value: str | None) -> str | None:
+    """Map a full GoPro serial (e.g. ``C3504224544313``) to its trailing-digit id.
+
+    Everything in /ingest keys cameras by the digits the camera advertises over BLE
+    (``GoPro 4313`` = last 4 digits of the serial): the SDK's scan target, the
+    discovery scanner, the registry allow-list, and the raw-storage layout. A full
+    serial would BLE-scan forever without matching and create a registry entry
+    auto-discovery can never see, so shorten it here rather than fail downstream.
+    """
+    if value is None:
+        return None
+    value = value.strip()
+    if value.isdigit() and len(value) <= 4:
+        return value
+    if len(value) > 4 and (m := _TRAILING_SERIAL_DIGITS.search(value)):
+        digits = m.group(1)[-4:]
+        logger.warning(
+            "camera id %r looks like a full serial; using trailing digits %r "
+            "(the id the camera advertises as 'GoPro %s'). Pair/register it "
+            "everywhere by that id.",
+            value,
+            digits,
+            digits,
+        )
+        return digits
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
+    # The API service loads the repo .env via api.config's dotenv call; this
+    # standalone CLI must load it too, or --pair silently skips the camera
+    # registry (MONGO_URL lives in .env). Optional, like in api.config: a no-op
+    # when python-dotenv or the .env file is absent, and it never overrides
+    # variables already exported in the environment.
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except Exception:  # pragma: no cover - python-dotenv is an optional convenience
+        pass
+
     args = _parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    args.camera = _normalize_camera_id(args.camera)
 
     try:
         if args.pair:

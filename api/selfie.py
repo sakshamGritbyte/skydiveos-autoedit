@@ -2670,6 +2670,7 @@ def run_selfie_pipeline(
     store.update(job_id, status=JobStatus.processing, error=None)
 
     booking = json.loads(store.booking_path(job_id).read_text())
+    booking = _ensure_default_music(booking, job_id, store, jobs_root)
     job = store.load(job_id)
     package = job.package
 
@@ -2743,6 +2744,53 @@ def _uploaded_music(
         if p.stem == deliverable and p.suffix.lower() in MUSIC_SUFFIXES:
             return str(p)
     return None
+
+
+def _ensure_default_music(
+    booking: dict[str, Any],
+    job_id: str,
+    store: Any,
+    jobs_root: str | Path | None,
+    *,
+    choose: Callable[[Sequence[Path]], Path] | None = None,
+) -> dict[str, Any]:
+    """Assign a random default backing track once when the booking names no music.
+
+    A customer who didn't pick a track should still get a scored soundtrack, not a
+    silent video. When the booking has no base ``music``, pick one of the
+    ``templates/music`` tracks at random and **persist it** — into ``booking.json``
+    *and* the job's ``music`` field — so a later replay/tweak (which re-reads
+    ``booking.json``) re-renders with the SAME track. That keeps the random variety
+    across jobs while honouring "jobs are idempotent; EDLs replayable": the pick
+    happens once, at first processing, never again.
+
+    A no-op when the booking already names music (a real customer choice, or a
+    previously-persisted pick on a re-run) or the library is empty (the render stays
+    music-less, exactly as before). Per-deliverable names and uploaded tracks still
+    win over this base default in :func:`_music_picker`. Never fails the job — music
+    is optional, so any error here just leaves the render music-less.
+    """
+    if booking.get("music"):
+        return booking
+    try:
+        import random
+
+        from render.templates import list_music
+
+        tracks = list_music()
+        if not tracks:
+            return booking
+        pick = (choose or random.choice)(tracks)
+        booking = {**booking, "music": pick.stem}
+        store.write_booking(job_id, booking)
+        store.update(job_id, music=pick.stem)
+        logger.info(
+            "job %s: no music chosen; assigned random default %r (from %d tracks)",
+            job_id, pick.stem, len(tracks),
+        )
+    except Exception as e:  # noqa: BLE001 - music is optional; never fail the job on it
+        logger.warning("could not assign default music for job %s: %r", job_id, e)
+    return booking
 
 
 def _music_picker(
@@ -3030,6 +3078,7 @@ def run_ultimum_pipeline(
     store.update(job_id, status=JobStatus.processing, error=None)
 
     booking = json.loads(store.booking_path(job_id).read_text())
+    booking = _ensure_default_music(booking, job_id, store, jobs_root)
     job = store.load(job_id)
     jd = job_dir(job_id, jobs_root)
     music = _ultimum_music_paths(booking, job_id, jobs_root)

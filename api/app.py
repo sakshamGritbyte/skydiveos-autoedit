@@ -96,7 +96,9 @@ attach the raw GoPro master (or pull it off the camera), and the pipeline segmen
 scores, composes an EDL, and renders a 60–120 s customer edit for instructor review.
 
 Heavy work runs asynchronously on Celery workers; these endpoints only enqueue it
-and report status. Nothing is delivered to the customer until an instructor approves.
+and report status. Nothing is delivered to the customer until an instructor approves —
+unless the deployment sets `AUTO_DELIVER=1`, in which case a finished render is
+auto-approved and delivered straight to the customer (presigned S3 links, emailed).
 """
 
 TAGS_METADATA = [
@@ -269,6 +271,7 @@ async def _upload_ultimum(
         {
             "booking_id": job.booking_id,
             "customer_name": job.customer_name,
+            "customer_email": job.customer_email,
             "jump_date": job.jump_date,
             "package": job.package.value,
             "music": job.music,
@@ -439,6 +442,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     bucket=settings.s3_bucket,
                     endpoint_url=settings.s3_endpoint_url,
                     region_name=settings.s3_region,
+                    clock_tz=settings.camera_clock_tz,
                 ),
                 pull=_build_pull(settings),
                 interval=settings.discovery_interval,
@@ -465,6 +469,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     """Build the FastAPI application (factory so tests get a fresh instance)."""
+    # Under uvicorn only the uvicorn.* loggers get handlers, so our pipeline INFO
+    # ("camera auto-discovery started", "Camera X discovered, pull enqueued", …)
+    # would fall to Python's WARNING+ last-resort handler and never reach the
+    # service logs. No-op when the host process already configured logging.
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
     app = FastAPI(
         title="SkydiveOS Auto-Edit API",
         version="1.0.0",
@@ -554,14 +566,21 @@ def create_app() -> FastAPI:
             str | None,
             Form(description="Camera source for the Ultimate package: instructor | external"),
         ] = None,
+        s3_key: Annotated[
+            str | None,
+            Form(description="Key of a raw master already in S3 (auto-discovery path)"),
+        ] = None,
     ) -> UploadResponse:
         """Attach the raw footage to a job, then enqueue the right pipeline.
 
-        Provide **either** one or more multipart ``files`` (the raw GoPro MP4s) **or**
-        a ``camera_id`` to pull the jump off an Open GoPro. On a file upload the MP4s
+        Provide **one** footage source: multipart ``files`` (the raw GoPro MP4s), a
+        ``camera_id`` to pull the jump off an Open GoPro, or an ``s3_key`` naming a raw
+        master already staged in S3 (the auto-discovery path — the worker downloads it
+        instead of the web layer re-streaming multi-GB bytes). On a file upload the MP4s
         are staged under ``raw/`` and the package's pipeline is enqueued: the scene
         pipeline for the selfie / video-only / photo-only packages (which deliverables
-        it emits depends on the package), the single-master edit otherwise.
+        it emits depends on the package), the single-master edit otherwise. The
+        ``s3_key`` path hands off to the identical dispatch once the download lands.
 
         The two-camera **Ultimate** package is the exception: each call must name a
         ``camera_role`` (``instructor`` or ``external``) and its clips are staged under
@@ -611,6 +630,7 @@ def create_app() -> FastAPI:
                 {
                     "booking_id": job.booking_id,
                     "customer_name": job.customer_name,
+                    "customer_email": job.customer_email,
                     "jump_date": job.jump_date,
                     "package": job.package.value,
                     "music": job.music,
@@ -650,7 +670,50 @@ def create_app() -> FastAPI:
                 detail=f"Open GoPro pull from camera {camera} enqueued",
             )
 
-        raise HTTPException(status_code=422, detail="provide at least one file or a camera_id")
+        if s3_key:
+            # Auto-discovery already staged the master in S3; source the job straight
+            # from the key instead of streaming multi-GB bytes back through the web
+            # layer. The worker downloads it and hands off to the same pipeline dispatch.
+            if not s3_key.lower().endswith(".mp4"):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"s3_key must point to an .mp4 master (got {s3_key!r})",
+                )
+            if job.package.is_ultimum:
+                from .selfie import CAMERA_ROLES
+
+                if camera_role not in CAMERA_ROLES:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"the ultimum package requires camera_role to be one of "
+                            f"{list(CAMERA_ROLES)} for an S3 ingest (got {camera_role!r})"
+                        ),
+                    )
+            store.write_booking(
+                job_id,
+                {
+                    "booking_id": job.booking_id,
+                    "customer_name": job.customer_name,
+                    "customer_email": job.customer_email,
+                    "jump_date": job.jump_date,
+                    "package": job.package.value,
+                    "music": job.music,
+                },
+            )
+            store.update(job_id, status=JobStatus.queued, error=None)
+            queue.enqueue_s3_ingest(job_id, s3_key, camera_role)
+            detail = f"S3 ingest of {s3_key} enqueued"
+            if job.package.is_ultimum:
+                detail += f" for {camera_role}"
+            return UploadResponse(
+                job_id=job_id, status=JobStatus.queued, source="s3",
+                package=job.package, camera_role=camera_role, detail=detail,
+            )
+
+        raise HTTPException(
+            status_code=422, detail="provide at least one file, a camera_id, or an s3_key"
+        )
 
     @app.get(
         "/jobs/{job_id}",

@@ -47,6 +47,11 @@ class FakeQueue:
     def enqueue_pull(self, job_id: str, camera_id: str) -> None:
         self.calls.append(("pull", (job_id, camera_id)))
 
+    def enqueue_s3_ingest(
+        self, job_id: str, s3_key: str, camera_role: str | None = None
+    ) -> None:
+        self.calls.append(("s3_ingest", (job_id, s3_key, camera_role)))
+
     def kinds(self) -> list[str]:
         return [kind for kind, _ in self.calls]
 
@@ -111,6 +116,16 @@ def test_create_job_stores_package_and_booking_id(client: TestClient) -> None:
     # Existing fields still behave exactly as before.
     assert job["customer_name"] == "Alex"
     assert job["target_duration"] == 90.0
+
+
+def test_create_job_stores_customer_email(client: TestClient) -> None:
+    resp = client.post(
+        "/jobs", json={"customer_name": "Jane", "customer_email": "jane@example.com"}
+    )
+    assert resp.status_code == 201
+    job = resp.json()["job"]
+    assert job["customer_email"] == "jane@example.com"
+    assert job["delivery_links"] is None  # nothing sent until status == delivered
 
 
 def test_create_job_rejects_unknown_package(client: TestClient) -> None:
@@ -386,6 +401,7 @@ def test_upload_multiple_files_saved_to_raw(client: TestClient, queue: FakeQueue
     assert booking == {
         "booking_id": "BK-9",
         "customer_name": "Mia",
+        "customer_email": None,
         "jump_date": "2026-06-02",
         "package": "selfie",
         "music": None,
@@ -530,6 +546,51 @@ def test_upload_camera_id_triggers_pull(client: TestClient, queue: FakeQueue) ->
     assert resp.json()["source"] == "pull"
     assert queue.calls == [("pull", (job_id, "1234"))]
     assert client.get(f"/jobs/{job_id}").json()["camera_id"] == "1234"
+
+
+def test_upload_s3_key_enqueues_ingest(client: TestClient, queue: FakeQueue) -> None:
+    job_id = _create(client)  # default selfie package
+    resp = client.post(
+        f"/jobs/{job_id}/upload", data={"s3_key": "raw/1234/GH010001.MP4"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "s3"
+    assert queue.calls == [("s3_ingest", (job_id, "raw/1234/GH010001.MP4", None))]
+    assert client.get(f"/jobs/{job_id}").json()["status"] == "queued"
+    # Booking sidecar is written so the scene pipeline can read it back.
+    booking = json.loads((job_dir(job_id, client.jobs_root) / "booking.json").read_text())
+    assert booking["package"] == "selfie"
+
+
+def test_upload_s3_key_non_mp4_is_422(client: TestClient, queue: FakeQueue) -> None:
+    job_id = _create(client)
+    resp = client.post(f"/jobs/{job_id}/upload", data={"s3_key": "raw/1234/notes.txt"})
+    assert resp.status_code == 422
+    assert queue.calls == []
+
+
+def test_upload_s3_key_ultimum_requires_role(client: TestClient, queue: FakeQueue) -> None:
+    job_id = _create(client, package="ultimum")
+    # Without camera_role → 422
+    bad = client.post(f"/jobs/{job_id}/upload", data={"s3_key": "raw/1/GH010001.MP4"})
+    assert bad.status_code == 422
+    assert queue.calls == []
+    # With camera_role → enqueued, role echoed back.
+    ok = client.post(
+        f"/jobs/{job_id}/upload",
+        data={"s3_key": "raw/1/GH010001.MP4", "camera_role": "instructor"},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["camera_role"] == "instructor"
+    assert queue.calls == [("s3_ingest", (job_id, "raw/1/GH010001.MP4", "instructor"))]
+
+
+def test_upload_no_source_is_422(client: TestClient) -> None:
+    job_id = _create(client)
+    resp = client.post(f"/jobs/{job_id}/upload", data={})
+    assert resp.status_code == 422
+    assert "s3_key" in resp.json()["detail"]
 
 
 def test_upload_to_processing_job_conflicts(client: TestClient) -> None:

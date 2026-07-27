@@ -269,3 +269,24 @@ def test_real_camera_open_raises_clear_error_without_sdk() -> None:
         asyncio.run(GoProCamera("1234").open())
     with pytest.raises(CameraError, match="not installed"):
         asyncio.run(pair("1234"))
+
+
+# --------------------------------------------------------------------------- #
+# Camera-id normalization (full serial -> trailing BLE digits)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("C3504224544313", "4313"),  # full GoPro serial -> advertised digits
+        ("4313", "4313"),  # already the trailing-digit id
+        ("  4313  ", "4313"),
+        ("TESTGOPRO001", "TESTGOPRO001"),  # test serial: <4 trailing digits, untouched
+        (None, None),
+    ],
+)
+def test_normalize_camera_id(raw: str | None, expected: str | None) -> None:
+    from ingest.pull import _normalize_camera_id
+
+    assert _normalize_camera_id(raw) == expected

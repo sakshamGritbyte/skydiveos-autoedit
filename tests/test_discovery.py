@@ -193,7 +193,7 @@ def test_handoff_passes_camera_owner(tmp_path: Path) -> None:
         await service.stop()
 
     asyncio.run(scenario())
-    assert uploads.calls and uploads.calls[0][2] == "inst-9"  # (mp4, camera_id, instructor_id, role)
+    assert uploads.calls and uploads.calls[0][2] == "inst-9"  # (mp4, camera, instructor, role)
 
 
 def test_known_camera_is_pulled_and_handed_off(tmp_path: Path) -> None:
@@ -334,6 +334,83 @@ def test_s3_notify_uploader_puts_to_s3_then_notifies(tmp_path, monkeypatch) -> N
     posted.clear()
     upload(str(mp4), "1234", None)
     assert posted["json"] == {"s3_key": "raw/1234/GX010001.MP4", "camera_id": "1234"}
+
+
+def test_s3_notify_uploader_includes_capture_time(tmp_path, monkeypatch) -> None:
+    """When the MP4 has a readable creation_time, it rides along as captured_at."""
+    import httpx
+
+    from ingest import discovery
+    from ingest.discovery import s3_notify_uploader
+
+    mp4 = tmp_path / "GX010001.MP4"
+    mp4.write_bytes(b"video-bytes")
+
+    class _FakeS3:
+        def upload_file(self, filename: str, bucket: str, key: str) -> None:
+            pass
+
+    posted: dict[str, object] = {}
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            pass
+
+    def _fake_post(url, *, json, timeout):  # noqa: ANN001
+        posted.update(json=json)
+        return _Resp()
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    # Stub the ffprobe read so the test doesn't depend on a real GoPro file.
+    monkeypatch.setattr(
+        discovery, "_probe_capture_time",
+        lambda p, *, clock_tz=None: "2026-06-10T18:42:31Z",
+    )
+
+    upload = s3_notify_uploader("http://skydiveos.test/", bucket="jumps", s3_client=_FakeS3())
+    upload(str(mp4), "1234", "inst-1", "external")
+
+    assert posted["json"] == {
+        "s3_key": "raw/1234/GX010001.MP4",
+        "camera_id": "1234",
+        "instructor_id": "inst-1",
+        "camera_role": "external",
+        "captured_at": "2026-06-10T18:42:31Z",
+    }
+
+
+def test_probe_capture_time_never_raises_on_bad_file(tmp_path) -> None:
+    """A non-video / unreadable file yields None, never an exception (best-effort)."""
+    from ingest.discovery import _probe_capture_time
+
+    bad = tmp_path / "not-a-video.MP4"
+    bad.write_bytes(b"not really an mp4")
+    assert _probe_capture_time(str(bad)) is None
+
+
+def test_to_true_utc_converts_gopro_local_time() -> None:
+    """A GoPro creation_time (local wall-clock mislabelled Z) becomes real UTC."""
+    from ingest.discovery import _to_true_utc
+
+    # 14:42 Toronto in June is EDT (UTC-4) → 18:42 UTC.
+    assert _to_true_utc("2026-06-10T14:42:31.000000Z", "America/Toronto") == \
+        "2026-06-10T18:42:31Z"
+    # January is EST (UTC-5) → 19:42 UTC. DST handled by the zone, not a fixed offset.
+    assert _to_true_utc("2026-01-10T14:42:31Z", "America/Toronto") == "2026-01-10T19:42:31Z"
+
+
+def test_to_true_utc_passthrough_without_tz() -> None:
+    """No clock_tz → the tag is left as-is (assumed already UTC), backward-compatible."""
+    from ingest.discovery import _to_true_utc
+
+    assert _to_true_utc("2026-06-10T14:42:31.000000Z", None) == "2026-06-10T14:42:31.000000Z"
+
+
+def test_to_true_utc_bad_zone_falls_back_to_raw() -> None:
+    """An unknown zone never raises — returns the original value (hand-off not blocked)."""
+    from ingest.discovery import _to_true_utc
+
+    assert _to_true_utc("2026-06-10T14:42:31Z", "Not/AZone") == "2026-06-10T14:42:31Z"
 
 
 def test_stop_is_idempotent_and_clears_tasks(tmp_path: Path) -> None:
@@ -669,3 +746,88 @@ def test_assign_auto_registers_unknown_camera(tmp_path: Path) -> None:
         assert cams["9999"]["instructor_id"] == "inst-7"
         assert cams["9999"]["active"] is True  # active, so discovery will pull it
         assert registry.instructor_for("9999") == "inst-7"
+
+
+# --------------------------------------------------------------------------- #
+# Hand-off retry: a network blip (WiFi on the camera AP) must not drop footage
+# --------------------------------------------------------------------------- #
+
+
+class _FlakyUploader(_RecordingUploader):
+    """Uploader that fails the first ``fail_times`` calls, then succeeds."""
+
+    def __init__(self, fail_times: int) -> None:
+        super().__init__()
+        self._fail_times = fail_times
+        self.failures = 0
+
+    def __call__(self, *args, **kwargs) -> None:
+        if self.failures < self._fail_times:
+            self.failures += 1
+            raise ConnectionError("no internet (WiFi joined to the camera AP)")
+        super().__call__(*args, **kwargs)
+
+
+def test_failed_handoff_is_retried_until_network_returns(tmp_path: Path) -> None:
+    """Hand-offs that fail while offline are requeued, not dropped (staged jumps
+    never re-emit, so a drop would strand the footage locally forever)."""
+    uploads = _FlakyUploader(fail_times=2)
+    registry = FakeRegistry(
+        [CameraRecord(camera_id="1234", paired_at=1.0, instructor_id="inst-1")]
+    )
+    service = CameraDiscoveryService(
+        scanner=StaticCameraScanner(["1234"]),
+        registry=registry,
+        upload=uploads,
+        pull=_make_pull(tmp_path / "GX010001.MP4"),
+        interval=0.05,
+        handoff_retry_delay=0.01,
+    )
+
+    async def scenario() -> None:
+        await service.start()
+        await _wait_for(lambda: bool(uploads.calls))
+        await service.stop()
+
+    asyncio.run(scenario())
+    assert uploads.failures == 2
+    assert uploads.calls == [(str(tmp_path / "GX010001.MP4"), "1234", "inst-1", None)]
+
+
+def test_handoff_gives_up_after_max_attempts(tmp_path: Path) -> None:
+    """A permanently failing hand-off stops retrying (no hot loop) and is logged."""
+    uploads = _FlakyUploader(fail_times=10_000)
+    registry = FakeRegistry(
+        [CameraRecord(camera_id="1234", paired_at=1.0, instructor_id="inst-1")]
+    )
+    service = CameraDiscoveryService(
+        scanner=StaticCameraScanner(["1234"]),
+        registry=registry,
+        upload=uploads,
+        pull=_make_pull(tmp_path / "GX010001.MP4"),
+        interval=0.05,
+        handoff_retry_delay=0.01,
+        handoff_max_attempts=3,
+    )
+
+    async def scenario() -> None:
+        await service.start()
+        await _wait_for(lambda: uploads.failures >= 3)
+        # Give any (wrongly) still-scheduled retry a chance to fire, then check
+        # the attempt count stayed at the cap.
+        await asyncio.sleep(0.1)
+        await service.stop()
+
+    asyncio.run(scenario())
+    assert uploads.failures == 3
+    assert uploads.calls == []
+
+
+def test_registry_db_name_resolves_like_the_url(monkeypatch) -> None:
+    """The --pair CLI builds CameraRegistry() bare; it must honor $MONGO_DB or the
+    pairing lands in a different database than the service's allow-list reads."""
+    monkeypatch.setenv("MONGO_DB", "skydivingos")
+    assert CameraRegistry(mongo_url=None)._db_name == "skydivingos"
+    monkeypatch.delenv("MONGO_DB")
+    assert CameraRegistry(mongo_url=None)._db_name == "skydiveos"
+    assert CameraRegistry(mongo_url=None, db_name="explicit")._db_name == "explicit"

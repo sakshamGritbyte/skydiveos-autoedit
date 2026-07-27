@@ -44,8 +44,14 @@ Built as a module inside SkydiveOS. Replaces our current dependency on Shred.
    dedupe, chronological order, multi-cam pacing). Repairs are logged at INFO and written
    to `jobs/<id>/validation_report.json`.
 5. **Render** — execute EDL against full-res MP4 with FFmpeg: trim, speed ramps, intro/outro, music
-6. **Review** — instructor approves or tweaks in web UI
-7. **Deliver** — push final MP4 to customer (email link, WhatsApp, QR)
+6. **Review** — instructor approves or tweaks in web UI (skipped entirely when
+   `AUTO_DELIVER=1`: a finished render is auto-approved and delivery fires immediately)
+7. **Deliver** — `api/delivery.py`: upload every rendered deliverable to
+   `s3://$S3_BUCKET/deliveries/{job_id}/` (a photos dir is zipped first), presign
+   download links (`DELIVERY_LINK_TTL_DAYS`, ≤7), email them to `Job.customer_email`
+   via SMTP, persist them as `Job.delivery_links`, and forward them in the SkydiveOS
+   status callback. Missing email/SMTP is tolerated only if `SKYDIVEOS_API_BASE` is
+   set to forward the links; otherwise the job fails rather than lying `delivered`.
 
 ## Key Conventions
 - All timestamps in seconds (float), not frames
@@ -112,6 +118,16 @@ Built as a module inside SkydiveOS. Replaces our current dependency on Shred.
   The renderer (`api.selfie._music_paths`/`_ultimum_music_paths`) prefers the uploaded
   track, else falls back to the booking's `music` name → `templates/music`. Never fail
   a job for missing music — it just falls back.
+- **Default random music**: when a booking names NO music (and no per-deliverable/
+  uploaded track), `api.selfie._ensure_default_music` picks one `templates/music`
+  track at random so the customer still gets a scored soundtrack, not silence. The
+  pick happens **once, at first processing**, and is persisted to BOTH `Job.music`
+  and `booking.json` — so a replay/tweak (which re-reads `booking.json`) re-renders
+  with the SAME track (jobs are idempotent; EDLs replayable — don't re-randomize on
+  replay; the process paths call it, the `replay_*` paths must not). No-op when music
+  is already named or the library is empty. Drop 2–4 licensed tracks in
+  `templates/music/` for real variety (see its README) — with one track it always
+  picks that one.
 
 ## Bash Commands
 - `pip install -r requirements.txt` — install Python deps
@@ -123,11 +139,17 @@ Built as a module inside SkydiveOS. Replaces our current dependency on Shred.
 - `python scripts/process_jump.py <path/to/raw.mp4>` — end-to-end on a sample file (timeline → house-cut EDL → render `jobs/{id}/final.mp4`)
 - `python -m render <source.mp4> --job-id <id> --customer "<name>"` — render an EDL (the job's saved `edl.json`, or `--edl <path>`) to `jobs/{id}/final.mp4` at 1080p/h264/30fps; intro/outro from `/templates`, music via `--music <name>`, caption font override with `$RENDER_FONT`
 - `python scripts/replay_edl.py <job_id>` — re-render from a saved EDL
+- `python scripts/demo_auto_deliver.py` — no-camera end-to-end check of the full
+  automatic flow: edits a sample MP4, auto-approves it (`AUTO_DELIVER`), uploads the
+  render to S3, presigns links, and emails them — catching the mail in a throwaway
+  local SMTP sink (`aiosmtpd`) so you see the exact customer email with no real mail
+  server. `--email/--smtp-host/...` to send for real, `--no-email` for links only,
+  `--source` for your own footage, `--keep` to retain the S3 uploads (default: deleted)
 - `python scripts/diagnose_ultimum.py <job_id>` — read-only diagnostic for an Ultimate job: per-camera scene classification, combo clip selection by `(camera, scene)`, video-vs-audio stream-duration sync on scene files + rendered outputs (catches the "video freezes, audio continues" desync), per-camera freefall cuts, and photo count — with findings flagging a camera collapsed to one scene, the cameraman absent from a scene, or any desync
 - `ffmpeg -version` — must be 6.0+ for our speed-ramp filter
 - `uvicorn api.app:app --reload` — serve the /api FastAPI service (OpenAPI docs at `/docs`); SkydiveOS calls it to create jobs, upload footage, review, approve, and stream previews
 - `celery -A api.celery_app.celery_app worker -l info` — run the worker that executes the async pipeline tasks /api enqueues (set `CELERY_TASK_ALWAYS_EAGER=1` to run tasks inline without a worker, for a single-process demo)
-- Camera auto-discovery (`api.app` lifespan → `ingest.discovery.CameraDiscoveryService`): when `ENABLE_AUTO_DISCOVERY=1`, the API BLE-scans every `DISCOVERY_INTERVAL_SECONDS` (default 30) for *paired* cameras (the allow-list in the MongoDB `cameras` collection), runs the existing `pull_camera` for each unseen one, **uploads each pulled MP4 to S3** (`S3_BUCKET`, key `raw/{camera_id}/{file}`) then **POSTs JSON** `{s3_key, camera_id, instructor_id}` to `{SKYDIVEOS_API_BASE}/api/media/raw-upload`. SkydiveOS creates the media/job from the key — big files never stream through the web layer, and discovery does **not** create jobs itself (needs `SKYDIVEOS_API_BASE` + `S3_BUCKET` set). Off by default — pulls stay operator/SkydiveOS-triggered until opted in. Manage the registry via `GET /cameras`, `DELETE /cameras/{id}` (soft-deactivate, admin), `POST /cameras/{id}/assign` (register/assign owning instructor, admin). The BLE scan needs the hardware-only `bleak`/Open GoPro SDK; the registry needs `pymongo[srv]` + `MONGO_URL`.
+- Camera auto-discovery (`api.app` lifespan → `ingest.discovery.CameraDiscoveryService`): when `ENABLE_AUTO_DISCOVERY=1`, the API BLE-scans every `DISCOVERY_INTERVAL_SECONDS` (default 30) for *paired* cameras (the allow-list in the MongoDB `cameras` collection), runs the existing `pull_camera` for each unseen one, **uploads each pulled MP4 to S3** (`S3_BUCKET`, key `raw/{camera_id}/{file}`) then **POSTs JSON** `{s3_key, camera_id, instructor_id?, camera_role?, captured_at?}` to `{SKYDIVEOS_API_BASE}/api/media/raw-upload` (`captured_at` = a TRUE-UTC ISO-8601 instant from the MP4's `creation_time` via ffprobe, best-effort, so SkydiveOS can match footage→booking by camera + capture time; `camera_role` routes the two Ultimate angles). GoPro writes the camera's LOCAL wall-clock into `creation_time` mislabelled as UTC, so `CAMERA_CLOCK_TZ` (the dropzone's IANA zone, e.g. `America/Toronto`) is used to convert it to real UTC — set it or the match skews by the UTC offset (`ingest.discovery._to_true_utc`). SkydiveOS creates the media/job from the key (`POST /jobs` for the booking metadata, then `POST /jobs/{id}/upload` with an `s3_key` form field → `api.tasks.ingest_s3_job` downloads that S3 object into the job's `raw/` staging — per-`camera_role` for `ultimum` — and hands off to the same pipeline dispatch a byte upload uses, so big files never stream through the web layer). An `ultimum` ingest that has only one camera so far arms `api.tasks.ultimum_watchdog_job` (countdown `ULTIMUM_SECOND_CAMERA_TIMEOUT_S`, default 1h; skipped in eager mode): if the second camera never arrives the job is failed with an actionable error instead of hanging in `queued` — the guard against a missing second camera or a booking mis-mapped to the two-camera package. Discovery does **not** create jobs itself (needs `SKYDIVEOS_API_BASE` + `S3_BUCKET` set). Off by default — pulls stay operator/SkydiveOS-triggered until opted in. Manage the registry via `GET /cameras`, `DELETE /cameras/{id}` (soft-deactivate, admin), `POST /cameras/{id}/assign` (register/assign owning instructor, admin). The BLE scan needs the hardware-only `bleak`/Open GoPro SDK; the registry needs `pymongo[srv]` + `MONGO_URL`.
 - `CAMERA_SCANNER` selects the discovery transport: `ble` (default — BLE scan + WiFi pull, wireless), `usb` (mDNS detect + `ingest.camera.WiredGoProCamera` pull — the kiosk path, one camera per scan), or `static` (no-hardware simulation: `StaticCameraScanner` + `ingest.camera.LocalSampleCamera` stage `DISCOVERY_SAMPLE_MP4` through the *real* pull path; needs `DISCOVERY_FAKE_CAMERAS`). USB and WiFi share one HTTP download path (`_SdkGoProCamera`); both need the hardware-only Open GoPro SDK.
 - `python scripts/check_camera.py --usb` / `--wifi --camera <id>` — hardware smoke test: open a real GoPro and list its media (read-only), using the same Camera classes the pull uses. Verifies the SDK + connectivity before enabling discovery.
 - Instructor ownership / access scoping (`api.auth`): each camera carries an `instructor_id` (set at `--pair --instructor-id` or via `POST /cameras/{id}/assign`); auto-discovery sends it with the raw upload (and locally-created jobs carry `Job.instructor_id`), so footage lands in that instructor's SkydiveOS account. SkydiveOS forwards identity as `X-Instructor-Id` + `X-Role` (`instructor`/`admin`); when `ENFORCE_INSTRUCTOR_AUTH=1` an instructor sees only their own jobs/cameras (`GET /jobs`, `GET /cameras`) and admins see all + manage the registry. Off by default (every caller is admin), so the open flow is unchanged; ownership *tagging* always happens regardless.
@@ -145,7 +167,9 @@ Built as a module inside SkydiveOS. Replaces our current dependency on Shred.
 - `.env.example` documents required vars: `ANTHROPIC_API_KEY`, `S3_BUCKET`,
   `REDIS_URL`, `SKYDIVEOS_API_BASE`; auto-discovery adds `ENABLE_AUTO_DISCOVERY`,
   `DISCOVERY_INTERVAL_SECONDS`, `CAMERA_SCANNER`, `DISCOVERY_FAKE_CAMERAS`,
-  `DISCOVERY_SAMPLE_MP4`, `MONGO_URL`, `MONGO_DB`, `ENFORCE_INSTRUCTOR_AUTH`
+  `DISCOVERY_SAMPLE_MP4`, `MONGO_URL`, `MONGO_DB`, `ENFORCE_INSTRUCTOR_AUTH`;
+  automatic delivery adds `AUTO_DELIVER`, `SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/
+  `SMTP_PASSWORD`/`SMTP_STARTTLS`, `DELIVERY_FROM_EMAIL`, `DELIVERY_LINK_TTL_DAYS`
 - Local dev assumes FFmpeg on PATH and a sample jump in `/sample-data/`
 
 ## Domain Glossary
@@ -162,7 +186,10 @@ Built as a module inside SkydiveOS. Replaces our current dependency on Shred.
 - Don't fine-tune Claude on Shred data — train a separate scoring model instead
 - Don't use Higgsfield, Runway, Sora, or any generative video tool — customers want their REAL face, not a stylized version
 - Don't render until the instructor has approved — wasted GPU time
-- Don't skip the review gate even when the model is good (5-star reviews depend on this)
+- Don't skip the review gate in code paths — the ONLY sanctioned bypass is the
+  `AUTO_DELIVER=1` deployment opt-in (business decision 2026-07: fully hands-off
+  camera→customer flow), which auto-approves at the same `_maybe_auto_deliver` seam;
+  with the flag off the instructor gate behaves exactly as before
 - Don't persist an EDL that hasn't passed `validate_and_repair`; don't make it do I/O or import `api.*` (keep it pure and dependency-light — `api.selfie` imports it)
 - Don't mine a "deployment" beat from the `canopy`/`landing` scene — it's positionally unreliable; the deploy beat comes from the freefall scene at `deploy_offset`
 

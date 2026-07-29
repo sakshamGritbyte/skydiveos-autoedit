@@ -140,6 +140,21 @@ def _readiness(matcher, settings) -> int:
                 "and the owner lookup will refuse. Use different cameras at this dropzone."
             )
 
+    # Discovery matches a scanned id against cameras.camera_id EXACTLY, and a GoPro only
+    # ever advertises its trailing serial digits. So a registry entry holding the full
+    # printed serial is dead weight — BLE will never report it and it is never pulled.
+    unpullable = [
+        str(c.get("camera_id")) for c in cameras
+        if not str(c.get("camera_id")).strip().isdigit()
+    ]
+    if unpullable:
+        print(
+            f"\nWARNING: registry entr{'y' if len(unpullable) == 1 else 'ies'} {unpullable} "
+            "cannot be discovered: a GoPro advertises only its trailing serial DIGITS "
+            "(e.g. 'GoPro 4313' -> '4313'), so this never matches a scan. Pair with the "
+            "short id; keep the full serial in staffs.goproSerial."
+        )
+
     registry_serials = {str(c.get("camera_id")) for c in cameras}
     staff_serials = {str(s.get("goproSerial")) for s in with_serial}
     # A registry id is the short BLE id; a staff serial is the full one. A camera is

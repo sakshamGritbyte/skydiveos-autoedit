@@ -21,6 +21,7 @@ is exercised without hardware.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -179,6 +180,22 @@ _SDK_MISSING = (
 )
 
 
+def _force_us_english_locale() -> None:
+    """Make ``LANG`` start with ``en_US`` before the SDK's WiFi driver inspects it.
+
+    The Open GoPro WiFi adapter parses ``networksetup`` CLI output and refuses to start
+    unless ``os.environ["LANG"]`` begins with ``en_US`` — raising on a French Mac (the
+    client dropzone) and ``KeyError``-ing under launchd, which sets no ``LANG`` at all.
+    macOS CLI output is English regardless of UI language, so forcing it is safe.
+
+    ``deploy/mac/run.sh`` already exports this for the *service*; doing it here covers
+    every other entry point too (``python -m ingest.pull``, ``scripts/check_camera.py``),
+    which otherwise fail on that Mac with an error that looks like a camera fault.
+    """
+    if not os.environ.get("LANG", "").startswith("en_US"):
+        os.environ["LANG"] = "en_US.UTF-8"
+
+
 def _downloaded_path(resp: Any, dest: Path) -> Path:
     if not resp.ok:
         raise CameraError(f"download failed for {dest.name}: {resp}")
@@ -281,6 +298,7 @@ class GoProCamera(_SdkGoProCamera):
 
     def _make_gopro(self) -> Any:
         sdk = _load_sdk()
+        _force_us_english_locale()
         # Default interfaces are BLE + WIFI_AP, so open() both pairs over BLE and
         # joins the camera's WiFi access point in one step.
         return sdk(
@@ -418,6 +436,7 @@ async def pair(
     routine WiFi pulls. Raises :class:`CameraError` if the BLE link never comes up.
     """
     sdk = _load_sdk()
+    _force_us_english_locale()
     gopro = sdk(
         target=camera_id,
         host_wifi_interface=wifi_interface,

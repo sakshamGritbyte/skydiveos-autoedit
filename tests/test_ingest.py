@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -293,3 +294,28 @@ def test_normalize_camera_id(raw: str | None, expected: str | None) -> None:
     from ingest.pull import _normalize_camera_id
 
     assert _normalize_camera_id(raw) == expected
+
+
+def test_force_us_english_locale_sets_lang(monkeypatch):
+    """The SDK's WiFi driver reads os.environ['LANG'] and refuses anything but en_US.
+
+    On the French client Mac (fr_CA) — and under launchd, which sets no LANG at all —
+    every manual pull failed with what looked like a camera fault.
+    """
+    from ingest.camera import _force_us_english_locale
+
+    monkeypatch.setenv("LANG", "fr_CA.UTF-8")
+    _force_us_english_locale()
+    assert os.environ["LANG"].startswith("en_US")
+
+    monkeypatch.delenv("LANG", raising=False)
+    _force_us_english_locale()
+    assert os.environ["LANG"].startswith("en_US")
+
+
+def test_force_us_english_locale_keeps_an_existing_en_us(monkeypatch):
+    from ingest.camera import _force_us_english_locale
+
+    monkeypatch.setenv("LANG", "en_US.ISO8859-1")
+    _force_us_english_locale()
+    assert os.environ["LANG"] == "en_US.ISO8859-1"

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd timer: pull the customer-named jump archive down from EC2 every few minutes.
+
+  This is a TEMPLATE: __REPO_ROOT__ and __EC2_HOST__ are substituted by
+  deploy/mac/load-archive-sync.sh, which writes the result to
+  ~/Library/LaunchAgents/com.skydiveos.archive-sync.plist and loads it.
+
+  Unlike the ingest service this is NOT KeepAlive — it is a periodic one-shot:
+  launchd runs sync-archive.sh every StartInterval seconds, it rsyncs, prints the
+  archive listing to the log, and exits. rsync is idempotent, so an overlapping or
+  failed run just catches up next time.
+
+  Needs non-interactive SSH to the EC2 box (ssh-copy-id once, as the logged-in user).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.skydiveos.archive-sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__REPO_ROOT__/deploy/mac/sync-archive.sh</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>EC2_HOST</key>
+        <string>__EC2_HOST__</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_ROOT__</string>
+
+    <!-- Run at login, then every 5 minutes. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>StandardOutPath</key>
+    <string>__REPO_ROOT__/logs/archive-sync.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO_ROOT__/logs/archive-sync.err.log</string>
+</dict>
+</plist>

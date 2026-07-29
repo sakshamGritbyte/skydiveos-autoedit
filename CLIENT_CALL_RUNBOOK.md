@@ -146,6 +146,35 @@ System Settings → Privacy & Security → Bluetooth.
 
 ---
 
+## PART 2.5 — Jump archive Mac pe (automatic)
+
+Pipeline EC2 pe chalti hai, isliye customer-naam wala archive wahin banta hai. Mac pe
+wo **khud-ba-khud** har 5 minute mein sync hota hai:
+
+```bash
+# EC2 pe (ek baar): bind mount wala compose lagao
+git pull && mkdir -p raw-storage && docker compose up -d
+
+# Mac pe (ek baar): SSH key + timer
+ssh-copy-id ubuntu@<ec2-ip>
+git pull
+EC2_HOST=ubuntu@<ec2-ip> bash deploy/mac/load-archive-sync.sh
+```
+
+Uske baad Mac pe Finder mein kholo: `~/skydiveos-autoedit/jump-archive/`
+
+```
+2026-07-29/Gregory-Perrimond/Marie-Dupont/
+    edited/    full_video.mp4  highlights.mp4  ...
+    photos/    50 stills
+    manifest.json
+```
+
+- Har 5 min sync (`logs/archive-sync.out.log` mein har run ka record)
+- `raw/` jaan-boojh ke nahi aata — masters Mac pe pehle se hain (`_camera-staging`),
+  GB-on-GB dobara download karna bekaar hai
+- Band karna ho: `bash deploy/mac/load-archive-sync.sh unload`
+
 ## PART 3 — Client ko kya batana hai (imaandari se)
 
 ### ✅ Jo chal raha hai

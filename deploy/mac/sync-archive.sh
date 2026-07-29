@@ -46,24 +46,36 @@ ARGS=(
   --exclude '_camera-staging/'
   --exclude '.transferred.json'
 )
-[ -n "${DRY_RUN}" ] && ARGS+=(--dry-run --itemize-changes)
+if [ -n "${DRY_RUN}" ]; then ARGS+=(--dry-run --itemize-changes); fi
 
 echo "==> syncing ${EC2_HOST}:${REMOTE_DIR}"
 echo "    into ${DEST}"
-[ -n "${DRY_RUN}" ] && echo "    (DRY RUN — nothing will be written)"
+if [ -n "${DRY_RUN}" ]; then echo "    (DRY RUN — nothing will be written)"; fi
 
 rsync "${ARGS[@]}" "${EC2_HOST}:${REMOTE_DIR}" "${DEST}/"
 
-if [ -z "${DRY_RUN}" ]; then
+summarise() {
+  # Cosmetic only — see the `|| true` below. One line per jump folder:
+  # date / instructor / customer, and what is in it.
   echo
   echo "==> jump archive on this Mac:"
-  # One line per jump folder: date / instructor / customer, and what is in it.
-  find "${DEST}" -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sort | while read -r jump; do
+  local found=0
+  while IFS= read -r jump; do
+    found=1
     rel="${jump#"${DEST}"/}"
-    videos=$(find "${jump}/edited" -type f 2>/dev/null | wc -l | tr -d ' ')
-    photos=$(find "${jump}/photos" -type f 2>/dev/null | wc -l | tr -d ' ')
+    videos=$(find "${jump}/edited" -type f 2>/dev/null | wc -l | tr -d " ")
+    photos=$(find "${jump}/photos" -type f 2>/dev/null | wc -l | tr -d " ")
     printf "    %-52s %s video(s), %s photo(s)\n" "${rel}" "${videos}" "${photos}"
-  done
-  echo
-  echo "    total: $(du -sh "${DEST}" 2>/dev/null | cut -f1)"
+  done < <(find "${DEST}" -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sort)
+  if [ "${found}" -eq 0 ]; then
+    echo "    (empty — no jump has been archived on EC2 yet)"
+  fi
+  echo "    total: $(du -sh "${DEST}" 2>/dev/null | cut -f1 || echo '?')"
+}
+
+if [ -z "${DRY_RUN}" ]; then
+  # `|| true`: the transfer already succeeded by this point. A failure while merely
+  # PRINTING what arrived must not report the sync as failed (launchd would show a
+  # non-zero exit and it would look broken when it is not).
+  summarise || true
 fi

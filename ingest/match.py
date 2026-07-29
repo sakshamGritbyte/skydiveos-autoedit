@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -287,6 +288,42 @@ class FootageMatcher:
         return captured_at.replace(tzinfo=None)
 
     @staticmethod
+    def _staff_for_camera(db: Any, camera_id: str) -> dict[str, Any]:
+        """The staff member who owns this camera, by exact serial or serial suffix.
+
+        A "camera id" in /ingest is the **trailing serial digits** the camera advertises
+        over BLE — a GoPro named ``GoPro 4313`` scans as ``4313`` — while
+        ``staffs.goproSerial`` normally holds the full printed serial
+        (``C3504224544313``). An exact-match-only lookup therefore finds nothing for
+        every real camera, silently degrading to the registry's static role hint. So we
+        fall back to a suffix match, which is exactly what the two representations
+        share.
+
+        Refuses on a suffix that fits more than one staff member (two cameras whose
+        serials end the same way) rather than picking one — mis-owning a camera
+        mis-delivers a customer's video.
+        """
+        exact = db[STAFFS].find_one({"goproSerial": camera_id})
+        if exact:
+            return dict(exact)
+        # ``$options: "i"`` because serials are quoted inconsistently by hand.
+        pattern = f"{re.escape(camera_id)}$"
+        matches = list(db[STAFFS].find({"goproSerial": {"$regex": pattern, "$options": "i"}}))
+        if not matches:
+            raise UnknownCamera(f"no staff owns camera serial {camera_id!r}")
+        if len(matches) > 1:
+            owners = [str(m.get("goproSerial")) for m in matches]
+            raise AmbiguousMatch(
+                f"camera id {camera_id!r} is the tail of {len(matches)} staff serials "
+                f"({owners}); refusing to guess the owner",
+                [],
+            )
+        logger.info(
+            "camera %s matched staff serial %r by suffix", camera_id, matches[0].get("goproSerial")
+        )
+        return dict(matches[0])
+
+    @staticmethod
     def _naive_local(value: Any) -> datetime | None:
         """A stored Mongo datetime → naive local (best effort; ``None`` if not a date)."""
         if isinstance(value, datetime):
@@ -304,9 +341,7 @@ class FootageMatcher:
             raise RegistryUnavailable("MONGO_URL unset; cannot read the shared DB")
 
         db = self._database()
-        staff = db[STAFFS].find_one({"goproSerial": gopro_serial})
-        if not staff:
-            raise UnknownCamera(f"no staff owns camera serial {gopro_serial!r}")
+        staff = self._staff_for_camera(db, gopro_serial)
         staff_id = staff["_id"]
         staff_name = " ".join(
             p for p in (staff.get("firstName"), staff.get("lastName")) if p

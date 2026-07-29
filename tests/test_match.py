@@ -153,3 +153,60 @@ class TestSelectMatch:
         assert _in_window(dep - WINDOW_PRE, dep)
         assert not _in_window(dep + WINDOW_POST + timedelta(seconds=1), dep)
         assert not _in_window(dep, None)
+
+
+class TestStaffLookupBySerialSuffix:
+    """A camera id is the TRAILING serial digits; staffs.goproSerial holds the full one.
+
+    A GoPro named ``GoPro 4313`` scans as ``4313``, but the staff record carries
+    ``C3504224544313``. Exact-match-only silently owned no camera at a real dropzone.
+    """
+
+    class _FakeStaffs:
+        def __init__(self, docs): self._docs = docs
+
+        def find_one(self, q):
+            return next((d for d in self._docs if d.get("goproSerial") == q["goproSerial"]), None)
+
+        def find(self, q):
+            import re as _re
+            pat = _re.compile(q["goproSerial"]["$regex"], _re.IGNORECASE)
+            return [d for d in self._docs if pat.search(str(d.get("goproSerial") or ""))]
+
+    def _db(self, *serials):
+        docs = [{"_id": i, "goproSerial": s} for i, s in enumerate(serials)]
+        return {"staffs": self._FakeStaffs(docs)}
+
+    def test_exact_serial_still_wins(self):
+        from ingest.match import FootageMatcher
+
+        db = self._db("C3504224544313")
+        got = FootageMatcher._staff_for_camera(db, "C3504224544313")
+        assert got["goproSerial"] == "C3504224544313"
+
+    def test_ble_short_id_matches_full_serial(self):
+        from ingest.match import FootageMatcher
+
+        db = self._db("C3504224544313")
+        got = FootageMatcher._staff_for_camera(db, "4313")
+        assert got["goproSerial"] == "C3504224544313"
+
+    def test_unknown_camera_raises(self):
+        from ingest.match import FootageMatcher, UnknownCamera
+
+        with pytest.raises(UnknownCamera):
+            FootageMatcher._staff_for_camera(self._db("C3504224544313"), "9999")
+
+    def test_suffix_shared_by_two_staff_refuses(self):
+        from ingest.match import AmbiguousMatch, FootageMatcher
+
+        db = self._db("C3504224544313", "C9999999994313")
+        with pytest.raises(AmbiguousMatch, match="refusing to guess the owner"):
+            FootageMatcher._staff_for_camera(db, "4313")
+
+    def test_suffix_only_never_matches_a_prefix(self):
+        """``4313`` must not match ``43134444`` — it is a suffix, anchored."""
+        from ingest.match import FootageMatcher, UnknownCamera
+
+        with pytest.raises(UnknownCamera):
+            FootageMatcher._staff_for_camera(self._db("C350431344449"), "4313")

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # Make the repo root importable when run as `python scripts/check_camera.py`.
@@ -37,8 +38,21 @@ async def _check(cam: Camera, transport: str) -> None:
         print(f"{len(videos)} video(s) on card:")
         for m in videos:
             lrv = "+LRV" if m.has_lrv else "    "
-            size = f"{m.size:,} bytes" if m.size else "size ?"
-            print(f"  {lrv}  {m.camera_path}  ({size})")
+            size = f"{m.size / 1e6:,.0f} MB" if m.size else "size ?"
+            # The camera's own wall clock — this is the time the footage must be
+            # matched against a load's departureTime, so print it rather than make
+            # the operator guess which day a clip belongs to.
+            when = (
+                datetime.fromtimestamp(m.created_epoch).strftime("%Y-%m-%d %H:%M:%S")
+                if m.created_epoch else "no timestamp"
+            )
+            print(f"  {lrv}  {when}  {m.camera_path:<28} ({size})")
+        stamped = [m.created_epoch for m in videos if m.created_epoch]
+        if stamped:
+            first = datetime.fromtimestamp(min(stamped)).strftime("%Y-%m-%d %H:%M")
+            last = datetime.fromtimestamp(max(stamped)).strftime("%Y-%m-%d %H:%M")
+            print(f"\ncard covers {first} .. {last} (camera clock)")
+            print("a load must depart within [clip -150min, clip +30min] to match")
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -192,6 +192,18 @@ def _replay_day(matcher, settings, day: str) -> int:
     )
     if not loads:
         print(f"no loads with a departureTime on {day}")
+        # Save the caller guessing: name the days that DO have loads.
+        days = sorted({
+            load["departureTime"].date().isoformat()
+            for load in db["loads"].find({})
+            if isinstance(load.get("departureTime"), dt.datetime)
+        })
+        if days:
+            print(f"days with loads ({len(days)}): {', '.join(days[-15:])}")
+            if len(days) > 15:
+                print(f"  … and {len(days) - 15} earlier")
+        else:
+            print("no load in the database has a departureTime — nothing can be matched")
         return 1
 
     print(f"replaying {len(loads)} load(s) on {day} (clip 5 min after each departure)\n")

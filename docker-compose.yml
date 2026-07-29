@@ -13,8 +13,15 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       JOBS_ROOT: /data/jobs
+      # The browsable jump archive (api/archive.py). A HOST bind mount, not a named
+      # volume, for two reasons: it survives `up --build` (the container layer does
+      # not), and the dropzone can rsync it down without docker exec. Costs disk —
+      # being a separate mount from `jobs`, archived masters are copied rather than
+      # hardlinked (place() falls back automatically).
+      RAW_STORAGE_ROOT: /data/raw-storage
     volumes:
-      - jobs:/data/jobs            # api writes uploaded footage here
+      - jobs:/data/jobs                  # api writes uploaded footage here
+      - ./raw-storage:/data/raw-storage  # {date}/{instructor}/{customer}/ archive
     ports:
       - "8000:8000"
     depends_on: [redis]
@@ -29,8 +36,10 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       JOBS_ROOT: /data/jobs
+      RAW_STORAGE_ROOT: /data/raw-storage
     volumes:
-      - jobs:/data/jobs            # SAME volume — worker reads that footage
+      - jobs:/data/jobs                  # SAME volume — worker reads that footage
+      - ./raw-storage:/data/raw-storage  # the worker writes renders + photos here
     depends_on: [redis]
     restart: unless-stopped
 

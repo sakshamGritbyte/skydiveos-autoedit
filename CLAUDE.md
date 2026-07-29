@@ -283,6 +283,10 @@ Two runtime media roots, with different audiences:
   `SMTP_PASSWORD`/`SMTP_STARTTLS`, `DELIVERY_FROM_EMAIL`, `DELIVERY_LINK_TTL_DAYS`;
   the jump archive adds `ARCHIVE_ENABLED` (on by default), `ARCHIVE_ROOT` (defaults to
   `$RAW_STORAGE_ROOT`), `ARCHIVE_LINK_MODE` (`link` | `copy` | `symlink`)
+- Under Docker the archive is a **host bind mount** (`./raw-storage:/data/raw-storage`),
+  not a named volume: the container layer is wiped by `up --build`, and a bind mount can
+  be rsync'd off the box without `docker exec`. Being a separate mount from the `jobs`
+  volume, archived masters are copied rather than hardlinked — budget the disk
 - `tests/conftest.py` pins the test environment (both storage roots into `tmp_path`,
   `ENABLE_AUTO_DISCOVERY`/`AUTO_DELIVER` off) so the suite never inherits a dev box's
   live `.env` — don't remove it, or tests write into the real `raw-storage` and the
@@ -316,7 +320,10 @@ Two runtime media roots, with different audiences:
   `delete_all_media`: it's per-file, or not at all
 - Don't file a camera pull directly into the archive — a pull knows only the camera and
   the timestamp, not the booking, so it stages into `raw-storage/_camera-staging/` and is
-  mirrored into the jump folder once a job identifies whose jump it is
+  mirrored into the jump folder once a job identifies whose jump it is. The dropzone Mac
+  therefore only ever sees footage by camera; it gets the customer-named archive by
+  **syncing it down from wherever the pipeline ran** (`deploy/mac/sync-archive.sh`,
+  rsync pull, `raw/` excluded because the Mac already holds those masters)
 - Don't mine a "deployment" beat from the `canopy`/`landing` scene — it's positionally unreliable; the deploy beat comes from the freefall scene at `deploy_offset`
 
 ## Workflow Rules

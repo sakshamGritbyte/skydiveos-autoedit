@@ -61,6 +61,26 @@ if str(_REPO_ROOT) not in sys.path:
 #: Statuses that mean the pipeline is finished with this job, one way or another.
 _DONE = {"ready", "ready_for_review", "delivered", "failed", "rejected"}
 
+
+def _jobs_root() -> Path:
+    """Where the pipeline actually keeps job dirs — NOT always ``<repo>/jobs``.
+
+    Under Docker the volume is mounted at ``/data/jobs`` (``JOBS_ROOT``), so a
+    repo-relative guess finds nothing and every audit fails with a confusing
+    "missing artifact" instead of "wrong directory". Resolve it the same way the
+    pipeline does, and fall back to the repo for a plain checkout.
+    """
+    try:
+        from api.config import get_settings
+
+        configured = get_settings().jobs_root
+        if configured:
+            return Path(configured)
+    except Exception:  # noqa: BLE001 - a diagnostic must not die on config import
+        pass
+    return _REPO_ROOT / "jobs"
+
+
 #: What each package must emit, keyed by package name.
 _EXPECTED_OUTPUTS: dict[str, tuple[str, ...]] = {
     "selfie": ("full_video", "highlights", "freefall", "photos"),
@@ -169,7 +189,7 @@ def _stream_durations(path: Path) -> dict[str, float]:
 
 def _find_default_footage() -> tuple[list[Path], list[Path], list[Path]]:
     """Reuse real masters from earlier jobs: (single-cam, instructor-cam, external-cam)."""
-    jobs_root = _REPO_ROOT / "jobs"
+    jobs_root = _jobs_root()
     single: list[Path] = []
     instructor: list[Path] = []
     external: list[Path] = []
@@ -576,7 +596,7 @@ def _audit_all(
     review_gate: bool = False,
 ) -> None:
     """Run every stage audit against a finished job's working dir + API responses."""
-    jd = _REPO_ROOT / "jobs" / run.job_id
+    jd = _jobs_root() / run.job_id
     roles = ["instructor", "external"] if package == "ultimum" else []
     outputs = {k: str(v) for k, v in (job.get("outputs") or {}).items()}
 
@@ -620,7 +640,7 @@ def _audit_existing(client: Any, api: str, job_id: str) -> PackageRun:
 
     # Rebuild the "what was uploaded" view from the raw staging the job actually has,
     # so the ingest audit still reports per-camera counts.
-    jd = _REPO_ROOT / "jobs" / job_id
+    jd = _jobs_root() / job_id
     cameras: list[tuple[str | None, list[Path]]] = []
     if package == "ultimum":
         for role in ("instructor", "external"):

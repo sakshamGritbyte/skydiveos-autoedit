@@ -122,9 +122,32 @@ def _readiness(matcher, settings) -> int:
     print(f"paired cameras   : {len(cameras)}  {[c.get('camera_id') for c in cameras]}")
     print(f"loads            : {len(loads)}")
 
+    # A GoPro's BLE name is "GoPro" + the LAST 4 DIGITS of its serial, so two cameras
+    # ending the same way advertise identically. BLE then cannot tell them apart at all
+    # — the pull targets whichever answers first — and the owner lookup refuses. Catch
+    # it here rather than on a jump day.
+    by_tail: dict[str, list[str]] = {}
+    for s in with_serial:
+        serial = str(s.get("goproSerial")).strip()
+        by_tail.setdefault(serial[-4:], []).append(serial)
+    collisions = {tail: v for tail, v in by_tail.items() if len(v) > 1}
+    if collisions:
+        print()
+        for tail, serials in collisions.items():
+            print(
+                f"WARNING: {len(serials)} cameras' serials end in {tail!r} ({serials}). "
+                "They advertise the SAME BLE name, so the pull cannot distinguish them "
+                "and the owner lookup will refuse. Use different cameras at this dropzone."
+            )
+
     registry_serials = {str(c.get("camera_id")) for c in cameras}
     staff_serials = {str(s.get("goproSerial")) for s in with_serial}
-    orphan = registry_serials - staff_serials
+    # A registry id is the short BLE id; a staff serial is the full one. A camera is
+    # "owned" when its id is the tail of some staff serial (see FootageMatcher).
+    orphan = {
+        cam for cam in registry_serials
+        if not any(full.endswith(cam) or full == cam for full in staff_serials)
+    }
     if orphan:
         print(
             f"\nWARNING: paired camera(s) {sorted(orphan)} match no staffs.goproSerial — "

@@ -17,6 +17,15 @@ layout, and project conventions, and
 SkydiveOS drives this module with (create job → attach footage → auto-deliver →
 status callbacks).
 
+## Testing and go-live
+
+- **[CLIENT_CALL_RUNBOOK.md](./CLIENT_CALL_RUNBOOK.md)** (Hinglish) — pre-flight both
+  machines, demo the whole flow start to end, and what is still pending. Read this first
+  before a customer-facing session.
+- [QA_NO_GOPRO.md](./QA_NO_GOPRO.md) — test every package and the camera flow with no camera
+- [MANUAL_QA.md](./MANUAL_QA.md) — the dropzone checklist, with a real camera
+- [GO_LIVE.md](./GO_LIVE.md) — deployment/config checklist
+
 ## Quick start
 
 ```bash

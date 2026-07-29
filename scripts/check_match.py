@@ -99,7 +99,10 @@ def _readiness(matcher, settings) -> int:
     db = matcher._database()  # noqa: SLF001 - a diagnostic, deliberately nosy
     staff = list(db["staffs"].find({}))
     with_serial = [s for s in staff if (s.get("goproSerial") or "").strip()]
-    cameras = list(db["cameras"].find({}))
+    all_cameras = list(db["cameras"].find({}))
+    # Discovery only ever pulls active cameras, so a deactivated entry is already
+    # excluded — warning about one would nag about something correctly handled.
+    cameras = [c for c in all_cameras if c.get("active", True)]
     loads = list(db["loads"].find({}))
 
     print(f"database         : {settings.mongo_db}")
@@ -119,7 +122,9 @@ def _readiness(matcher, settings) -> int:
                 p for p in (s.get("firstName"), s.get("lastName")) if p
             )
             print(f"      (none)             {name}")
-    print(f"paired cameras   : {len(cameras)}  {[c.get('camera_id') for c in cameras]}")
+    inactive = [str(c.get("camera_id")) for c in all_cameras if not c.get("active", True)]
+    print(f"paired cameras   : {len(cameras)} active {[c.get('camera_id') for c in cameras]}"
+          + (f", {len(inactive)} inactive {inactive}" if inactive else ""))
     print(f"loads            : {len(loads)}")
 
     # A GoPro's BLE name is "GoPro" + the LAST 4 DIGITS of its serial, so two cameras
@@ -146,7 +151,7 @@ def _readiness(matcher, settings) -> int:
     unpullable = [
         str(c.get("camera_id")) for c in cameras
         if not str(c.get("camera_id")).strip().isdigit()
-    ]
+    ]  # `cameras` is already active-only
     if unpullable:
         print(
             f"\nWARNING: registry entr{'y' if len(unpullable) == 1 else 'ies'} {unpullable} "

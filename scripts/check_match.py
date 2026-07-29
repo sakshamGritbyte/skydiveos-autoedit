@@ -230,6 +230,48 @@ def _replay_day(matcher, settings, day: str) -> int:
     return 0 if failed == 0 else 1
 
 
+def _list_owner_loads(matcher, settings, serial: str) -> int:
+    """Every load this camera's owner flew — i.e. the days worth replaying."""
+    from ingest.match import FootageMatcher, FootageMatchError
+
+    db = matcher._database()  # noqa: SLF001
+    try:
+        staff = FootageMatcher._staff_for_camera(db, serial)  # noqa: SLF001
+    except FootageMatchError as e:
+        print(f"{type(e).__name__}: {e}")
+        return 1
+    name = staff.get("name") or " ".join(
+        p for p in (staff.get("firstName"), staff.get("lastName")) if p
+    )
+    print(f"camera {serial} -> {name} (goproSerial={staff.get('goproSerial')!r})\n")
+
+    staff_id = staff["_id"]
+    rows = []
+    for load in db["loads"].find(
+        {"$or": [{"jumpers.instructor": staff_id}, {"jumpers.assignedCameraman": staff_id}]}
+    ):
+        dep = load.get("departureTime")
+        if not isinstance(dep, dt.datetime):
+            continue
+        for jumper in load.get("jumpers") or []:
+            if jumper.get("instructor") == staff_id:
+                role = "instructor"
+            elif jumper.get("assignedCameraman") == staff_id:
+                role = "external"
+            else:
+                continue
+            rows.append((dep, role, load.get("status"), jumper.get("mediaPackage")))
+
+    if not rows:
+        print("this staff member is not on any load — nothing to replay")
+        return 1
+    print(f"{len(rows)} jump(s) flown:")
+    for dep, role, status, media in sorted(rows):
+        print(f"  {dep:%Y-%m-%d %H:%M}  {role:<10} status={status:<10} media={media!r}")
+    print(f"\nreplay one with:  --day {sorted(rows)[-1][0]:%Y-%m-%d}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="python scripts/check_match.py",
@@ -249,8 +291,12 @@ def main(argv: list[str] | None = None) -> int:
             return _readiness(matcher, settings)
         if args.day:
             return _replay_day(matcher, settings, args.day)
-        if not args.serial or not (args.at or args.file):
-            p.error("give --readiness, --day, or --serial with --at/--file")
+        if args.serial and not (args.at or args.file):
+            # No time given: list the jumps this camera's owner actually flew, so you
+            # know which day is worth replaying instead of guessing.
+            return _list_owner_loads(matcher, settings, args.serial)
+        if not args.serial:
+            p.error("give --readiness, --day, or --serial (optionally with --at/--file)")
 
         if args.file:
             from ingest.discovery import _probe_capture_time

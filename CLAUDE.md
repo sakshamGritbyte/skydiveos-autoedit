@@ -225,6 +225,15 @@ Two runtime media roots, with different audiences:
   `/deliverables` + `/photos` endpoints. Prints a stage matrix, writes
   `qa-report.{json,md}`, exits non-zero if any stage failed. Runbook:
   [`QA_NO_GOPRO.md`](QA_NO_GOPRO.md)
+- `python scripts/restamp_footage.py --at <local-time> --out-dir <dir> <masters…>` —
+  write re-stamped COPIES of GoPro masters so an old card can be demoed against a load
+  manifested for today (prefer manifesting the load for the footage's real date — then
+  nothing is altered). Avoids the three traps that silently break this: a plain
+  `ffmpeg -c copy` **drops the `gpmd` telemetry** (segmentation then finds no exit /
+  deploy), `creation_time` without a trailing `Z` is **timezone-shifted** from
+  host-local, and stamping every clip identically breaks the per-file match — relative
+  spacing is preserved. `--at` is dropzone-local wall clock, exactly what a GoPro
+  writes. Output can only be re-uploaded, never put back on a camera
 - `python scripts/check_match.py --readiness | --day <ISO> | --serial <s> --at <local-time>`
   — read-only: shows what the footage→customer matcher WOULD decide against the live
   shared DB, with no camera. `--readiness` reports the two data prerequisites that

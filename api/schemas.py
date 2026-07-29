@@ -36,6 +36,9 @@ class CreateJobRequest(BaseModel):
     #: Product booked for this jump. Omitted → the :class:`Job` default ("selfie").
     package: Package | None = Field(default=None, examples=["selfie"])
     booking_id: str | None = Field(default=None, examples=["BK-1001"])
+    #: The instructor's display name — names their folder in the jump archive
+    #: (``raw-storage/{date}/{instructor}/{customer}/``). Omitted → ``instructor_id``.
+    instructor_name: str | None = Field(default=None, examples=["Marc Tremblay"])
 
 
 class JobResponse(BaseModel):
@@ -55,6 +58,8 @@ class JobResponse(BaseModel):
     booking_id: str | None
     #: Instructor (SkydiveOS account) that owns this job.
     instructor_id: str | None
+    #: The instructor's display name (names their folder in the jump archive).
+    instructor_name: str | None
     reject_reason: str | None
     error: str | None
     #: Rendered deliverables, present (non-null) only once status == ready.
@@ -79,6 +84,7 @@ class JobResponse(BaseModel):
             package=job.package,
             booking_id=job.booking_id,
             instructor_id=job.instructor_id,
+            instructor_name=job.instructor_name,
             reject_reason=job.reject_reason,
             error=job.error,
             outputs=job.outputs,

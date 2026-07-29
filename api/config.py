@@ -63,6 +63,19 @@ class Settings:
     #: default) or ``"static"`` — a no-hardware simulation mode that scans a fixed
     #: list and stages a sample file instead of pulling a camera (see :mod:`api.app`).
     camera_scanner: str
+    #: Delete already-delivered footage off the SD card on the next pull
+    #: (``DELETE_AFTER_TRANSFER``). A dropzone card fills in about a week and a full card
+    #: silently stops recording, so cleanup is required for unattended operation — but it
+    #: destroys footage, so it is OFF by default and opted into per machine. Only files
+    #: S3 has confirmed are ever removed (see :mod:`ingest.retention`).
+    delete_after_transfer: bool
+    #: Grace period before a confirmed file may be deleted, in hours
+    #: (``DELETE_AFTER_TRANSFER_MIN_AGE_H``). Default 24 h — a day to notice a problem
+    #: while the footage is still on the card. 0 deletes as soon as S3 confirms.
+    delete_after_transfer_min_age_h: float
+    #: Log what cleanup would delete without deleting (``DELETE_AFTER_TRANSFER_DRY_RUN``).
+    #: Run a day like this before trusting it with real footage.
+    delete_after_transfer_dry_run: bool
     #: Camera ids the ``static`` scanner reports (``DISCOVERY_FAKE_CAMERAS``, comma-sep).
     discovery_fake_cameras: tuple[str, ...]
     #: Sample MP4 the simulation copies in place of a real download (``DISCOVERY_SAMPLE_MP4``).
@@ -118,6 +131,11 @@ class Settings:
     #: (``AUTO_EDIT_CALLBACK_TOKEN``); SkydiveOS optionally verifies it inbound. Sent as
     #: the ``X-Auto-Edit-Token`` header when set; ``None`` → no token header (open).
     auto_edit_callback_token: str | None = None
+    #: Dropzone brand shown on the customer gallery page + email (``DELIVERY_BRAND_NAME``).
+    delivery_brand_name: str = "Ultimate DZ"
+    #: Optional location line on the gallery page (``DELIVERY_LOCATION``, e.g.
+    #: "Parachute Montréal, Québec"). ``None`` → omitted.
+    delivery_location: str | None = None
     #: IANA timezone the GoPro cameras' clocks are set to (``CAMERA_CLOCK_TZ``, e.g.
     #: ``America/Toronto``). GoPro writes the camera's LOCAL wall-clock into the MP4's
     #: ``creation_time`` and ffprobe mislabels it ``Z`` (UTC); when this is set, discovery
@@ -125,6 +143,18 @@ class Settings:
     #: so SkydiveOS's DZ-local footage↔booking match lines up. ``None`` → pass the tag
     #: through as-is (assume it is already UTC).
     camera_clock_tz: str | None = None
+    #: Mirror every job's raw footage + finished renders into the human-browsable jump
+    #: archive, ``<archive_root>/{jump date}/{instructor}/{customer}/`` (``ARCHIVE_ENABLED``,
+    #: on by default). See :mod:`api.archive`; turning it off changes nothing else.
+    archive_enabled: bool = True
+    #: Archive root (``ARCHIVE_ROOT``). ``None`` → /ingest's ``$RAW_STORAGE_ROOT``
+    #: (``./raw-storage``), so the archive lands where the operators already look and
+    #: hardlinks to pulled masters stay on one filesystem.
+    archive_root: str | None = None
+    #: How archived files are materialised (``ARCHIVE_LINK_MODE``): ``link`` (default —
+    #: hardlink, so a 4K master costs no extra disk, falling back to a copy across
+    #: filesystems), ``copy`` (always a real copy), or ``symlink``.
+    archive_link_mode: str = "link"
 
 
 def _flag(name: str, *, default: bool = False) -> bool:
@@ -152,6 +182,11 @@ def get_settings() -> Settings:
         mongo_db=os.environ.get("MONGO_DB") or "skydiveos",
         discovery_interval=float(os.environ.get("DISCOVERY_INTERVAL_SECONDS") or 30.0),
         camera_scanner=(os.environ.get("CAMERA_SCANNER") or "ble").strip().lower(),
+        delete_after_transfer=_flag("DELETE_AFTER_TRANSFER"),
+        delete_after_transfer_min_age_h=float(
+            os.environ.get("DELETE_AFTER_TRANSFER_MIN_AGE_H") or 24.0
+        ),
+        delete_after_transfer_dry_run=_flag("DELETE_AFTER_TRANSFER_DRY_RUN"),
         discovery_fake_cameras=tuple(
             c.strip()
             for c in (os.environ.get("DISCOVERY_FAKE_CAMERAS") or "").split(",")
@@ -179,4 +214,9 @@ def get_settings() -> Settings:
         ),
         auto_edit_callback_token=os.environ.get("AUTO_EDIT_CALLBACK_TOKEN") or None,
         camera_clock_tz=os.environ.get("CAMERA_CLOCK_TZ") or None,
+        delivery_brand_name=os.environ.get("DELIVERY_BRAND_NAME") or "Ultimate DZ",
+        delivery_location=os.environ.get("DELIVERY_LOCATION") or None,
+        archive_enabled=_flag("ARCHIVE_ENABLED", default=True),
+        archive_root=os.environ.get("ARCHIVE_ROOT") or None,
+        archive_link_mode=(os.environ.get("ARCHIVE_LINK_MODE") or "link").strip().lower(),
     )

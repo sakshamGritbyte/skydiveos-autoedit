@@ -1314,8 +1314,14 @@ def _ensure_aircraft_entry(edls: EDLResponse, manifest: dict[str, Any]) -> EDLRe
                 i += 1
             return [*clips[:i], entry, *clips[i:]]
 
-        full = list(edls.full_video) if _has_entry(edls.full_video) else _after_intro_head(edls.full_video)
-        highs = list(edls.highlights) if _has_entry(edls.highlights) else _after_intro_head(edls.highlights)
+        full = (
+            list(edls.full_video) if _has_entry(edls.full_video)
+            else _after_intro_head(edls.full_video)
+        )
+        highs = (
+            list(edls.highlights) if _has_entry(edls.highlights)
+            else _after_intro_head(edls.highlights)
+        )
         return edls.model_copy(update={"full_video": full, "highlights": highs})
 
     # --- fallback: dedicated boarding/plane scene head (original behaviour) ---

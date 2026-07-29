@@ -99,9 +99,12 @@ def test_lrv_camera_path_rejects_short_name() -> None:
 
 
 def test_storage_layout() -> None:
+    # The card mirror lives under the reserved _camera-staging/ prefix, keeping the
+    # root's top level for the {date}/{instructor}/{customer} jump archive.
     root = Path("/tmp/raw-storage")
     dest = storage.destination(root, "1234", CREATED, "GX010123.MP4")
-    assert dest == root / "1234" / "2024-05-29" / "GX010123.MP4"
+    assert dest == root / "_camera-staging" / "1234" / "2024-05-29" / "GX010123.MP4"
+    assert storage.camera_staging_root(root) == root / "_camera-staging"
 
 
 def test_date_for_falls_back_to_today_when_unknown() -> None:
@@ -171,7 +174,7 @@ def test_pull_camera_downloads_and_emits(tmp_path: Path) -> None:
     assert [j.skipped for j in jumps] == [False, False]
     assert [j.job_id for j in jumps] == ["1234-GX010123", "1234-GX020456"]
 
-    day_dir = tmp_path / "1234" / "2024-05-29"
+    day_dir = tmp_path / storage.CAMERA_STAGING_DIRNAME / "1234" / "2024-05-29"
     for stem in ("GX010123", "GX020456"):
         assert (day_dir / f"{stem}.MP4").exists()
         assert (day_dir / f"{stem}.LRV").exists()

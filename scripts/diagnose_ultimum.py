@@ -147,11 +147,18 @@ def main(argv: list[str] | None = None) -> int:
     _report_combo_edl(jd, ULTIMUM_EDL_FILES["full_video"], findings)
     _report_combo_edl(jd, ULTIMUM_EDL_FILES["highlights"], findings)
 
+    # A job still mid-pipeline legitimately has no renders yet; only a job the pipeline
+    # says it FINISHED may be judged on missing deliverables (an interrupted run must
+    # not read as "healthy").
+    finished = job.status.value in {"ready", "ready_for_review", "approved", "delivered"}
+
     _w("\n-- Per-camera freefall cuts --")
     for deliverable in ("external_freefall", "chute_libre_selfie"):
         clips = _load_json(jd / ULTIMUM_EDL_FILES[deliverable])
         n = len(clips) if isinstance(clips, list) else 0
         _w(f"  {deliverable:<20} {ULTIMUM_EDL_FILES[deliverable]}: {n} clips")
+        if finished and n == 0:
+            findings.append(f"{deliverable}: EDL has 0 clips — that camera's cut is empty")
 
     _w("\n-- Rendered outputs (A/V sync) --")
     for name in ("full_video", "highlights", "external_freefall", "chute_libre_selfie"):
@@ -160,6 +167,10 @@ def main(argv: list[str] | None = None) -> int:
         _w(f"  {name:<20} {label}")
         if "DESYNC" in label:
             findings.append(f"{name}.mp4: video/audio desync (video freezes, audio continues)")
+        elif finished and "missing" in label:
+            findings.append(f"{name}.mp4: deliverable never rendered (job is {job.status.value})")
+        elif finished and "no per-stream duration" in label:
+            findings.append(f"{name}.mp4: unreadable streams — likely truncated/corrupt render")
 
     _w("\n-- Photos --")
     index = _load_json(jd / "photos" / "index.json")
@@ -170,11 +181,17 @@ def main(argv: list[str] | None = None) -> int:
             findings.append(f"photos: only {len(index)} (target is ~50)")
     else:
         _w("  (no photos/index.json)")
+        if finished:
+            findings.append("photos: no index.json — the photo set was never extracted")
 
     _w("\n== Findings ==")
     if findings:
         for f in findings:
             _w(f"  ⚠ {f}")
+    elif not finished:
+        # Don't let "no findings" read as "all good" for a job that never got there.
+        _w(f"  none so far — but the job is still {job.status.value!r}, so missing "
+           f"deliverables above are NOT judged. Re-run once it reaches ready/delivered.")
     else:
         _w("  none — classification, combo selection, A/V sync and photo count all look healthy.")
     return 1 if findings else 0

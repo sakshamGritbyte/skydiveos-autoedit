@@ -6,6 +6,10 @@ plus poori automation ka step-by-step. Har box tick karte jao. ✅
 > **Rule #1:** Har test mein `customer_email` apna khud ka email do — kabhi real paying
 > customer ka nahi (jab tak sab pass na ho jaye).
 > **Rule #1 ka reason:** galat edit ya galat email real customer tak nahi jaana chahiye.
+>
+> **Camera paas nahi hai?** → [`QA_NO_GOPRO.md`](QA_NO_GOPRO.md). Wahan paanchon package
+> ka poora stage-by-stage audit ek command me chalta hai
+> (`python scripts/qa_all_packages.py`), purane jobs ke real masters use karke.
 
 `$AE` = auto-edit API ka URL (e.g. `http://<ec2-ip>:8000`).
 
@@ -70,7 +74,7 @@ watch -n3 "curl -s $AE/jobs/$JOB | python3 -m json.tool | grep -E 'status|error|
 
 ### ✅ 4. `photo_only` (sirf photos)
 - [ ] `"package":"photo_only"`
-- [ ] `outputs`: sirf **photos** (~90–100)
+- [ ] `outputs`: sirf **photos** (~140 — `PHOTO_ONLY_TARGET`, footage pe depend)
 - [ ] Video koi nahi
 - [ ] Email + photos-zip link OK
 

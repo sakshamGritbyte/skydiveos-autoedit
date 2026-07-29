@@ -20,11 +20,14 @@ is exercised without hardware.
 
 from __future__ import annotations
 
+import logging
 import shutil
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class CameraError(RuntimeError):
@@ -106,6 +109,18 @@ class Camera(ABC):
     @abstractmethod
     async def download_thumbnail(self, media: RemoteMedia, dest: Path) -> Path:
         """Download a recording's thumbnail to ``dest``."""
+
+    async def delete_media(self, media: RemoteMedia) -> None:
+        """Delete one recording (and its proxy/thumbnail) from the card.
+
+        Only ever called for footage S3 has already confirmed — see
+        :mod:`ingest.retention`. Deleting a customer's only copy is unrecoverable, so
+        this is per-file by design; nothing here wipes a card wholesale.
+
+        Default implementation refuses, so a transport that cannot delete safely fails
+        loudly instead of silently letting a card fill up.
+        """
+        raise CameraError(f"{type(self).__name__} does not support deleting media")
 
 
 def _to_float(value: Any) -> float | None:
@@ -232,6 +247,22 @@ class _SdkGoProCamera(Camera):
         )
         return _downloaded_path(resp, dest)
 
+    async def delete_media(self, media: RemoteMedia) -> None:
+        """Delete this recording's MP4, then its LRV proxy, over the HTTP API.
+
+        The MP4 is deleted first and its failure is fatal (the caller must not believe
+        the card was freed). The proxy is best-effort: some cameras remove it with the
+        master, and a stranded 30 MB LRV is not worth failing an otherwise-good delete.
+        """
+        gopro = self._require_open()
+        resp = await gopro.http_command.delete_file(path=media.camera_path)
+        if not resp.ok:
+            raise CameraError(f"delete_file failed for {media.camera_path}: {resp}")
+        try:
+            await gopro.http_command.delete_file(path=media.lrv_camera_path)
+        except Exception as e:  # noqa: BLE001 - proxy cleanup is best-effort
+            logger.debug("LRV delete skipped for %s: %r", media.camera_path, e)
+
 
 class GoProCamera(_SdkGoProCamera):
     """:class:`Camera` backed by a real GoPro over BLE + WiFi (the wireless pull)."""
@@ -306,6 +337,9 @@ class LocalSampleCamera(Camera):
         self._filename = filename
         self._count = max(1, count)
         self._created_epoch = created_epoch
+        #: Clips "deleted" from the simulated card — dropped from list_videos, so the
+        #: retention sweep can be exercised without hardware.
+        self._deleted: set[str] = set()
 
     @staticmethod
     def _bump(filename: str, i: int) -> str:
@@ -345,6 +379,7 @@ class LocalSampleCamera(Camera):
                 has_lrv=True,
             )
             for i in range(self._count)
+            if self._bump(self._filename, i) not in self._deleted
         ]
 
     async def download_mp4(self, media: RemoteMedia, dest: Path) -> Path:
@@ -359,6 +394,15 @@ class LocalSampleCamera(Camera):
     async def download_thumbnail(self, media: RemoteMedia, dest: Path) -> Path:
         dest.write_bytes(self._PLACEHOLDER_JPEG)
         return dest
+
+    async def delete_media(self, media: RemoteMedia) -> None:
+        """Forget a synthetic clip, so the simulation exercises the cleanup path too.
+
+        There is no card to free — the sample file on disk is left alone — but the clip
+        stops being listed, exactly as a real delete behaves on the next pull.
+        """
+        self._deleted.add(media.filename)
+        logger.info("simulated camera: dropped %s from the card", media.filename)
 
 
 async def pair(

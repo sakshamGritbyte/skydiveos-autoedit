@@ -30,7 +30,8 @@ from pathlib import Path
 
 from .camera import Camera, CameraError, GoProCamera, RemoteMedia, pair
 from .events import EventEmitter, build_event, default_emitter
-from .storage import destination, is_complete, storage_root, write_manifest
+from .retention import deletable
+from .storage import camera_dir, destination, is_complete, storage_root, write_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,51 @@ async def _pull_one(
     return PulledJump(job_id, camera_id, media, mp4_dest, lrv_dest, thumb_dest, skipped=False)
 
 
+async def _sweep_card(
+    cam: Camera,
+    camera_id: str,
+    videos: list[RemoteMedia],
+    root: Path,
+    *,
+    min_age_s: float,
+    dry_run: bool,
+    now: Callable[[], float],
+) -> list[str]:
+    """Delete on-card files S3 already confirmed, freeing the card for today's jumps.
+
+    Runs at the START of a pull, while the camera is open: by then the previous run's
+    uploads have been confirmed and recorded (:mod:`ingest.retention`), so this is the
+    first safe moment to clear them. A file is deleted only if the ledger names it — an
+    unknown file is always kept, so a missing or corrupt ledger fails safe.
+
+    Never raises: a card that cannot be cleaned is a capacity problem to warn about, not
+    a reason to abandon footage that is sitting on it right now.
+    """
+    by_name = {m.filename: m for m in videos}
+    candidates = deletable(camera_dir(root, camera_id), by_name, min_age_s=min_age_s, now=now())
+    if not candidates:
+        return []
+    deleted: list[str] = []
+    for rec in candidates:
+        media = by_name[rec.filename]
+        if dry_run:
+            logger.info(
+                "card cleanup (DRY RUN): would delete %s — confirmed in S3 at %s",
+                rec.filename, rec.s3_key,
+            )
+            deleted.append(rec.filename)
+            continue
+        try:
+            await cam.delete_media(media)
+        except CameraError as e:
+            logger.warning("could not delete %s from camera %s: %s", rec.filename, camera_id, e)
+            continue
+        # Logged with the S3 key that authorised it, so every deletion is auditable.
+        logger.info("card cleanup: deleted %s (safe: %s)", rec.filename, rec.s3_key)
+        deleted.append(rec.filename)
+    return deleted
+
+
 async def pull_camera(
     camera_id: str,
     *,
@@ -123,6 +169,9 @@ async def pull_camera(
     repull: bool = False,
     emit: bool = True,
     queue: str | None = None,
+    cleanup: bool = False,
+    cleanup_min_age_s: float = 0.0,
+    cleanup_dry_run: bool = False,
     now: Callable[[], float] = time.time,
 ) -> list[PulledJump]:
     """Pull all (new) recordings off ``camera_id`` into local staging.
@@ -137,6 +186,12 @@ async def pull_camera(
             tests inject a fake).
         since: Only pull recordings created at/after this epoch second.
         repull: Re-download even files already fully staged.
+        cleanup: Before pulling, delete on-card files S3 has already confirmed, so the
+            card cannot fill up and silently stop recording. Off by default — it
+            destroys footage, so it is opted into per machine.
+        cleanup_min_age_s: Grace period; only delete files confirmed at least this long
+            ago. 0 deletes as soon as the upload is confirmed.
+        cleanup_dry_run: Log what cleanup *would* delete, and delete nothing.
         emit: Emit ``ready_for_processing`` events. When False, no emitter is used.
         queue: Override the Redis queue name for the default emitter.
         now: Clock for the event timestamp (injectable for deterministic tests).
@@ -158,6 +213,18 @@ async def pull_camera(
     async with cam:
         videos = await cam.list_videos()
         logger.info("camera %s: %d video(s) on card", camera_id, len(videos))
+
+        if cleanup:
+            freed = await _sweep_card(
+                cam, camera_id, videos, resolved_root,
+                min_age_s=cleanup_min_age_s, dry_run=cleanup_dry_run, now=now,
+            )
+            if freed:
+                logger.info(
+                    "camera %s: cleared %d already-delivered file(s)", camera_id, len(freed)
+                )
+                videos = [m for m in videos if m.filename not in set(freed)]
+
         for media in videos:
             if since is not None and (media.created_epoch or 0.0) < since:
                 logger.debug("skip %s (older than --since)", media.filename)

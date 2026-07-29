@@ -32,6 +32,7 @@ from pathlib import Path
 from edl.storage import load_edl
 from render import render_edl
 
+from . import archive
 from .celery_app import celery_app
 from .config import Settings, get_settings
 from .jobs import Job, JobStatus, JobStore
@@ -105,6 +106,17 @@ def _notify_skydiveos(job: Job) -> None:
         logger.warning("SkydiveOS status callback failed for %s: %r", job.job_id, e)
 
 
+def _archive_deliverables(store: JobStore, job_id: str) -> None:
+    """Mirror a finished job's renders into the browsable jump archive.
+
+    Called at every "render finished" seam so the archive folder
+    (``<raw-storage>/{date}/{instructor}/{customer}/``) always holds the current cut
+    beside the footage it came from. :mod:`api.archive` never raises — a mirror must
+    not fail a customer's edit.
+    """
+    archive.archive_deliverables(store.load(job_id), store, get_settings())
+
+
 def _maybe_auto_deliver(store: JobStore, job_id: str) -> None:
     """Skip the review gate when ``AUTO_DELIVER`` is on: approve + enqueue delivery.
 
@@ -159,6 +171,7 @@ def process_job(job_id: str) -> str:
 
     updated = store.update(job_id, status=JobStatus.ready_for_review)
     _notify_skydiveos(updated)
+    _archive_deliverables(store, job_id)
     _maybe_auto_deliver(store, job_id)
     return job_id
 
@@ -186,6 +199,7 @@ def process_selfie_package(job_id: str) -> str:
         raise
 
     _notify_skydiveos(store.load(job_id))
+    _archive_deliverables(store, job_id)
     _maybe_auto_deliver(store, job_id)
     return job_id
 
@@ -222,6 +236,7 @@ def rerender_job(job_id: str) -> str:
 
     updated = store.update(job_id, status=JobStatus.ready_for_review)
     _notify_skydiveos(updated)
+    _archive_deliverables(store, job_id)
     _maybe_auto_deliver(store, job_id)
     return job_id
 
@@ -253,6 +268,9 @@ def deliver_job(job_id: str) -> str:
 
     updated = store.update(job_id, status=JobStatus.delivered, delivery_links=links)
     _notify_skydiveos(updated)
+    # Record what the customer got in the jump's archive manifest, so the folder alone
+    # answers "was this delivered, and to where?".
+    archive.archive_delivery(updated, get_settings())
     return job_id
 
 
@@ -283,7 +301,11 @@ def pull_camera_job(job_id: str, camera_id: str) -> str:
         store.update(job_id, status=JobStatus.failed, error=f"no recordings on camera {camera_id}")
         raise RuntimeError(f"no recordings pulled from camera {camera_id}")
 
-    store.update(job_id, source_path=str(pulled.mp4_path), status=JobStatus.queued)
+    updated = store.update(job_id, source_path=str(pulled.mp4_path), status=JobStatus.queued)
+    # The pull staged into the camera card mirror (raw-storage/_camera-staging/...);
+    # file the master under the jump in the browsable archive too, now that this job
+    # tells us whose jump it is.
+    archive.archive_raw_footage(updated, store, get_settings())
     # Hand off to the normal edit pipeline now that we have a master on disk.
     process_job.delay(job_id)
     return job_id
@@ -339,6 +361,10 @@ def ingest_s3_job(job_id: str, s3_key: str, camera_role: str | None = None) -> s
         store.update(job_id, status=JobStatus.failed, error=f"S3 ingest failed: {e}")
         raise
 
+    # File the freshly-downloaded master under the jump in the browsable archive before
+    # any editing runs, so the raw footage is preserved even if the edit later fails.
+    archive.archive_raw_footage(job, store, settings)
+
     # Two-camera Ultimate: wait until BOTH roles are on disk before processing.
     if job.package.is_ultimum:
         from .selfie import CAMERA_ROLES
@@ -378,6 +404,12 @@ def ultimum_watchdog_job(job_id: str) -> str:
     progressed past ``queued``, or both roles are now present), so a normal two-camera
     jump is never affected.
     """
+    # ``api.selfie`` pulls in top-level ``analysis``, and this import is deferred to
+    # task-execution time — after Celery has taken cwd back off sys.path. Without this
+    # the watchdog dies with ModuleNotFoundError and the stranded job it exists to fail
+    # stays in ``queued`` forever, which is the exact bug it guards against.
+    _ensure_repo_on_path()
+
     from .selfie import CAMERA_ROLES
 
     store = _store()
@@ -385,10 +417,14 @@ def ultimum_watchdog_job(job_id: str) -> str:
     if job.status != JobStatus.queued or store.camera_roles_present(job_id, CAMERA_ROLES):
         return job_id  # second camera arrived / job progressed — nothing to do
 
+    # Case-insensitive: GoPro masters are ``.MP4``, so a ``*.mp4`` glob finds nothing on
+    # a case-sensitive filesystem and the error would misreport which camera did arrive.
     present = [
         r for r in CAMERA_ROLES
         if store.camera_raw_dir(job_id, r).exists()
-        and any(store.camera_raw_dir(job_id, r).glob("*.mp4"))
+        and any(
+            p.suffix.lower() == ".mp4" for p in store.camera_raw_dir(job_id, r).glob("*")
+        )
     ]
     missing = [r for r in CAMERA_ROLES if r not in present]
     timeout = int(get_settings().ultimum_second_camera_timeout_s)

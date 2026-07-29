@@ -1,12 +1,19 @@
 """Local staging layout for media pulled off a camera.
 
-Files land under ``<root>/{camera_id}/{date}/{filename}`` per the ingest spec,
-where:
+Files land under ``<root>/_camera-staging/{camera_id}/{date}/{filename}``, where:
 
 * ``<root>`` defaults to ``./raw-storage`` and is overridable with the
   ``$RAW_STORAGE_ROOT`` env var (or an explicit argument);
 * ``{date}`` is the media's *own* creation date (``YYYY-MM-DD``) so a jump
   filmed yesterday but pulled today still files under the day it was shot.
+
+This is a *card mirror*, keyed by the only two things a pull knows — which camera
+and when it recorded — and it exists to make re-pulls idempotent. It deliberately
+sits under the reserved ``_camera-staging/`` prefix so the top level of the storage
+root holds nothing but the dropzone's jump archive,
+``{jump date}/{instructor}/{customer}/`` (see :mod:`api.archive`), which is the tree
+an operator browses. A pull can't file itself there: the booking that names the
+instructor and customer isn't known until SkydiveOS matches the footage to a jump.
 
 Each pulled jump gets a sidecar ``<stem>.ingest.json`` manifest next to its
 MP4. Its presence (together with the MP4) is what makes a re-run idempotent: we
@@ -24,6 +31,10 @@ from pathlib import Path
 DEFAULT_ROOT = Path("raw-storage")
 _ENV_ROOT = "RAW_STORAGE_ROOT"
 _MANIFEST_SUFFIX = ".ingest.json"
+#: Reserved subdirectory holding the per-camera card mirror, so it never mixes with
+#: the ``{date}/{instructor}/{customer}/`` jump folders at the root's top level. The
+#: underscore keeps it sorted away from the dates and marks it as machine-owned.
+CAMERA_STAGING_DIRNAME = "_camera-staging"
 
 
 def storage_root(override: str | Path | None = None) -> Path:
@@ -44,9 +55,23 @@ def date_for(created_epoch: float | None) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
+def camera_staging_root(root: Path) -> Path:
+    """The card-mirror subtree of a storage root: ``<root>/_camera-staging``."""
+    return root / CAMERA_STAGING_DIRNAME
+
+
+def camera_dir(root: Path, camera_id: str) -> Path:
+    """One camera's staging subtree: ``<root>/_camera-staging/{camera_id}``.
+
+    Date-independent, so per-camera state that must outlive a single day (the
+    confirmed-upload ledger in :mod:`ingest.retention`) has a stable home.
+    """
+    return camera_staging_root(root) / camera_id
+
+
 def jump_dir(root: Path, camera_id: str, created_epoch: float | None) -> Path:
-    """Directory a given jump's files belong in: ``<root>/{camera_id}/{date}``."""
-    return root / camera_id / date_for(created_epoch)
+    """Where a pulled jump's files stage: ``<root>/_camera-staging/{camera_id}/{date}``."""
+    return camera_staging_root(root) / camera_id / date_for(created_epoch)
 
 
 def destination(root: Path, camera_id: str, created_epoch: float | None, filename: str) -> Path:

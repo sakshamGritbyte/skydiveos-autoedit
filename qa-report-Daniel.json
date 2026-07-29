@@ -1,0 +1,366 @@
+[
+  {
+    "package": "ultimum",
+    "job_id": "05c797b719de452cbb340f86a87f40fa",
+    "status": "delivered",
+    "error": null,
+    "elapsed_s": 1269.8,
+    "ok": true,
+    "checks": [
+      {
+        "stage": "create",
+        "name": "POST /jobs",
+        "ok": true,
+        "detail": "job 05c797b719de452cbb340f86a87f40fa"
+      },
+      {
+        "stage": "ingest",
+        "name": "upload [instructor]",
+        "ok": true,
+        "detail": "2 file(s)"
+      },
+      {
+        "stage": "ingest",
+        "name": "ultimum waits for 2nd camera",
+        "ok": true,
+        "detail": "status after camera 1 = queued"
+      },
+      {
+        "stage": "ingest",
+        "name": "upload [external]",
+        "ok": true,
+        "detail": "8 file(s)"
+      },
+      {
+        "stage": "pipeline",
+        "name": "job succeeded",
+        "ok": true,
+        "detail": "delivered in 21m09s"
+      },
+      {
+        "stage": "ingest",
+        "name": "raw staged [instructor]",
+        "ok": true,
+        "detail": "2/2 masters in jobs/05c797b719de452cbb340f86a87f40fa/raw/instructor"
+      },
+      {
+        "stage": "ingest",
+        "name": "raw staged [external]",
+        "ok": true,
+        "detail": "8/8 masters in jobs/05c797b719de452cbb340f86a87f40fa/raw/external"
+      },
+      {
+        "stage": "segment",
+        "name": "scenes found [instructor]",
+        "ok": true,
+        "detail": "2: ['freefall', 'canopy']"
+      },
+      {
+        "stage": "segment",
+        "name": "milestone scenes [instructor]",
+        "ok": true,
+        "detail": "freefall present"
+      },
+      {
+        "stage": "segment",
+        "name": "exit/deploy offsets [instructor]",
+        "ok": true,
+        "detail": "exit=19.02 deploy=60.06 (freefall 41.0s)"
+      },
+      {
+        "stage": "segment",
+        "name": "landing milestone [instructor]",
+        "ok": true,
+        "detail": "no landing rename (canopy accl_z_mean=[1.465], needs >1.5) \u2014 expected unless the touchdown is in frame"
+      },
+      {
+        "stage": "segment",
+        "name": "flagged for review [instructor]",
+        "ok": true,
+        "detail": "none"
+      },
+      {
+        "stage": "segment",
+        "name": "file_offsets recorded [instructor]",
+        "ok": true,
+        "detail": "every scene maps back to its source files"
+      },
+      {
+        "stage": "segment",
+        "name": "scenes found [external]",
+        "ok": true,
+        "detail": "5: ['intro_interview', 'boarding', 'freefall', 'landing', 'outro_interview']"
+      },
+      {
+        "stage": "segment",
+        "name": "milestone scenes [external]",
+        "ok": true,
+        "detail": "freefall present"
+      },
+      {
+        "stage": "segment",
+        "name": "exit/deploy offsets [external]",
+        "ok": true,
+        "detail": "exit=25.02 deploy=67.07 (freefall 42.0s)"
+      },
+      {
+        "stage": "segment",
+        "name": "landing milestone [external]",
+        "ok": true,
+        "detail": "landing scene present"
+      },
+      {
+        "stage": "segment",
+        "name": "flagged for review [external]",
+        "ok": true,
+        "detail": "1 flag(s): ['auto-renamed canopy->landing (accl signature)']"
+      },
+      {
+        "stage": "segment",
+        "name": "file_offsets recorded [external]",
+        "ok": true,
+        "detail": "every scene maps back to its source files"
+      },
+      {
+        "stage": "score",
+        "name": "face scores [instructor]",
+        "ok": true,
+        "detail": "107 scored second(s) across 2 scene(s)"
+      },
+      {
+        "stage": "score",
+        "name": "face scores [external]",
+        "ok": true,
+        "detail": "199 scored second(s) across 5 scene(s)"
+      },
+      {
+        "stage": "compose",
+        "name": "EDL full_video",
+        "ok": true,
+        "detail": "23 clip(s) in edl_full.json"
+      },
+      {
+        "stage": "compose",
+        "name": "EDL full_video sane",
+        "ok": true,
+        "detail": "every clip has src_start <= src_end"
+      },
+      {
+        "stage": "compose",
+        "name": "EDL highlights",
+        "ok": true,
+        "detail": "27 clip(s) in edl_highlights.json"
+      },
+      {
+        "stage": "compose",
+        "name": "EDL highlights sane",
+        "ok": true,
+        "detail": "every clip has src_start <= src_end"
+      },
+      {
+        "stage": "compose",
+        "name": "EDL external_freefall",
+        "ok": true,
+        "detail": "22 clip(s) in edl_external_freefall.json"
+      },
+      {
+        "stage": "compose",
+        "name": "EDL external_freefall sane",
+        "ok": true,
+        "detail": "every clip has src_start <= src_end"
+      },
+      {
+        "stage": "compose",
+        "name": "EDL chute_libre_selfie",
+        "ok": true,
+        "detail": "20 clip(s) in edl_chute_libre.json"
+      },
+      {
+        "stage": "compose",
+        "name": "EDL chute_libre_selfie sane",
+        "ok": true,
+        "detail": "every clip has src_start <= src_end"
+      },
+      {
+        "stage": "validate",
+        "name": "validation report",
+        "ok": true,
+        "detail": "36 repair(s) across 4 deliverable(s): {\"full_video\": [\"dropped instructor/freefall [0.00, 19.02] \\u2014 outside freefall window [19.02, 63.06]\", \"dropped external/freefall [0.00, 25.02] \\u2014 outside freefall window [25.02, 70.07]\", \"clamped instructor/freefall [61.06, 79.00] -> [61.06, 63.06] \\u2014 freefall window is [19.02, 63.06]\", \"dropped instructor/freefall [79.00, 80.00] @0.4 \\u2014 outside freefall window [19.02, 63.06]\", \"c"
+      },
+      {
+        "stage": "render",
+        "name": "deliverable set",
+        "ok": true,
+        "detail": "got ['chute_libre_selfie', 'external_freefall', 'full_video', 'highlights', 'photos']"
+      },
+      {
+        "stage": "render",
+        "name": "full_video rendered",
+        "ok": true,
+        "detail": "730 MB, video 247.033333s, audio 247.030998s"
+      },
+      {
+        "stage": "render",
+        "name": "full_video A/V sync",
+        "ok": true,
+        "detail": "video/audio differ by 0.00s"
+      },
+      {
+        "stage": "render",
+        "name": "highlights rendered",
+        "ok": true,
+        "detail": "216 MB, video 81.966667s, audio 81.951995s"
+      },
+      {
+        "stage": "render",
+        "name": "highlights A/V sync",
+        "ok": true,
+        "detail": "video/audio differ by 0.01s"
+      },
+      {
+        "stage": "render",
+        "name": "external_freefall rendered",
+        "ok": true,
+        "detail": "79 MB, video 53.0s, audio 53.0s"
+      },
+      {
+        "stage": "render",
+        "name": "external_freefall A/V sync",
+        "ok": true,
+        "detail": "video/audio differ by 0.00s"
+      },
+      {
+        "stage": "render",
+        "name": "chute_libre_selfie rendered",
+        "ok": true,
+        "detail": "135 MB, video 48.066667s, audio 48.06s"
+      },
+      {
+        "stage": "render",
+        "name": "chute_libre_selfie A/V sync",
+        "ok": true,
+        "detail": "video/audio differ by 0.01s"
+      },
+      {
+        "stage": "photos",
+        "name": "photo count",
+        "ok": true,
+        "detail": "50 stills (expected 35\u2013150)"
+      },
+      {
+        "stage": "photos",
+        "name": "photos non-empty",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "stage": "photos",
+        "name": "photos.zip",
+        "ok": true,
+        "detail": "42.7 MB"
+      },
+      {
+        "stage": "review",
+        "name": "auto-approved (no manual gate)",
+        "ok": true,
+        "detail": "status=delivered"
+      },
+      {
+        "stage": "deliver",
+        "name": "delivery links",
+        "ok": true,
+        "detail": "6 link(s): ['chute_libre_selfie', 'external_freefall', 'full_video', 'gallery', 'highlights', 'photos']"
+      },
+      {
+        "stage": "deliver",
+        "name": "gallery link",
+        "ok": true,
+        "detail": "https://skydivingoss.s3.amazonaws.com/deliveries/05c797b719de452cbb340f86a87f40fa/gallery.html?X-Amz-Algorithm=AWS4-HMAC"
+      },
+      {
+        "stage": "deliver",
+        "name": "link gallery opens",
+        "ok": true,
+        "detail": "HTTP 206"
+      },
+      {
+        "stage": "deliver",
+        "name": "link full_video opens",
+        "ok": true,
+        "detail": "HTTP 206"
+      },
+      {
+        "stage": "deliver",
+        "name": "link highlights opens",
+        "ok": true,
+        "detail": "HTTP 206"
+      },
+      {
+        "stage": "deliver",
+        "name": "link external_freefall opens",
+        "ok": true,
+        "detail": "HTTP 206"
+      },
+      {
+        "stage": "deliver",
+        "name": "link chute_libre_selfie opens",
+        "ok": true,
+        "detail": "HTTP 206"
+      },
+      {
+        "stage": "deliver",
+        "name": "link photos opens",
+        "ok": true,
+        "detail": "HTTP 206"
+      },
+      {
+        "stage": "archive",
+        "name": "jump folder",
+        "ok": true,
+        "detail": "2026-07-28/Shred-QA/Daniel-ultimum"
+      },
+      {
+        "stage": "archive",
+        "name": "raw mirrored",
+        "ok": true,
+        "detail": "10 file(s)"
+      },
+      {
+        "stage": "archive",
+        "name": "edited mirrored",
+        "ok": true,
+        "detail": "4 file(s)"
+      },
+      {
+        "stage": "archive",
+        "name": "photos mirrored",
+        "ok": true,
+        "detail": "51 file(s)"
+      },
+      {
+        "stage": "archive",
+        "name": "manifest complete",
+        "ok": true,
+        "detail": "keys=['archived_at', 'booking_id', 'camera_id', 'customer', 'customer_email', 'customer_name', 'delivered_at', 'delivery_links', 'edited', 'instructor', 'instructor_id', 'instructor_name', 'job_id', 'jump_date', 'package', 'photos', 'raw', 'status', 'updated_at']"
+      },
+      {
+        "stage": "api",
+        "name": "GET /deliverables",
+        "ok": true,
+        "detail": "HTTP 200, lists ['chute_libre_selfie', 'external_freefall', 'full_video', 'highlights', 'photos']"
+      },
+      {
+        "stage": "api",
+        "name": "stream full_video",
+        "ok": true,
+        "detail": "HTTP 206"
+      },
+      {
+        "stage": "api",
+        "name": "GET /photos",
+        "ok": true,
+        "detail": "HTTP 200, count=50"
+      }
+    ]
+  }
+]

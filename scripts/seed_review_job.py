@@ -51,7 +51,9 @@ def seed(job_id: str | None) -> str:
     if job_id is None:
         job_id = uuid.uuid4().hex
     if not store.exists(job_id):
-        store.create(Job(job_id=job_id, customer_name="Jane Doe", jump_date="2026-06-02", music="sunrise"))
+        store.create(Job(
+            job_id=job_id, customer_name="Jane Doe", jump_date="2026-06-02", music="sunrise"
+        ))
 
     store.save_edl(job_id, QA_EDL)
     final = store.final_path(job_id)

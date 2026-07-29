@@ -45,6 +45,10 @@ extend-exclude = ["vendor"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
+[tool.ruff.lint.per-file-ignores]
+# gallery.py is an HTML/CSS template — long inline style lines are clearer unwrapped.
+"api/gallery.py" = ["E501"]
+
 [tool.mypy]
 python_version = "3.11"
 warn_unused_ignores = true

@@ -1129,7 +1129,8 @@ def test_ensure_aircraft_entry_is_noop_when_present() -> None:
 def _intro_entry_manifest(intro_files: list[dict[str, Any]]) -> dict[str, Any]:
     scenes = [
         {"name": "intro_interview", "duration": 49.333, "file_offsets": intro_files},
-        {"name": "boarding", "duration": 37.237, "file_offsets": [{"file": "b.MP4", "offset": 0.0}]},
+        {"name": "boarding", "duration": 37.237,
+         "file_offsets": [{"file": "b.MP4", "offset": 0.0}]},
         {"name": "freefall", "duration": 112.0},
         {"name": "canopy", "duration": 18.0},
     ]

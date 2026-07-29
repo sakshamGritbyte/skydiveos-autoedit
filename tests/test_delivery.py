@@ -41,6 +41,9 @@ def _settings(**overrides: Any) -> Settings:
         mongo_db="skydiveos",
         discovery_interval=30.0,
         camera_scanner="static",
+        delete_after_transfer=False,
+        delete_after_transfer_min_age_h=24.0,
+        delete_after_transfer_dry_run=False,
         discovery_fake_cameras=(),
         discovery_sample_mp4=None,
         discovery_sample_count=1,
@@ -61,11 +64,18 @@ class FakeS3:
 
     def __init__(self) -> None:
         self.uploads: list[tuple[str, str, str, dict[str, Any]]] = []
+        #: ``put_object`` bodies (the gallery HTML), keyed by S3 key.
+        self.objects: dict[str, bytes] = {}
 
     def upload_file(
         self, filename: str, bucket: str, key: str, ExtraArgs: dict[str, Any]
     ) -> None:
         self.uploads.append((filename, bucket, key, ExtraArgs))
+
+    def put_object(
+        self, *, Bucket: str, Key: str, Body: bytes, ContentType: str
+    ) -> None:
+        self.objects[Key] = Body
 
     def generate_presigned_url(
         self, op: str, Params: dict[str, str], ExpiresIn: int
@@ -246,13 +256,18 @@ def _rendered_job(store: JobStore, **fields: Any) -> Job:
 def test_deliver_happy_path_returns_links(store: JobStore) -> None:
     job = _rendered_job(store, customer_email="jane@example.com")
     smtp = FakeSMTP()
+    s3 = FakeS3()
 
     links = deliver_to_customer(
-        job, store, _settings(), s3_client=FakeS3(), smtp_factory=lambda: smtp  # type: ignore[arg-type,return-value]
+        job, store, _settings(), s3_client=s3, smtp_factory=lambda: smtp  # type: ignore[arg-type,return-value]
     )
 
-    assert set(links) == {"final"}
+    # One customer link is the hosted gallery; the raw video link rides along for
+    # SkydiveOS. Exactly one email — the single gallery link, not a link per file.
+    assert set(links) == {"gallery", "final"}
+    assert f"{DELIVERY_KEY_PREFIX}/{job.job_id}/gallery.html" in s3.objects
     assert len(smtp.sent) == 1
+    assert links["gallery"] in smtp.sent[0].get_content()
 
 
 def test_deliver_fails_when_nothing_rendered(store: JobStore) -> None:
@@ -278,7 +293,7 @@ def test_deliver_without_email_ok_when_skydiveos_forwards(store: JobStore) -> No
         _settings(skydiveos_api_base="http://skydiveos.test"),
         s3_client=FakeS3(),
     )
-    assert set(links) == {"final"}
+    assert set(links) == {"gallery", "final"}
 
 
 # --------------------------------------------------------------------------- #
@@ -341,7 +356,7 @@ def test_deliver_job_task_persists_links_and_marks_delivered(
 
     job = store.load("j1")
     assert job.status == JobStatus.delivered
-    assert job.delivery_links and set(job.delivery_links) == {"final"}
+    assert job.delivery_links and set(job.delivery_links) == {"gallery", "final"}
     assert len(smtp.sent) == 1
 
 

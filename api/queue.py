@@ -44,6 +44,10 @@ class JobQueue(Protocol):
         """Queue a download of a raw master already staged in S3 (auto-discovery path)."""
         ...
 
+    def arm_ultimum_watchdog(self, job_id: str, countdown: float) -> None:
+        """Schedule the stranded-Ultimate check for ``countdown`` seconds from now."""
+        ...
+
 
 class CeleryJobQueue:
     """Production :class:`JobQueue` — dispatches to the Celery tasks via ``.delay``."""
@@ -79,3 +83,8 @@ class CeleryJobQueue:
         from .tasks import ingest_s3_job
 
         ingest_s3_job.delay(job_id, s3_key, camera_role)
+
+    def arm_ultimum_watchdog(self, job_id: str, countdown: float) -> None:
+        from .tasks import ultimum_watchdog_job
+
+        ultimum_watchdog_job.apply_async((job_id,), countdown=countdown)

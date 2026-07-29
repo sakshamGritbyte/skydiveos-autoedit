@@ -1,0 +1,64 @@
+# Auto-Edit QA report
+
+## ultimum — PASS
+job `05c797b719de452cbb340f86a87f40fa` · status `delivered` · 21m09s
+
+- ✓ **create** POST /jobs — job 05c797b719de452cbb340f86a87f40fa
+- ✓ **ingest** upload [instructor] — 2 file(s)
+- ✓ **ingest** ultimum waits for 2nd camera — status after camera 1 = queued
+- ✓ **ingest** upload [external] — 8 file(s)
+- ✓ **pipeline** job succeeded — delivered in 21m09s
+- ✓ **ingest** raw staged [instructor] — 2/2 masters in jobs/05c797b719de452cbb340f86a87f40fa/raw/instructor
+- ✓ **ingest** raw staged [external] — 8/8 masters in jobs/05c797b719de452cbb340f86a87f40fa/raw/external
+- ✓ **segment** scenes found [instructor] — 2: ['freefall', 'canopy']
+- ✓ **segment** milestone scenes [instructor] — freefall present
+- ✓ **segment** exit/deploy offsets [instructor] — exit=19.02 deploy=60.06 (freefall 41.0s)
+- ✓ **segment** landing milestone [instructor] — no landing rename (canopy accl_z_mean=[1.465], needs >1.5) — expected unless the touchdown is in frame
+- ✓ **segment** flagged for review [instructor] — none
+- ✓ **segment** file_offsets recorded [instructor] — every scene maps back to its source files
+- ✓ **segment** scenes found [external] — 5: ['intro_interview', 'boarding', 'freefall', 'landing', 'outro_interview']
+- ✓ **segment** milestone scenes [external] — freefall present
+- ✓ **segment** exit/deploy offsets [external] — exit=25.02 deploy=67.07 (freefall 42.0s)
+- ✓ **segment** landing milestone [external] — landing scene present
+- ✓ **segment** flagged for review [external] — 1 flag(s): ['auto-renamed canopy->landing (accl signature)']
+- ✓ **segment** file_offsets recorded [external] — every scene maps back to its source files
+- ✓ **score** face scores [instructor] — 107 scored second(s) across 2 scene(s)
+- ✓ **score** face scores [external] — 199 scored second(s) across 5 scene(s)
+- ✓ **compose** EDL full_video — 23 clip(s) in edl_full.json
+- ✓ **compose** EDL full_video sane — every clip has src_start <= src_end
+- ✓ **compose** EDL highlights — 27 clip(s) in edl_highlights.json
+- ✓ **compose** EDL highlights sane — every clip has src_start <= src_end
+- ✓ **compose** EDL external_freefall — 22 clip(s) in edl_external_freefall.json
+- ✓ **compose** EDL external_freefall sane — every clip has src_start <= src_end
+- ✓ **compose** EDL chute_libre_selfie — 20 clip(s) in edl_chute_libre.json
+- ✓ **compose** EDL chute_libre_selfie sane — every clip has src_start <= src_end
+- ✓ **validate** validation report — 36 repair(s) across 4 deliverable(s): {"full_video": ["dropped instructor/freefall [0.00, 19.02] \u2014 outside freefall window [19.02, 63.06]", "dropped external/freefall [0.00, 25.02] \u2014 outside freefall window [25.02, 70.07]", "clamped instructor/freefall [61.06, 79.00] -> [61.06, 63.06] \u2014 freefall window is [19.02, 63.06]", "dropped instructor/freefall [79.00, 80.00] @0.4 \u2014 outside freefall window [19.02, 63.06]", "c
+- ✓ **render** deliverable set — got ['chute_libre_selfie', 'external_freefall', 'full_video', 'highlights', 'photos']
+- ✓ **render** full_video rendered — 730 MB, video 247.033333s, audio 247.030998s
+- ✓ **render** full_video A/V sync — video/audio differ by 0.00s
+- ✓ **render** highlights rendered — 216 MB, video 81.966667s, audio 81.951995s
+- ✓ **render** highlights A/V sync — video/audio differ by 0.01s
+- ✓ **render** external_freefall rendered — 79 MB, video 53.0s, audio 53.0s
+- ✓ **render** external_freefall A/V sync — video/audio differ by 0.00s
+- ✓ **render** chute_libre_selfie rendered — 135 MB, video 48.066667s, audio 48.06s
+- ✓ **render** chute_libre_selfie A/V sync — video/audio differ by 0.01s
+- ✓ **photos** photo count — 50 stills (expected 35–150)
+- ✓ **photos** photos non-empty — 
+- ✓ **photos** photos.zip — 42.7 MB
+- ✓ **review** auto-approved (no manual gate) — status=delivered
+- ✓ **deliver** delivery links — 6 link(s): ['chute_libre_selfie', 'external_freefall', 'full_video', 'gallery', 'highlights', 'photos']
+- ✓ **deliver** gallery link — https://skydivingoss.s3.amazonaws.com/deliveries/05c797b719de452cbb340f86a87f40fa/gallery.html?X-Amz-Algorithm=AWS4-HMAC
+- ✓ **deliver** link gallery opens — HTTP 206
+- ✓ **deliver** link full_video opens — HTTP 206
+- ✓ **deliver** link highlights opens — HTTP 206
+- ✓ **deliver** link external_freefall opens — HTTP 206
+- ✓ **deliver** link chute_libre_selfie opens — HTTP 206
+- ✓ **deliver** link photos opens — HTTP 206
+- ✓ **archive** jump folder — 2026-07-28/Shred-QA/Daniel-ultimum
+- ✓ **archive** raw mirrored — 10 file(s)
+- ✓ **archive** edited mirrored — 4 file(s)
+- ✓ **archive** photos mirrored — 51 file(s)
+- ✓ **archive** manifest complete — keys=['archived_at', 'booking_id', 'camera_id', 'customer', 'customer_email', 'customer_name', 'delivered_at', 'delivery_links', 'edited', 'instructor', 'instructor_id', 'instructor_name', 'job_id', 'jump_date', 'package', 'photos', 'raw', 'status', 'updated_at']
+- ✓ **api** GET /deliverables — HTTP 200, lists ['chute_libre_selfie', 'external_freefall', 'full_video', 'highlights', 'photos']
+- ✓ **api** stream full_video — HTTP 206
+- ✓ **api** GET /photos — HTTP 200, count=50

@@ -36,6 +36,12 @@ class RawUploadNotice(BaseModel):
     s3_key: str
     camera_id: str
     instructor_id: str | None = None
+    #: Which Ultimate angle this camera filled on THIS jump (load-derived, not the
+    #: registry's static hint) — recorded so a QA run can see the routing decision.
+    camera_role: str | None = None
+    #: True-UTC ISO-8601 capture instant (GoPro local clock converted via
+    #: ``CAMERA_CLOCK_TZ``) — the field SkydiveOS matches footage to a load on.
+    captured_at: str | None = None
 
 
 @app.post("/api/media/raw-upload")
@@ -46,11 +52,14 @@ def raw_upload(notice: RawUploadNotice) -> dict[str, object]:
         "s3_key": notice.s3_key,
         "camera_id": notice.camera_id,
         "instructor_id": notice.instructor_id,
+        "camera_role": notice.camera_role,
+        "captured_at": notice.captured_at,
     }
     _MEDIA.append(item)
     print(
         f"[mock-skydiveos] registered {notice.s3_key} "
-        f"from {notice.camera_id} -> instructor {notice.instructor_id}"
+        f"from {notice.camera_id} -> instructor {notice.instructor_id} "
+        f"role={notice.camera_role} captured_at={notice.captured_at}"
     )
     return {"ok": True, "media": item}
 

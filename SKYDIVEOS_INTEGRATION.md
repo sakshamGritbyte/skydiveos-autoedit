@@ -57,6 +57,7 @@ X-Role: instructor
 {
   "customer_name":   "Jane Doe",
   "customer_email":  "jane@example.com",
+  "instructor_name": "Marc Tremblay",
   "package":         "selfie",
   "booking_id":      "BK-1001",
   "jump_date":       "2026-07-27",
@@ -71,7 +72,8 @@ X-Role: instructor
 | `customer_email` | string | **yes** | Where the finished links are emailed. **Without it the pipeline can't email the customer** — it will only hand the links back to SkydiveOS via the status callback. |
 | `package` | enum | **yes** | Drives the whole pipeline & deliverable set. See the add-on table below. |
 | `booking_id` | string | recommended | Your booking reference; round-trips on every response/callback. |
-| `jump_date` | ISO date | optional | Defaults to render-day. |
+| `instructor_name` | string | recommended | The instructor's display name. Names their folder in the dropzone's jump archive (`raw-storage/{jump date}/{instructor}/{customer}/`, see CLAUDE.md). You own the staff records — we only store what you send. Omitted → the folder falls back to `instructor_id`, then `_no-instructor`. |
+| `jump_date` | ISO date | optional | Defaults to render-day. Also the archive's top-level date folder — send it if you want the jump filed under the day it was *flown* rather than the day it was edited. |
 | `target_duration` | float (s) | optional | Final length target; default 90. |
 | `music` | string | optional | Track **stem** from `templates/music/` (e.g. `"Fly Away - Lenny Kravitz"`). Omit/`null` → the pipeline picks a random default track once and reuses it. |
 

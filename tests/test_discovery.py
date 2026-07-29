@@ -246,6 +246,109 @@ def test_camera_role_is_handed_off(tmp_path: Path) -> None:
     assert uploads.calls == [(str(tmp_path / "GX010001.MP4"), "5678", "inst-2", "external")]
 
 
+def test_role_resolver_overrides_static_registry_hint(tmp_path: Path) -> None:
+    """The load-derived role wins over the camera's static registry role.
+
+    The registry statically calls camera 5678 an ``instructor`` cam, but on THIS jump
+    its owner flew as the cameraman — the injected resolver returns ``external`` and
+    that is what's handed off (the "one staff member does both roles" case).
+    """
+    uploads = _RecordingUploader()
+    registry = FakeRegistry(
+        [CameraRecord(camera_id="5678", paired_at=1.0, instructor_id="inst-2", role="instructor")]
+    )
+    seen: list[tuple[str, str]] = []
+
+    def resolver(camera_id: str, mp4_path: str) -> str | None:
+        seen.append((camera_id, mp4_path))
+        return "external"
+
+    service = CameraDiscoveryService(
+        scanner=StaticCameraScanner(["5678"]),
+        registry=registry,
+        upload=uploads,
+        pull=_make_pull(tmp_path / "GX010001.MP4"),
+        interval=0.05,
+        role_resolver=resolver,
+    )
+
+    async def scenario() -> None:
+        await service.start()
+        await _wait_for(lambda: bool(uploads.calls))
+        await service.stop()
+
+    asyncio.run(scenario())
+
+    assert seen == [("5678", str(tmp_path / "GX010001.MP4"))]
+    # 'external' (load-derived), NOT the registry's static 'instructor' hint.
+    assert uploads.calls == [(str(tmp_path / "GX010001.MP4"), "5678", "inst-2", "external")]
+
+
+def test_role_resolver_falls_back_to_hint_when_unresolved(tmp_path: Path) -> None:
+    """When the resolver can't decide (returns None), the static registry role is used."""
+    uploads = _RecordingUploader()
+    registry = FakeRegistry(
+        [CameraRecord(camera_id="5678", paired_at=1.0, instructor_id="inst-2", role="external")]
+    )
+    service = CameraDiscoveryService(
+        scanner=StaticCameraScanner(["5678"]),
+        registry=registry,
+        upload=uploads,
+        pull=_make_pull(tmp_path / "GX010001.MP4"),
+        interval=0.05,
+        role_resolver=lambda _c, _m: None,  # unresolved / ambiguous → fall back
+    )
+
+    async def scenario() -> None:
+        await service.start()
+        await _wait_for(lambda: bool(uploads.calls))
+        await service.stop()
+
+    asyncio.run(scenario())
+
+    assert uploads.calls == [(str(tmp_path / "GX010001.MP4"), "5678", "inst-2", "external")]
+
+
+def test_matcher_role_resolver_adapts_matcher(monkeypatch) -> None:
+    """The adapter probes capture time, asks the matcher, and swallows match errors."""
+    from ingest import discovery
+    from ingest.discovery import matcher_role_resolver
+    from ingest.match import AmbiguousMatch, MatchResult
+
+    monkeypatch.setattr(
+        discovery, "_probe_capture_time", lambda p, clock_tz=None: "2026-07-21T17:15:00Z"
+    )
+
+    class _OkMatcher:
+        def resolve(self, serial: str, captured_at: str) -> MatchResult:
+            assert captured_at == "2026-07-21T17:15:00Z"
+            return MatchResult(
+                role="external", staff_id="s1", load_id="L1", jumper_index=0
+            )
+
+    assert matcher_role_resolver(_OkMatcher())("5678", "/x.mp4") == "external"
+
+    class _AmbiguousMatcher:
+        def resolve(self, serial: str, captured_at: str) -> MatchResult:
+            raise AmbiguousMatch("two jumpers", [])
+
+    # Ambiguous → None (caller falls back to the static hint), never raises.
+    assert matcher_role_resolver(_AmbiguousMatcher())("5678", "/x.mp4") is None
+
+    # No readable capture time → None without even calling the matcher.
+    monkeypatch.setattr(discovery, "_probe_capture_time", lambda p, clock_tz=None: None)
+    called = False
+
+    class _Unused:
+        def resolve(self, *a: object) -> MatchResult:
+            nonlocal called
+            called = True
+            raise AssertionError("must not be called")
+
+    assert matcher_role_resolver(_Unused())("5678", "/x.mp4") is None
+    assert called is False
+
+
 def test_unknown_camera_is_ignored(tmp_path: Path) -> None:
     uploads = _RecordingUploader()
     # Scanner sees 9999, but only 1234 is paired → 9999 must never be pulled.
@@ -482,6 +585,9 @@ def _settings(**overrides: object) -> Settings:
         mongo_db="skydiveos",
         discovery_interval=30.0,
         camera_scanner="ble",
+        delete_after_transfer=False,
+        delete_after_transfer_min_age_h=24.0,
+        delete_after_transfer_dry_run=False,
         discovery_fake_cameras=(),
         discovery_sample_mp4=None,
         discovery_sample_count=1,

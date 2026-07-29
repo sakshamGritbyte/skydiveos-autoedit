@@ -52,6 +52,9 @@ class FakeQueue:
     ) -> None:
         self.calls.append(("s3_ingest", (job_id, s3_key, camera_role)))
 
+    def arm_ultimum_watchdog(self, job_id: str, countdown: float) -> None:
+        self.calls.append(("ultimum_watchdog", (job_id, countdown)))
+
     def kinds(self) -> list[str]:
         return [kind for kind, _ in self.calls]
 
@@ -402,10 +405,60 @@ def test_upload_multiple_files_saved_to_raw(client: TestClient, queue: FakeQueue
         "booking_id": "BK-9",
         "customer_name": "Mia",
         "customer_email": None,
+        "instructor_name": None,
         "jump_date": "2026-06-02",
         "package": "selfie",
         "music": None,
     }
+
+
+def test_upload_files_land_in_the_jump_archive(client: TestClient, tmp_path: Path) -> None:
+    """An upload also files the masters under {date}/{instructor}/{customer} in raw-storage.
+
+    The archive tree itself is covered in ``test_archive.py``; this pins the wiring —
+    that the endpoint actually reaches it, with the booking's names.
+    """
+    job_id = _create(
+        client,
+        customer_name="Marie Dupont",
+        instructor_name="Marc Tremblay",
+        jump_date="2026-06-02",
+    )
+    resp = client.post(
+        f"/jobs/{job_id}/upload",
+        files=[("files", ("GH010001.MP4", b"master", "video/mp4"))],
+    )
+    assert resp.status_code == 200
+
+    jump_dir = tmp_path / "raw-storage" / "2026-06-02" / "Marc-Tremblay" / "Marie-Dupont"
+    assert (jump_dir / "raw" / "GH010001.MP4").read_bytes() == b"master"
+    manifest = json.loads((jump_dir / "manifest.json").read_text())
+    assert manifest["job_id"] == job_id
+    assert manifest["instructor_name"] == "Marc Tremblay"
+
+
+def test_upload_ultimum_files_both_cameras_into_one_jump_folder(
+    client: TestClient, tmp_path: Path
+) -> None:
+    job_id = _create(
+        client,
+        package="ultimum",
+        customer_name="Marie Dupont",
+        instructor_name="Marc Tremblay",
+        jump_date="2026-06-02",
+    )
+    for role, payload in (("instructor", b"selfie"), ("external", b"cameraman")):
+        resp = client.post(
+            f"/jobs/{job_id}/upload",
+            files=[("files", ("GH010001.MP4", payload, "video/mp4"))],
+            data={"camera_role": role},
+        )
+        assert resp.status_code == 200
+
+    raw = tmp_path / "raw-storage" / "2026-06-02" / "Marc-Tremblay" / "Marie-Dupont" / "raw"
+    # Both angles under one jump, each in its own role folder (colliding GoPro names).
+    assert (raw / "instructor" / "GH010001.MP4").read_bytes() == b"selfie"
+    assert (raw / "external" / "GH010001.MP4").read_bytes() == b"cameraman"
 
 
 def test_upload_ultimum_requires_camera_role(client: TestClient, queue: FakeQueue) -> None:
@@ -434,7 +487,11 @@ def test_upload_ultimum_waits_for_both_cameras_then_enqueues(
     body = first.json()
     assert body["camera_role"] == "instructor"
     assert "waiting" in body["detail"]
-    assert queue.calls == []  # not enqueued yet — only one camera present
+    # Not processed yet — only one camera present. But the stranded-job watchdog MUST be
+    # armed here: without it a second camera that never uploads leaves the job in
+    # `queued` forever (the upload path used to skip this, unlike the S3-ingest path).
+    assert queue.kinds() == ["ultimum_watchdog"]
+    assert queue.calls[0][1][0] == job_id
 
     # Clips land in raw/instructor/ (not the flat raw/), avoiding GoPro name collisions.
     raw = job_dir(job_id, client.jobs_root) / "raw"
@@ -448,7 +505,8 @@ def test_upload_ultimum_waits_for_both_cameras_then_enqueues(
     assert second.status_code == 200
     assert second.json()["camera_role"] == "external"
     assert (raw / "external" / "GH010001.MP4").read_bytes() == b"external"
-    assert queue.kinds() == ["selfie"]  # both cameras in → scene pipeline enqueued once
+    # Both cameras in → scene pipeline enqueued once; no second watchdog armed.
+    assert queue.kinds() == ["ultimum_watchdog", "selfie"]
 
 
 def test_upload_ultimum_rejects_unknown_camera_role(

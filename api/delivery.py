@@ -127,6 +127,99 @@ def upload_and_link(
     return links
 
 
+def _upload_photos_individually(
+    client: Any, photos_dir: Path, job_id: str, settings: Settings, ttl: int
+) -> list[str]:
+    """Upload each still to ``deliveries/{job}/photos/`` and return presigned URLs.
+
+    The gallery's photo grid needs a URL per image (the zip is only for "download
+    all"). Ordered by filename so the grid is stable.
+    """
+    urls: list[str] = []
+    for p in sorted(photos_dir.glob("*.jpg")):
+        key = f"{DELIVERY_KEY_PREFIX}/{job_id}/photos/{p.name}"
+        client.upload_file(str(p), settings.s3_bucket, key, ExtraArgs={"ContentType": "image/jpeg"})
+        urls.append(
+            client.generate_presigned_url(
+                "get_object", Params={"Bucket": settings.s3_bucket, "Key": key}, ExpiresIn=ttl
+            )
+        )
+    return urls
+
+
+def _upload_gallery_html(
+    client: Any, html_str: str, job_id: str, settings: Settings, ttl: int
+) -> str:
+    """Put the gallery page as an S3 ``text/html`` object and presign it (the customer link)."""
+    key = f"{DELIVERY_KEY_PREFIX}/{job_id}/gallery.html"
+    client.put_object(
+        Bucket=settings.s3_bucket,
+        Key=key,
+        Body=html_str.encode("utf-8"),
+        ContentType="text/html; charset=utf-8",
+    )
+    return client.generate_presigned_url(
+        "get_object", Params={"Bucket": settings.s3_bucket, "Key": key}, ExpiresIn=ttl
+    )
+
+
+def send_gallery_email(
+    job: Job,
+    gallery_url: str,
+    settings: Settings,
+    *,
+    smtp_factory: Callable[[], smtplib.SMTP] | None = None,
+) -> bool:
+    """Email the customer ONE gallery link (all videos + photos on one page).
+
+    Same skip-not-fail contract as :func:`send_delivery_email`: returns False (with a
+    warning) when there's no ``customer_email`` / SMTP, so the caller can fall back to
+    the SkydiveOS hand-off.
+    """
+    if not job.customer_email:
+        logger.warning("job %s has no customer_email — not emailing", job.job_id)
+        return False
+    if not settings.smtp_host:
+        logger.warning("SMTP_HOST not set — not emailing job %s", job.job_id)
+        return False
+    sender = settings.delivery_from_email or settings.smtp_user
+    if not sender:
+        logger.warning("no DELIVERY_FROM_EMAIL / SMTP_USER — not emailing job %s", job.job_id)
+        return False
+
+    expiry_days = int(settings.delivery_link_ttl_days)
+    lines = [
+        f"Hi {job.customer_name},",
+        "",
+        "Your skydive video is ready! 🪂",
+        "",
+        "View and download all your videos and photos on one page here:",
+        "",
+        f"  {gallery_url}",
+        "",
+        f"The link is valid for {expiry_days} days — save your files soon.",
+        "",
+        "Blue skies!",
+    ]
+    msg = EmailMessage()
+    msg["Subject"] = f"Your skydive video is ready, {job.customer_name}!"
+    msg["From"] = sender
+    msg["To"] = job.customer_email
+    msg.set_content("\n".join(lines))
+
+    factory = smtp_factory or (
+        lambda: smtplib.SMTP(settings.smtp_host or "", settings.smtp_port, timeout=30)
+    )
+    with factory() as smtp:
+        if settings.smtp_starttls:
+            smtp.starttls()
+        if settings.smtp_user and settings.smtp_password:
+            smtp.login(settings.smtp_user, settings.smtp_password)
+        smtp.send_message(msg)
+    logger.info("job %s: gallery email sent to %s", job.job_id, job.customer_email)
+    return True
+
+
 def send_delivery_email(
     job: Job,
     links: dict[str, str],
@@ -197,14 +290,59 @@ def deliver_to_customer(
     configured to forward them) — a job must never read ``delivered`` when the
     customer has no way to get the files.
     """
-    files = collect_deliverables(job, store)
+    from . import gallery
+
+    files = collect_deliverables(job, store)  # videos + photos.zip (photos dir zipped)
     if not files:
         raise RuntimeError(f"job {job.job_id} has no rendered deliverables to deliver")
-    links = upload_and_link(files, job_id=job.job_id, settings=settings, s3_client=s3_client)
-    emailed = send_delivery_email(job, links, settings, smtp_factory=smtp_factory)
+    if not settings.s3_bucket:
+        raise RuntimeError(
+            "delivery needs S3_BUCKET (or AWS_S3_BUCKET_NAME) to host the customer gallery"
+        )
+    client = s3_client if s3_client is not None else _default_s3_client(settings)
+    ttl = int(settings.delivery_link_ttl_days * 86400)
+
+    # Videos → a presigned URL each (the gallery's inline players).
+    video_files = {n: p for n, p in files.items() if n != "photos"}
+    video_links = upload_and_link(
+        video_files, job_id=job.job_id, settings=settings, s3_client=client
+    )
+
+    # Photos → individual URLs for the grid, plus the zip for "download all".
+    photo_urls: list[str] = []
+    zip_url: str | None = None
+    if "photos" in files:
+        zip_url = upload_and_link(
+            {"photos": files["photos"]}, job_id=job.job_id, settings=settings, s3_client=client
+        )["photos"]
+        photos_dir = (
+            Path(job.outputs["photos"])
+            if job.outputs and job.outputs.get("photos")
+            else None
+        )
+        if photos_dir and photos_dir.is_dir():
+            photo_urls = _upload_photos_individually(client, photos_dir, job.job_id, settings, ttl)
+
+    # Build the one-page gallery and host it; its link is what the customer gets.
+    page = gallery.render_gallery_html(
+        brand=settings.delivery_brand_name,
+        customer_name=job.customer_name,
+        jump_date=job.jump_date,
+        location=settings.delivery_location,
+        videos=[(n, video_links[n]) for n in video_files],
+        photos=photo_urls,
+        download_all_url=zip_url,
+    )
+    gallery_url = _upload_gallery_html(client, page, job.job_id, settings, ttl)
+
+    emailed = send_gallery_email(job, gallery_url, settings, smtp_factory=smtp_factory)
     if not emailed and not settings.skydiveos_api_base:
         raise RuntimeError(
-            f"job {job.job_id}: links generated but unreachable — no customer_email/SMTP "
-            "and no SKYDIVEOS_API_BASE to forward them to"
+            f"job {job.job_id}: gallery generated but unreachable — no customer_email/SMTP "
+            "and no SKYDIVEOS_API_BASE to forward it to"
         )
+    # gallery is the customer link; individual links ride along for SkydiveOS.
+    links = {"gallery": gallery_url, **video_links}
+    if zip_url:
+        links["photos"] = zip_url
     return links

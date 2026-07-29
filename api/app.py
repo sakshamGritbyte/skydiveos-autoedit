@@ -48,6 +48,7 @@ from fastapi.responses import FileResponse
 from edl.schema import EditDecisionList
 from ingest.registry import CameraRegistry
 
+from . import archive
 from .auth import AdminDep, PrincipalDep
 from .config import Settings, get_settings
 from .jobs import MUSIC_SUFFIXES, REVIEWABLE, Job, JobStatus, JobStore
@@ -136,6 +137,7 @@ def get_registry(settings: Annotated[Settings, Depends(get_settings)]) -> Camera
 
 StoreDep = Annotated[JobStore, Depends(get_store)]
 QueueDep = Annotated[JobQueue, Depends(get_queue)]
+SettingsDep = Annotated[Settings, Depends(get_settings)]
 RegistryDep = Annotated[CameraRegistry, Depends(get_registry)]
 JobId = Annotated[str, PathParam(description="Job identifier returned by POST /jobs")]
 
@@ -233,10 +235,29 @@ def _music_slots(store: JobStore, job: Job) -> MusicSlotsResponse:
     return MusicSlotsResponse(job_id=job.job_id, package=job.package, slots=slots)
 
 
+def _booking_sidecar(job: Job) -> dict[str, object]:
+    """The booking metadata staged beside a job's footage for the pipeline to read back.
+
+    One definition shared by both upload paths so the two never drift (the selfie
+    renderer burns ``customer_name`` / ``jump_date`` onto the intro card from here, and
+    :func:`api.selfie._ensure_default_music` persists its random pick back into it).
+    """
+    return {
+        "booking_id": job.booking_id,
+        "customer_name": job.customer_name,
+        "customer_email": job.customer_email,
+        "instructor_name": job.instructor_name,
+        "jump_date": job.jump_date,
+        "package": job.package.value,
+        "music": job.music,
+    }
+
+
 async def _upload_ultimum(
     job: Job,
     store: JobStore,
     queue: JobQueue,
+    settings: Settings,
     uploaded: list[UploadFile],
     camera_role: str | None,
 ) -> UploadResponse:
@@ -266,17 +287,11 @@ async def _upload_ultimum(
             while chunk := await f.read(_UPLOAD_CHUNK):
                 out.write(chunk)
 
-    store.write_booking(
-        job.job_id,
-        {
-            "booking_id": job.booking_id,
-            "customer_name": job.customer_name,
-            "customer_email": job.customer_email,
-            "jump_date": job.jump_date,
-            "package": job.package.value,
-            "music": job.music,
-        },
-    )
+    store.write_booking(job.job_id, _booking_sidecar(job))
+    # File this camera's masters under the jump in the browsable archive right away, so
+    # the footage is safe there even if the second camera never shows up (or the edit
+    # later fails). Idempotent — the other camera's upload adds to the same folder.
+    archive.archive_raw_footage(job, store, settings)
 
     n = len(uploaded)
     if store.camera_roles_present(job.job_id, CAMERA_ROLES):
@@ -285,6 +300,15 @@ async def _upload_ultimum(
         detail = f"received {n} files for {camera_role}; both cameras present, processing enqueued"
     else:
         missing = [r for r in CAMERA_ROLES if r != camera_role]
+        # Only one camera so far. Arm the same watchdog the S3-ingest path arms, so a
+        # second camera that never uploads fails the job with an actionable error rather
+        # than stranding it in `queued` forever — an upload-created job must not be
+        # weaker than a discovery-created one. Skipped under eager mode (countdown
+        # scheduling is a no-op there, and tests drive both uploads themselves).
+        if not settings.task_always_eager:
+            queue.arm_ultimum_watchdog(
+                job.job_id, settings.ultimum_second_camera_timeout_s
+            )
         detail = (
             f"received {n} files for {camera_role}; "
             f"waiting for the other camera ({', '.join(missing)})"
@@ -320,6 +344,21 @@ def _build_scanner(settings: Settings) -> CameraScanner:
 _DEFAULT_SAMPLE_MP4 = "sample-data/discovery_sample.mp4"
 
 
+def _cleanup_kwargs(settings: Settings) -> dict[str, Any]:
+    """Card-cleanup arguments for :func:`ingest.pull.pull_camera`.
+
+    Unattended ingest has to free the SD card or it fills within about a week and the
+    camera silently stops recording mid-day. Cleanup only ever removes footage S3 has
+    already confirmed (:mod:`ingest.retention`) and is off unless
+    ``DELETE_AFTER_TRANSFER`` is set, because it destroys the card's copy.
+    """
+    return {
+        "cleanup": settings.delete_after_transfer,
+        "cleanup_min_age_s": settings.delete_after_transfer_min_age_h * 3600.0,
+        "cleanup_dry_run": settings.delete_after_transfer_dry_run,
+    }
+
+
 def _build_pull(settings: Settings) -> Callable[..., Awaitable[Any]] | None:
     """The pull coroutine for the configured mode.
 
@@ -335,7 +374,12 @@ def _build_pull(settings: Settings) -> Callable[..., Awaitable[Any]] | None:
             from ingest.camera import WiredGoProCamera
             from ingest.pull import pull_camera
 
-            return await pull_camera(camera_id, camera=WiredGoProCamera(camera_id), emitter=emitter)
+            return await pull_camera(
+                camera_id,
+                camera=WiredGoProCamera(camera_id),
+                emitter=emitter,
+                **_cleanup_kwargs(settings),
+            )
 
         return _usb_pull
 
@@ -364,7 +408,9 @@ def _build_pull(settings: Settings) -> Callable[..., Awaitable[Any]] | None:
             filename=f"GX0100{camera_id[-2:].zfill(2)}.MP4",
             count=_simulated_clip_count(settings, camera_id),
         )
-        return await pull_camera(camera_id, camera=cam, emitter=emitter)
+        return await pull_camera(
+            camera_id, camera=cam, emitter=emitter, **_cleanup_kwargs(settings)
+        )
 
     return _simulated_pull
 
@@ -412,7 +458,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     service = None
     if settings.enable_auto_discovery:
         try:
-            from ingest.discovery import CameraDiscoveryService, s3_notify_uploader
+            from ingest.discovery import (
+                CameraDiscoveryService,
+                matcher_role_resolver,
+                s3_notify_uploader,
+            )
 
             if not settings.skydiveos_api_base:
                 raise RuntimeError(
@@ -425,6 +475,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     "then SkydiveOS is notified with the object key."
                 )
             registry = CameraRegistry(settings.mongo_url, db_name=settings.mongo_db)
+            # When the shared DB is reachable, the pulled clip's role is resolved from
+            # the load (which slot its owner filled on THAT jump) — authoritative over
+            # the registry's static role, so a staff member who is an instructor on one
+            # jump and a cameraman on the next routes correctly either way. No DB → the
+            # resolver stays None and the static registry role is used, as before.
+            matcher = None
+            if settings.mongo_url:
+                from ingest.match import FootageMatcher
+
+                matcher = FootageMatcher(
+                    settings.mongo_url,
+                    db_name=settings.mongo_db,
+                    clock_tz=settings.camera_clock_tz,
+                )
             if settings.camera_scanner == "static":
                 for camera_id in settings.discovery_fake_cameras:
                     registry.upsert_paired(camera_id, name="simulated")
@@ -446,9 +510,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 ),
                 pull=_build_pull(settings),
                 interval=settings.discovery_interval,
+                role_resolver=(
+                    matcher_role_resolver(matcher, clock_tz=settings.camera_clock_tz)
+                    if matcher is not None
+                    else None
+                ),
             )
             await service.start()
             app.state.discovery = service
+            app.state.footage_matcher = matcher
         except Exception:
             # A discovery misconfig must not take the whole API down — log and serve.
             logger.exception("camera auto-discovery failed to start; API running without it")
@@ -465,6 +535,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         if service is not None:
             await service.stop()
+        matcher = getattr(app.state, "footage_matcher", None)
+        if matcher is not None:
+            try:
+                matcher.close()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
 
 
 def create_app() -> FastAPI:
@@ -552,6 +628,7 @@ def create_app() -> FastAPI:
         job_id: JobId,
         store: StoreDep,
         queue: QueueDep,
+        settings: SettingsDep,
         files: Annotated[
             list[UploadFile] | None,
             File(description="One or more raw GoPro MP4s for this jump"),
@@ -613,7 +690,9 @@ def create_app() -> FastAPI:
                 )
 
             if job.package.is_ultimum:
-                return await _upload_ultimum(job, store, queue, uploaded, camera_role)
+                return await _upload_ultimum(
+                    job, store, queue, settings, uploaded, camera_role
+                )
 
             raw_dir = store.raw_dir(job_id)
             raw_dir.mkdir(parents=True, exist_ok=True)
@@ -625,26 +704,20 @@ def create_app() -> FastAPI:
                     while chunk := await f.read(_UPLOAD_CHUNK):
                         out.write(chunk)
 
-            store.write_booking(
-                job_id,
-                {
-                    "booking_id": job.booking_id,
-                    "customer_name": job.customer_name,
-                    "customer_email": job.customer_email,
-                    "jump_date": job.jump_date,
-                    "package": job.package.value,
-                    "music": job.music,
-                },
-            )
+            store.write_booking(job_id, _booking_sidecar(job))
 
             # The non-selfie pipelines still cut from a single ``source_path``; point
             # them at the first uploaded MP4 (never an LRV proxy) so they keep working
             # unchanged. Staged LRVs sit beside their MP4 for analysis to discover.
             first_mp4 = next(f for f in uploaded if _is_mp4(f))
             first_path = str(raw_dir / Path(first_mp4.filename or "clip.mp4").name)
-            store.update(
+            job = store.update(
                 job_id, source_path=first_path, status=JobStatus.queued, error=None
             )
+
+            # File the masters under the jump in the browsable archive before the edit
+            # starts, so raw footage is preserved even if processing later fails.
+            archive.archive_raw_footage(job, store, settings)
 
             if job.package.uses_scene_pipeline:
                 queue.enqueue_selfie_processing(job_id)
@@ -690,17 +763,7 @@ def create_app() -> FastAPI:
                             f"{list(CAMERA_ROLES)} for an S3 ingest (got {camera_role!r})"
                         ),
                     )
-            store.write_booking(
-                job_id,
-                {
-                    "booking_id": job.booking_id,
-                    "customer_name": job.customer_name,
-                    "customer_email": job.customer_email,
-                    "jump_date": job.jump_date,
-                    "package": job.package.value,
-                    "music": job.music,
-                },
-            )
+            store.write_booking(job_id, _booking_sidecar(job))
             store.update(job_id, status=JobStatus.queued, error=None)
             queue.enqueue_s3_ingest(job_id, s3_key, camera_role)
             detail = f"S3 ingest of {s3_key} enqueued"

@@ -42,7 +42,14 @@ from .scanner import (
     StaticCameraScanner,
     UsbCameraScanner,
 )
-from .storage import destination, is_complete, jump_dir, storage_root, write_manifest
+from .storage import (
+    camera_staging_root,
+    destination,
+    is_complete,
+    jump_dir,
+    storage_root,
+    write_manifest,
+)
 
 if TYPE_CHECKING:
     from .pull import PulledJump, pull_camera
@@ -75,6 +82,7 @@ __all__ = [
     "build_event",
     "default_emitter",
     "storage_root",
+    "camera_staging_root",
     "jump_dir",
     "destination",
     "is_complete",

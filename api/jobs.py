@@ -66,7 +66,8 @@ class Package(StrEnum):
     * ``external`` — same as selfie (the three videos *and* the photos); the difference
       is operational (a camera-flyer shoots it), the pipeline is identical.
     * ``video_only`` — the three videos, no photos.
-    * ``photo_only`` — only the photos (90–100 best moments), no videos.
+    * ``photo_only`` — only the photos, no videos: the extractor aims for
+      ``PHOTO_ONLY_TARGET`` (140) strong stills, vs ~50 for selfie/external.
     * ``ultimum`` — the two-camera "Ultimate" product: a combo full video + highlights
       drawing on *both* the instructor selfie cam and the external cameraman, plus a
       freefall cut from each camera alone (external-only, and the instructor-only
@@ -175,6 +176,12 @@ class Job(BaseModel):
     #: pulling camera's registry entry for auto-discovered jumps; drives access
     #: scoping (an instructor sees only their own jobs; admins see all).
     instructor_id: str | None = None
+    #: The instructor's *display* name, as the dropzone writes it on the manifest
+    #: ("Marc Tremblay"). Supplied by SkydiveOS on ``POST /jobs`` (it owns the staff
+    #: records; we only ever store what it tells us). Used to name the jump's folder in
+    #: the archive (:mod:`api.archive`), which falls back to ``instructor_id`` when this
+    #: is absent — so an omitted name degrades the folder name, nothing else.
+    instructor_name: str | None = None
 
     # Annotations from the review gate.
     reject_reason: str | None = None

@@ -44,6 +44,7 @@ from typing import Any
 
 from .events import EventEmitter
 from .registry import CameraRegistry
+from .retention import record_uploaded
 from .scanner import CameraScanner
 
 logger = logging.getLogger(__name__)
@@ -65,10 +66,48 @@ S3_KEY_PREFIX = "raw"
 #: ``ingest.pull.pull_camera`` satisfies this; tests inject a fake.
 PullFn = Callable[..., Awaitable[Any]]
 #: Hands one pulled jump to SkydiveOS:
-#: ``(mp4_path, camera_id, instructor_id, camera_role) -> None``. ``camera_role`` is
-#: ``instructor``/``external`` for a two-camera (Ultimate) jump, else ``None``. The
+#: ``(mp4_path, camera_id, instructor_id, camera_role) -> s3_key | None``. ``camera_role``
+#: is ``instructor``/``external`` for a two-camera (Ultimate) jump, else ``None``. The
 #: default (:func:`s3_notify_uploader`) PUTs to S3 then notifies; tests inject a recorder.
-UploadFn = Callable[[str, str, str | None, str | None], None]
+#: Returning the object key is what lets the card be cleared later: it is the proof that
+#: S3 holds the footage, recorded via :func:`ingest.retention.record_uploaded` and
+#: required before the next pull may delete that file (returning ``None`` keeps it).
+UploadFn = Callable[[str, str, str | None, str | None], str | None]
+#: Resolves a pulled clip's *authoritative* camera role from the load:
+#: ``(camera_id, mp4_path) -> "instructor" | "external" | None``. ``None`` means "couldn't
+#: resolve — fall back to the registry's static role hint". :func:`matcher_role_resolver`
+#: adapts an :class:`ingest.match.FootageMatcher` to this shape.
+RoleResolver = Callable[[str, str], str | None]
+
+
+def matcher_role_resolver(matcher: Any, *, clock_tz: str | None = None) -> RoleResolver:
+    """Adapt an :class:`~ingest.match.FootageMatcher` into a discovery role resolver.
+
+    The returned callable probes the clip's capture time and asks the matcher which
+    load-jumper slot the camera's owner filled *on that jump* — the authoritative role,
+    correct even when one staff member is the tandem instructor on one jump and the
+    cameraman on the next (the same physical GoPro, so the registry's static role can't
+    express it). Returns ``None`` — never raises — when the capture time is unreadable or
+    the match is unavailable / unknown / ambiguous, so the caller falls back to the
+    registry's static hint rather than blocking or guessing a hand-off.
+    """
+    from .match import FootageMatchError
+
+    def _resolve(camera_id: str, mp4_path: str) -> str | None:
+        captured_at = _probe_capture_time(mp4_path, clock_tz=clock_tz)
+        if captured_at is None:
+            return None
+        try:
+            return matcher.resolve(camera_id, captured_at).role
+        except FootageMatchError as e:
+            logger.warning(
+                "load-based role resolution failed for camera %s (%r); falling back to "
+                "the registry's static role hint",
+                camera_id, e,
+            )
+            return None
+
+    return _resolve
 
 
 def _probe_capture_time(mp4_path: str, *, clock_tz: str | None = None) -> str | None:
@@ -173,7 +212,7 @@ def s3_notify_uploader(
         camera_id: str,
         instructor_id: str | None,
         camera_role: str | None = None,
-    ) -> None:
+    ) -> str:
         import httpx
 
         key = f"{key_prefix}/{camera_id}/{Path(mp4_path).name}"
@@ -189,6 +228,8 @@ def s3_notify_uploader(
             payload["captured_at"] = captured_at
         resp = httpx.post(f"{skydiveos_url.rstrip('/')}{path}", json=payload, timeout=timeout)
         resp.raise_for_status()
+        # Both S3 and SkydiveOS accepted it — the key is now proof the footage is safe.
+        return key
 
     return _upload
 
@@ -234,10 +275,12 @@ class CameraDiscoveryService:
         install_signal_handlers: bool = False,
         handoff_retry_delay: float = 10.0,
         handoff_max_attempts: int = 10,
+        role_resolver: RoleResolver | None = None,
     ) -> None:
         self._scanner = scanner
         self._registry = registry
         self._upload = upload
+        self._role_resolver = role_resolver
         self._pull = pull if pull is not None else _default_pull
         self._interval = interval
         self._install_signal_handlers = install_signal_handlers
@@ -387,17 +430,38 @@ class CameraDiscoveryService:
         # the role (instructor selfie vs external cameraman) routes the two angles of an
         # Ultimate jump under the right raw/<role>/ on the SkydiveOS side.
         instructor_id = self._registry.instructor_for(camera_id)
-        camera_role = self._registry.role_for(camera_id)
+        camera_role = self._registry.role_for(camera_id)  # static registry hint
+
+        # The AUTHORITATIVE role is which slot the camera's owner filled on THIS jump
+        # (from the load), not the camera's static role — one staff member can be the
+        # instructor on one jump and the cameraman on the next, on the same GoPro. When a
+        # resolver is wired and resolves cleanly, it wins; otherwise we keep the hint.
+        if self._role_resolver is not None:
+            resolved = self._role_resolver(camera_id, mp4)
+            if resolved is not None:
+                if resolved != camera_role:
+                    logger.info(
+                        "camera %s: load-derived role %s overrides registry hint %s",
+                        camera_id, resolved, camera_role,
+                    )
+                camera_role = resolved
 
         logger.info(
             "uploading %s to S3 + notifying SkydiveOS (camera %s, instructor %s, role %s) ...",
             mp4, camera_id, instructor_id, camera_role,
         )
-        self._upload(mp4, camera_id, instructor_id, camera_role)
+        s3_key = self._upload(mp4, camera_id, instructor_id, camera_role)
         logger.info(
             "handed %s off to SkydiveOS (camera %s, instructor %s, role %s)",
             mp4, camera_id, instructor_id, camera_role,
         )
+        # Now — and only now — is this file safe to remove from the camera: S3 holds it.
+        # Recording that fact is what authorises the NEXT pull to free the card
+        # (ingest.retention); until then the file stays on the card.
+        if s3_key:
+            # jump_dir is <root>/_camera-staging/<camera_id>/<date>; the ledger belongs
+            # one level up, per camera, so it outlives any single day's folder.
+            record_uploaded(Path(event["jump_dir"]).parent, Path(mp4).name, s3_key)
 
     # --- helpers ----------------------------------------------------------- #
 

@@ -187,6 +187,21 @@ def _stream_durations(path: Path) -> dict[str, float]:
     return durations
 
 
+def _masters(directory: Path) -> list[Path]:
+    """The MP4 masters in a directory, case-insensitively.
+
+    Linux is case-sensitive where macOS is not, so a ``*.MP4`` glob silently finds
+    nothing on the EC2 box for footage saved as ``.mp4`` — reporting "no footage" for a
+    jobs volume that is full of it. Matches how the pipeline itself tests extensions
+    (``JobStore.camera_roles_present``).
+    """
+    if not directory.is_dir():
+        return []
+    return sorted(
+        p for p in directory.glob("*") if p.is_file() and p.suffix.lower() == ".mp4"
+    )
+
+
 def _find_default_footage() -> tuple[list[Path], list[Path], list[Path]]:
     """Reuse real masters from earlier jobs: (single-cam, instructor-cam, external-cam)."""
     jobs_root = _jobs_root()
@@ -194,11 +209,11 @@ def _find_default_footage() -> tuple[list[Path], list[Path], list[Path]]:
     instructor: list[Path] = []
     external: list[Path] = []
     for raw in sorted(jobs_root.glob("*/raw")):
-        flat = sorted(p for p in raw.glob("*.MP4") if p.is_file())
+        flat = _masters(raw)
         if flat and len(flat) > len(single):
             single = flat
-        inst = sorted(p for p in (raw / "instructor").glob("*.MP4") if p.is_file())
-        ext = sorted(p for p in (raw / "external").glob("*.MP4") if p.is_file())
+        inst = _masters(raw / "instructor")
+        ext = _masters(raw / "external")
         if inst and ext and (len(inst) + len(ext)) > (len(instructor) + len(external)):
             instructor, external = inst, ext
     if not single and instructor:
@@ -644,9 +659,9 @@ def _audit_existing(client: Any, api: str, job_id: str) -> PackageRun:
     cameras: list[tuple[str | None, list[Path]]] = []
     if package == "ultimum":
         for role in ("instructor", "external"):
-            cameras.append((role, sorted((jd / "raw" / role).glob("*.MP4"))))
+            cameras.append((role, _masters(jd / "raw" / role)))
     else:
-        cameras.append((None, sorted((jd / "raw").glob("*.MP4"))))
+        cameras.append((None, _masters(jd / "raw")))
 
     _audit_all(run, client, api, package, job, cameras,
                want_email=bool(job.get("customer_email")))

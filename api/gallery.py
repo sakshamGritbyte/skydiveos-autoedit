@@ -162,7 +162,7 @@ def render_gallery_html(
         </div>""")
 
     photo_tiles = "".join(
-        f'<a class="ptile" href="{e(u)}" target="_blank" rel="noopener">'
+        f'<a class="ptile" href="{e(u)}" target="_blank" rel="noopener noreferrer">'
         f'<img loading="lazy" src="{e(u)}" alt="photo"></a>'
         for u in photos
     )
@@ -195,7 +195,7 @@ def render_gallery_html(
     if locked:
         cta_line = f"Unlock full video — {e(price_display)}"
         cta_action = (
-            f'<a class="ctabtn" href="{e(unlock_url)}">🔒 {cta_line}</a>'
+            f'<a class="ctabtn" rel="noreferrer" href="{e(unlock_url)}">🔒 {cta_line}</a>'
             if unlock_url
             else f'<span class="ctabtn">{cta_line} · ask at the desk</span>'
         )
@@ -224,7 +224,7 @@ def render_gallery_html(
                 f'<div class="uprice">{e(t.price)}</div>'
             )
             tiles.append(
-                f'<a class="utile" href="{e(t.url)}">{body}</a>'
+                f'<a class="utile" rel="noreferrer" href="{e(t.url)}">{body}</a>'
                 if t.url else f'<div class="utile">{body}</div>'
             )
         upsell_section = (
@@ -279,9 +279,17 @@ def render_gallery_html(
             'class="photos" id="tab-photos"', 'class="photos tab-panel" id="tab-photos"'
         )
 
+    # `referrer: no-referrer` is load-bearing, not hygiene: this page's URL *is* the
+    # customer's credential, so it must never travel in a Referer header. Without it,
+    # following the unlock CTA or an upsell tile hands the short code to the checkout
+    # host — harmless while that's SkydiveOS's own domain, a credential leak the moment
+    # CHECKOUT_URL_TEMPLATE points at a payment provider. The outbound anchors carry
+    # rel="noreferrer" too, so the page is covered even if the meta tag is ever dropped.
+    # (Kept as a source comment: an HTML comment would ship to the customer.)
     return f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
 <title>{title} — {brand_e}</title>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}

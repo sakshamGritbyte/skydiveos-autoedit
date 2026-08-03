@@ -174,6 +174,12 @@ class Settings:
     #: :mod:`api.upsell`). Shown on both the unlocked and the locked page — the row is
     #: entitlement-independent. Unset → the design's three defaults; ``off`` → no row.
     upsell_tiles: tuple[UpsellTile, ...] = DEFAULT_TILES
+    #: Requests per minute per caller IP allowed on the PUBLIC customer-gallery routes
+    #: (``GALLERY_RATE_LIMIT_PER_MIN``; ``0`` disables). Everything else needs the
+    #: service token, so ``/j/{code}`` is the only surface a stranger can reach — and a
+    #: locked page polls ``/j/{code}/state`` every 6 s, so the ceiling has to clear
+    #: real traffic comfortably. Not a security control (the 65-bit code is); a cost cap.
+    gallery_rate_limit_per_min: int = 300
     #: Shared secret every caller must present as ``Authorization: Bearer`` on every
     #: route except the customer gallery ``/j/{code}`` (``AUTO_EDIT_API_KEY`` — the
     #: same value SkydiveOS sends from its ``AI_BACKEND_API_KEY``/``AUTO_EDIT_API_KEY``).
@@ -265,4 +271,5 @@ def get_settings() -> Settings:
             or None
         ),
         archive_hashes=_flag("ARCHIVE_HASHES", default=True),
+        gallery_rate_limit_per_min=int(os.environ.get("GALLERY_RATE_LIMIT_PER_MIN") or 300),
     )

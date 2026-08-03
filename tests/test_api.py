@@ -1193,6 +1193,127 @@ def test_path_a_creation_never_needs_a_public_base_url(client: TestClient) -> No
 
 
 # --------------------------------------------------------------------------- #
+# Gap 2 — the page URL is the credential, so it must not travel in a Referer.
+# Gap 1 — the public gallery routes are metered (they are the only ungated surface,
+# and the locked page polls /state).
+# --------------------------------------------------------------------------- #
+
+
+def test_gallery_page_forbids_referrer_leakage(
+    tmp_path: Path, queue: FakeQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Following the unlock CTA must not hand the short code to the checkout host.
+
+    Configured with a checkout URL on purpose: that's when the CTA and the upsell tiles
+    become real outbound anchors, and so the moment the leak could happen.
+    """
+    monkeypatch.setenv("CHECKOUT_URL_TEMPLATE", "https://pay.example/c?job={job_id}&item={item}")
+    get_settings.cache_clear()
+    try:
+        app = create_app()
+        store = JobStore(tmp_path)
+        app.dependency_overrides[get_store] = lambda: store
+        app.dependency_overrides[get_queue] = lambda: queue
+        with TestClient(app) as c:
+            c.jobs_root = tmp_path
+            job_id = _create(c, entitlement="preview_only")
+            _rendered(c, job_id, locked=True)
+            page = c.get(f"/j/{_token(c, job_id)}").text
+
+            assert 'href="https://pay.example/c' in page  # the anchors are real
+            assert '<meta name="referrer" content="no-referrer">' in page
+            # Per-anchor too, so the page holds if the meta tag is ever dropped.
+            assert 'class="ctabtn" rel="noreferrer"' in page
+            assert 'class="utile" rel="noreferrer"' in page
+    finally:
+        get_settings.cache_clear()
+
+
+def test_public_gallery_routes_are_rate_limited(
+    tmp_path: Path, queue: FakeQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GALLERY_RATE_LIMIT_PER_MIN", "5")
+    get_settings.cache_clear()
+    try:
+        app = create_app()
+        store = JobStore(tmp_path)
+        app.dependency_overrides[get_store] = lambda: store
+        app.dependency_overrides[get_queue] = lambda: queue
+        with TestClient(app) as c:
+            c.jobs_root = tmp_path
+            job_id = _create(c)
+            _rendered(c, job_id, locked=False)
+            token = _token(c, job_id)
+
+            codes = [c.get(f"/j/{token}").status_code for _ in range(7)]
+            assert codes[:5] == [200] * 5
+            assert codes[5:] == [429, 429]
+
+            # A truthful Retry-After, and no code echoed back in the body.
+            blocked = c.get(f"/j/{token}")
+            assert blocked.status_code == 429
+            assert 0 < int(blocked.headers["retry-after"]) <= 61
+            assert token not in blocked.text
+
+            # Guessing unknown codes is metered on the same budget — that's the point.
+            assert c.get("/j/deadbeef123").status_code == 429
+    finally:
+        get_settings.cache_clear()
+
+
+def test_rate_limit_is_per_caller_and_skips_the_authed_surface(
+    tmp_path: Path, queue: FakeQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GALLERY_RATE_LIMIT_PER_MIN", "3")
+    get_settings.cache_clear()
+    try:
+        app = create_app()
+        store = JobStore(tmp_path)
+        app.dependency_overrides[get_store] = lambda: store
+        app.dependency_overrides[get_queue] = lambda: queue
+        with TestClient(app) as c:
+            c.jobs_root = tmp_path
+            job_id = _create(c)
+            _rendered(c, job_id, locked=False)
+            token = _token(c, job_id)
+
+            # Behind a proxy every request shares one source address, so the real
+            # client comes from X-Forwarded-For — else one scanner throttles everyone.
+            scanner = {"X-Forwarded-For": "203.0.113.9"}
+            customer = {"X-Forwarded-For": "198.51.100.4"}
+            for _ in range(4):
+                c.get(f"/j/{token}", headers=scanner)
+            assert c.get(f"/j/{token}", headers=scanner).status_code == 429
+            # A different customer is unaffected.
+            assert c.get(f"/j/{token}", headers=customer).status_code == 200
+
+            # The token-gated surface isn't metered here (the gate already refuses it).
+            assert c.get(f"/jobs/{job_id}").status_code == 200
+    finally:
+        get_settings.cache_clear()
+
+
+def test_rate_limit_can_be_switched_off(
+    tmp_path: Path, queue: FakeQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GALLERY_RATE_LIMIT_PER_MIN", "0")
+    get_settings.cache_clear()
+    try:
+        app = create_app()
+        store = JobStore(tmp_path)
+        app.dependency_overrides[get_store] = lambda: store
+        app.dependency_overrides[get_queue] = lambda: queue
+        with TestClient(app) as c:
+            c.jobs_root = tmp_path
+            job_id = _create(c)
+            _rendered(c, job_id, locked=False)
+            token = _token(c, job_id)
+            assert all(c.get(f"/j/{token}").status_code == 200 for _ in range(20))
+    finally:
+        get_settings.cache_clear()
+
+
+# --------------------------------------------------------------------------- #
 # The service-token gate (risk probe / Fix #4).
 #
 # The hole this closes, verified against production on 2026-08-03: the service is

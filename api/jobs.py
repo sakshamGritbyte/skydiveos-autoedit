@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import secrets
 import string
+import threading
 import time
 from collections.abc import Callable
 from enum import StrEnum
@@ -170,6 +171,26 @@ class Entitlement(StrEnum):
 #: only auth.
 _GALLERY_CODE_ALPHABET = string.ascii_letters + string.digits
 _GALLERY_CODE_LENGTH = 11
+
+
+#: In-process ``{jobs root: {token: job_id}}`` index behind the PUBLIC gallery lookup,
+#: so an unknown code costs a dict lookup instead of a scan of every job on disk. A
+#: hint only — the job it names is always loaded and its token re-checked.
+_TOKEN_INDEX: dict[str, dict[str, str]] = {}
+#: When each root's index was last rebuilt, and how long that stands. Short enough that
+#: a token minted by another process (a second uvicorn worker) resolves well before a
+#: customer could click their link; long enough that a flood of bad codes scans once.
+_TOKEN_INDEX_BUILT: dict[str, float] = {}
+_TOKEN_INDEX_TTL_S = 5.0
+#: Serialises rebuilds so a burst of misses triggers one scan, not one per thread.
+_TOKEN_INDEX_LOCK = threading.Lock()
+
+
+def reset_token_index() -> None:
+    """Drop the gallery-token index (tests, and anything that rewrites jobs wholesale)."""
+    with _TOKEN_INDEX_LOCK:
+        _TOKEN_INDEX.clear()
+        _TOKEN_INDEX_BUILT.clear()
 
 
 def _new_gallery_token() -> str:
@@ -439,27 +460,87 @@ class JobStore:
             return job.gallery_token
         token = _new_gallery_token()
         self.update(job_id, gallery_token=token)
+        # Resolvable immediately in this process; other workers pick it up on their
+        # next index rebuild (well within the TTL of a customer receiving the link).
+        self._index_token(token, job_id)
         return token
 
     def find_by_gallery_token(self, token: str) -> Job | None:
         """Resolve a gallery short code to its job, or ``None``.
 
-        A directory scan like :meth:`list_jobs` — O(n) per lookup, fine at dropzone
-        volume. Empty/missing tokens never match (legacy jobs carry ``None``).
+        Backed by an in-process ``token → job_id`` index (:data:`_TOKEN_INDEX`), because
+        this is the one **public, unauthenticated** lookup in the service: the customer
+        gallery and its ``/state`` poll both land here. A plain directory scan meant
+        every *miss* globbed and JSON-parsed every ``job.json`` on disk, so an
+        unauthenticated caller could turn cheap requests into unbounded disk I/O.
+
+        The index is rebuilt at most once per :data:`_TOKEN_INDEX_TTL_S`, so a flood of
+        unknown codes costs one scan per window instead of one per request; a token
+        minted in *this* process is added immediately (see
+        :meth:`ensure_gallery_token`), and one minted by another process/worker becomes
+        resolvable within the TTL — which is irrelevant to a customer, since a render
+        takes minutes.
+
+        The index is only ever a *hint*: the job it points at is loaded and its token
+        re-checked, so a stale or poisoned entry yields ``None`` rather than the wrong
+        jump. Empty/missing tokens never match (legacy jobs carry ``None``).
         """
         if not token:
             return None
         root = jobs_root(self._root)
         if not root.is_dir():
             return None
-        for job_file in root.glob(f"*/{JOB_FILENAME}"):
-            try:
-                job = Job.model_validate_json(job_file.read_text())
-            except (OSError, ValueError):
-                continue
-            if job.gallery_token == token:
-                return job
-        return None
+        key = str(root.resolve())
+
+        job = self._resolve_indexed_token(key, token)
+        if job is not None:
+            return job
+        # Miss against a fresh index means the code really is unknown — answer from
+        # memory. Only a stale index earns a rescan.
+        if self._token_index_is_fresh(key):
+            return None
+        self._rebuild_token_index(key, root)
+        return self._resolve_indexed_token(key, token)
+
+    def _resolve_indexed_token(self, key: str, token: str) -> Job | None:
+        """Load the job the index maps ``token`` to, verifying the token still matches."""
+        job_id = _TOKEN_INDEX.get(key, {}).get(token)
+        if job_id is None:
+            return None
+        try:
+            job = self.load(job_id)
+        except (FileNotFoundError, ValueError):
+            _TOKEN_INDEX.get(key, {}).pop(token, None)
+            return None
+        if job.gallery_token != token:  # the index went stale; never guess
+            _TOKEN_INDEX.get(key, {}).pop(token, None)
+            return None
+        return job
+
+    def _token_index_is_fresh(self, key: str) -> bool:
+        built = _TOKEN_INDEX_BUILT.get(key)
+        return built is not None and (self._clock() - built) < _TOKEN_INDEX_TTL_S
+
+    def _rebuild_token_index(self, key: str, root: Path) -> None:
+        """One directory scan → the whole token map. Serialised so a burst scans once."""
+        with _TOKEN_INDEX_LOCK:
+            if self._token_index_is_fresh(key):  # another thread just did it
+                return
+            index: dict[str, str] = {}
+            for job_file in root.glob(f"*/{JOB_FILENAME}"):
+                try:
+                    job = Job.model_validate_json(job_file.read_text())
+                except (OSError, ValueError):
+                    continue
+                if job.gallery_token:
+                    index[job.gallery_token] = job.job_id
+            _TOKEN_INDEX[key] = index
+            _TOKEN_INDEX_BUILT[key] = self._clock()
+
+    def _index_token(self, token: str, job_id: str) -> None:
+        """Register a freshly minted token so its gallery resolves in this process at once."""
+        key = str(jobs_root(self._root).resolve())
+        _TOKEN_INDEX.setdefault(key, {})[token] = job_id
 
     def save(self, job: Job) -> Job:
         """Persist an updated job, refreshing ``updated_at``."""

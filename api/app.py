@@ -55,12 +55,13 @@ from edl.schema import EditDecisionList
 from ingest.registry import CameraRegistry
 
 from . import archive
-from .auth import AdminDep, PrincipalDep, service_token_allows
+from .auth import PUBLIC_PATH_PREFIX, AdminDep, PrincipalDep, service_token_allows
 from .config import Settings, get_settings
 from .gallery import render_gallery_html
 from .jobs import MUSIC_SUFFIXES, REVIEWABLE, Entitlement, Job, JobStatus, JobStore
 from .preview import preview_path
 from .queue import CeleryJobQueue, JobQueue
+from .ratelimit import FixedWindowLimiter, caller_key
 from .schemas import (
     AssignCameraRequest,
     CameraInfo,
@@ -626,6 +627,38 @@ def create_app() -> FastAPI:
         #     with a {job_id} (no-op when ENFORCE_INSTRUCTOR_AUTH is off).
         dependencies=[Depends(enforce_job_ownership)],
     )
+
+    # One limiter per app instance, so a test client's counters are its own.
+    gallery_limiter = FixedWindowLimiter(get_settings().gallery_rate_limit_per_min)
+    app.state.gallery_limiter = gallery_limiter
+
+    @app.middleware("http")
+    async def _gallery_rate_limit(
+        request: Request, call_next: Callable[[Request], Awaitable[Any]]
+    ) -> Any:
+        """Meter the PUBLIC gallery routes — the only surface with no service token.
+
+        Runs ahead of the token gate for ``/j/*`` because those requests are meant to
+        arrive without credentials; everything else is already refused by the gate, so
+        it isn't metered here. Not a security control (the 65-bit short code is that);
+        this caps the cost of someone trying codes anyway, and of a page left open for
+        a week polling ``/state``.
+        """
+        if request.url.path.startswith(PUBLIC_PATH_PREFIX):
+            key = caller_key(
+                request.client.host if request.client else None,
+                request.headers.get("x-forwarded-for"),
+            )
+            allowed, retry_after = gallery_limiter.allow(key)
+            if not allowed:
+                # No token echo, no code in the body — a 429 must not become an oracle.
+                logger.warning("gallery rate limit hit by %s on %s", key, request.url.path)
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "too many requests"},
+                    headers={"Retry-After": str(retry_after)},
+                )
+        return await call_next(request)
 
     @app.middleware("http")
     async def _service_token_gate(

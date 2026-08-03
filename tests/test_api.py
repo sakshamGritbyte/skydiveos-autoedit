@@ -978,6 +978,58 @@ def test_job_response_carries_the_derived_media_state(client: TestClient) -> Non
     assert body["media_state"] == "UNLOCKED" and body["status"] == "ready"
 
 
+def test_gallery_state_endpoint_reports_only_the_lock(client: TestClient) -> None:
+    """C-4: what the locked page polls to flip itself. One boolean, no PII."""
+    job_id = _create(client, entitlement="preview_only", customer_name="Sophie Lavoie")
+    _rendered(client, job_id, locked=True)
+    token = _token(client, job_id)
+
+    resp = client.get(f"/j/{token}/state")
+    assert resp.status_code == 200
+    assert resp.json() == {"locked": True}
+    assert "Sophie" not in resp.text and token not in resp.text
+
+    client.post(f"/jobs/{job_id}/unlock", json=_PAYMENT_BODY)
+    assert client.get(f"/j/{token}/state").json() == {"locked": False}
+
+
+def test_gallery_state_needs_no_service_token(
+    tmp_path: Path, queue: FakeQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It's part of the customer page, so it lives inside the /j/ exemption."""
+    monkeypatch.setenv("AUTO_EDIT_API_KEY", "s3cret-token")
+    get_settings.cache_clear()
+    try:
+        app = create_app()
+        store = JobStore(tmp_path)
+        app.dependency_overrides[get_store] = lambda: store
+        app.dependency_overrides[get_queue] = lambda: queue
+        with TestClient(app) as c:
+            c.jobs_root = tmp_path
+            job_id = _create(c, entitlement="preview_only", headers=_AUTH)
+            _rendered(c, job_id, locked=True)
+            token = _token(c, job_id)
+            assert c.get(f"/j/{token}/state").status_code == 200
+    finally:
+        get_settings.cache_clear()
+
+
+def test_unknown_gallery_code_state_is_404(client: TestClient) -> None:
+    assert client.get("/j/deadbeef123/state").status_code == 404
+
+
+def test_locked_gallery_page_carries_the_flip_poll(client: TestClient) -> None:
+    job_id = _create(client, entitlement="preview_only")
+    _rendered(client, job_id, locked=True)
+    token = _token(client, job_id)
+    page = client.get(f"/j/{token}").text
+    assert f"/j/{token}/state" in page and "location.reload()" in page
+
+    client.post(f"/jobs/{job_id}/unlock", json=_PAYMENT_BODY)
+    # Once unlocked there is nothing to wait for, so the script is gone.
+    assert "location.reload()" not in client.get(f"/j/{token}").text
+
+
 def test_gallery_ignores_any_source_tag(client: TestClient) -> None:
     """``?s=`` is analytics for SkydiveOS, never auth or lock state."""
     job_id = _create(client, entitlement="preview_only")

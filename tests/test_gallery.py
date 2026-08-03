@@ -223,3 +223,121 @@ def test_default_tiles_match_the_design() -> None:
         ("Photo Pack", "$19"),
         ("Book Again", "-15%"),
     ]
+
+
+# --------------------------------------------------------------------------- #
+# C-4 — Frame 03 conformance, asserted per state.
+#
+# The mockup is the contract here: headline, badge, primary action (in caps), the
+# upsell row on both paths, one layout skeleton, and a locked page that flips itself
+# when payment lands instead of waiting for a manual refresh.
+# --------------------------------------------------------------------------- #
+
+_FRAME03 = {
+    "jump_date": "2026-08-14",
+    "customer_name": "Sophie Lavoie",
+    "instructor_name": "Marc Tremblay",
+    "product_label": "Tandem · Handcam",
+    "tabbed": True,
+    "upsells": DEFAULT_TILES,
+}
+
+
+def _state_1_unlocked() -> str:
+    return _page(
+        show_downloads=True,
+        # A selfie package has stills in BOTH states — locked shows the teaser,
+        # unlocked shows the grid. Same section, same place.
+        photos=["/j/tok/photos/a.jpg"],
+        primary_download_url="/j/tok/media/full_video",
+        primary_download_note="1080p MP4  ·  214 MB  ·  yours to keep",
+        **_FRAME03,  # type: ignore[arg-type]
+    )
+
+
+def _state_2_locked() -> str:
+    return _page(
+        locked=True,
+        unlock_url="https://pay.test/u",
+        price_display="$39",
+        photo_count_teaser=32,
+        poll_token="tok",
+        **_FRAME03,  # type: ignore[arg-type]
+    )
+
+
+def test_frame03_state_1_unlocked() -> None:
+    html = _state_1_unlocked()
+    assert "Your jump is ready" in html
+    assert "1080P · FULL QUALITY" in html
+    assert "Download video" in html
+    assert "1080p MP4" in html and "214 MB" in html and "yours to keep" in html
+    assert "14 AUG 2026" in html and "Instructor Marc Tremblay" in html
+    assert "Unlock full video" not in html and "720P PREVIEW" not in html
+
+
+def test_frame03_state_2_locked() -> None:
+    html = _state_2_locked()
+    assert "We filmed it anyway" in html
+    assert "720P PREVIEW" in html
+    assert "Unlock full video — $39" in html
+    assert 'href="https://pay.test/u"' in html
+    assert "nodownload" in html  # watermarked player, no save affordance
+    assert "1080P · FULL QUALITY" not in html and "Download video" not in html
+
+
+def test_frame03_primary_action_is_set_in_caps() -> None:
+    """The mockup's CTA is upper-case. Done in CSS so the label stays translatable."""
+    for html in (_state_1_unlocked(), _state_2_locked()):
+        cta = html.split(".ctabtn {", 1)[1].split("}", 1)[0]
+        assert "text-transform:uppercase" in cta.replace(" ", "")
+
+
+def test_frame03_upsell_row_on_both_paths() -> None:
+    for html in (_state_1_unlocked(), _state_2_locked()):
+        assert "Add to your day" in html
+        for title in ("Raw Footage", "Photo Pack", "Book Again"):
+            assert title in html
+
+
+def test_frame03_states_share_one_layout_skeleton() -> None:
+    """Only the player treatment and the primary action may differ."""
+    skeleton = (
+        "<header>", 'class="hero"', 'class="eyebrow"', 'class="sub"', 'class="tabs"',
+        'class="cta"', 'id="tab-video"', 'class="vgrid"', 'class="vcard"',
+        'id="tab-photos"', 'class="upsell"', 'class="urow"', "<footer>",
+    )
+    unlocked, locked = _state_1_unlocked(), _state_2_locked()
+    for marker in skeleton:
+        assert marker in unlocked, marker
+        assert marker in locked, marker
+
+
+def test_locked_page_flips_itself_when_payment_lands() -> None:
+    """Frame 03: "on payment the page re-renders in place"."""
+    html = _state_2_locked()
+    assert "/j/tok/state" in html
+    assert "location.reload()" in html
+    assert "s.locked===false" in html
+
+
+def test_unlocked_page_does_not_poll() -> None:
+    """Nothing to wait for once the customer owns the edit."""
+    assert "/state" not in _state_1_unlocked()
+
+
+def test_legacy_s3_page_emits_no_script() -> None:
+    """The static S3 fallback can't reload into a fresh render — so it doesn't try."""
+    html = _page(locked=True, photo_count_teaser=1)  # no poll_token, no tabs
+    assert "location.reload()" not in html
+    assert "/state" not in html
+
+
+def test_a_jump_with_no_stills_shows_no_photos_tab_in_either_state() -> None:
+    """A locked page must not advertise photos the package never shot (video_only)."""
+    common = {"tabbed": True, "photos": []}
+    locked = _page(locked=True, photo_count_teaser=0, **common)  # type: ignore[arg-type]
+    unlocked = _page(show_downloads=True, **common)  # type: ignore[arg-type]
+    for html in (locked, unlocked):
+        assert 'id="tab-photos"' not in html
+    assert "Photos unlock with the full video" not in locked

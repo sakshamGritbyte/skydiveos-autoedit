@@ -49,6 +49,12 @@ _SURFACE = "#131b24"
 _ACCENT_UNLOCKED = "#5bbd84"
 _ACCENT_LOCKED = "#e2a13f"
 
+#: How the locked page notices it has been paid for (Frame 03's "re-renders in
+#: place"). Slow enough to be free at dropzone volume, bounded so a page left open
+#: overnight stops asking: 6 s x 200 = 20 minutes, then the customer reloads.
+_FLIP_POLL_MS = 6000
+_FLIP_POLL_LIMIT = 200
+
 
 def _video_label(name: str) -> tuple[str, str]:
     return _VIDEO_META.get(name, (name.replace("_", " ").title(), ""))
@@ -88,6 +94,7 @@ def render_gallery_html(
     primary_download_url: str | None = None,
     primary_download_note: str | None = None,
     upsells: Sequence[UpsellTile] = (),
+    poll_token: str | None = None,
 ) -> str:
     """Render the customer gallery page as one self-contained HTML string.
 
@@ -111,6 +118,10 @@ def render_gallery_html(
       yours to keep" line). Ignored while ``locked``, whose primary action is the
       unlock CTA.
     * ``upsells`` — the "Add to your day" tiles, rendered in *both* states.
+    * ``poll_token`` — the gallery short code. When given *and* ``locked``, the page
+      polls ``/j/{code}/state`` and reloads itself the moment the paywall lifts, so
+      paying in another tab flips this page without a manual refresh. Omit it (the
+      legacy S3 page) and no script is emitted.
     """
     e = html.escape
     brand_e = e(brand)
@@ -161,20 +172,20 @@ def render_gallery_html(
         if download_all_url and not locked else ""
     )
     n_photos = photo_count_teaser if locked else len(photos)
-    if locked:
-        photo_body = (
-            f'<p class="teaser">{n_photos} photos included — unlock to see them all.</p>'
-            if n_photos else '<p class="teaser">Photos unlock with the full video.</p>'
-        )
-    else:
-        photo_body = f'<div class="pgrid">{photo_tiles}</div>'
+    photo_body = (
+        f'<p class="teaser">{n_photos} photos included — unlock to see them all.</p>'
+        if locked else f'<div class="pgrid">{photo_tiles}</div>'
+    )
+    # The section appears when this jump HAS stills — locked or not, so the two states
+    # keep one layout (Frame 03). A package that shot none (video_only) gets no Photos
+    # tab in either state: a locked page must not advertise photos that don't exist.
     photos_section = (
         f"""
       <section class="photos" id="tab-photos">
         <div class="shead"><h2>Photos <span>({n_photos})</span></h2>{dl_btn}</div>
         {photo_body}
       </section>"""
-        if (photos or (locked and tabbed) or (locked and n_photos)) else ""
+        if n_photos else ""
     )
 
     # The primary action. Locked → the paywall CTA (an anchor when SkydiveOS's
@@ -224,6 +235,21 @@ def render_gallery_html(
         )
     else:
         upsell_section = ""
+
+    # Frame 03: "on payment the page re-renders in place — watermark drops, badge
+    # flips to 1080p, CTA becomes Download". The page is rendered server-side per
+    # request, so a reload IS that re-render: it asks for the state fresh and comes
+    # back unlocked. This poll only removes the need for the customer to do it by
+    # hand after paying in another tab. Locked pages only — an unlocked page has
+    # nothing to wait for — and it reads a boolean, never the media.
+    flip_js = (
+        "<script>(function(){var n=0;var t=setInterval(function(){"
+        f"if(++n>{_FLIP_POLL_LIMIT}){{clearInterval(t);return;}}"
+        f"fetch('/j/{{token}}/state',{{cache:'no-store'}}).then(function(r){{return r.json();}})"
+        ".then(function(s){if(s&&s.locked===false){clearInterval(t);location.reload();}})"
+        "['catch'](function(){});"
+        f"}},{_FLIP_POLL_MS});}})();</script>"
+    ).replace("{token}", html.escape(poll_token or "", quote=True)) if (locked and poll_token) else ""
 
     if tabbed:
         eyebrow = "We filmed it anyway" if locked else "Your jump is ready"
@@ -291,7 +317,10 @@ def render_gallery_html(
   .tab-panel {{ display:none; }}
   .tab-panel.active {{ display:block; }}
   .cta {{ max-width:1100px; margin:0 auto; padding:14px 20px 4px; text-align:center; }}
-  .ctabtn {{ display:block; background:var(--accent); color:#0c1218; text-decoration:none; padding:15px 30px; border-radius:9px; font-weight:800; font-size:15px; letter-spacing:.5px; }}
+  /* Frame 03 sets the primary action in caps. Done in CSS, not by upper-casing the
+     string, so the label stays one readable sentence for translation and for the
+     tests/scripts that match on it. */
+  .ctabtn {{ display:block; background:var(--accent); color:#0c1218; text-decoration:none; padding:15px 30px; border-radius:9px; font-weight:800; font-size:15px; letter-spacing:1px; text-transform:uppercase; }}
   .ctasub {{ color:var(--muted); font-size:12px; margin-top:8px; }}
   .upsell {{ max-width:1100px; margin:0 auto; padding:26px 20px 8px; border-top:1px solid var(--line); }}
   .ulabel {{ color:var(--muted); font-size:11px; letter-spacing:2px; text-transform:uppercase; font-weight:700; margin-bottom:10px; }}
@@ -311,4 +340,4 @@ def render_gallery_html(
   </main>
   {upsell_section}
   <footer>Powered by {brand_e} · Blue skies! 🪂</footer>
-{tab_js}</body></html>"""
+{tab_js}{flip_js}</body></html>"""

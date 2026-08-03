@@ -1285,8 +1285,27 @@ def create_app() -> FastAPI:
                 job_id=job.job_id,
                 booking_id=job.booking_id,
             ),
+            # Lets a locked page flip itself the moment /unlock lands (Frame 03).
+            poll_token=token,
         )
         return HTMLResponse(html_page)
+
+    @app.get("/j/{token}/state", include_in_schema=False)
+    def public_gallery_state(token: str, store: StoreDep) -> dict[str, bool]:
+        """Whether this jump is still behind the paywall — one boolean, nothing else.
+
+        Frame 03 says the page "re-renders in place" when payment lands. The page is
+        rendered server-side per request, so the locked page polls this and reloads
+        itself the moment the answer flips: the customer who paid in the checkout tab
+        doesn't have to know to refresh.
+
+        Deliberately the narrowest possible public response: no customer name, no
+        deliverable names, no token echo. Knowing that *some* jump is locked tells an
+        unauthenticated caller nothing it couldn't already see on the page it just
+        loaded.
+        """
+        job = _job_by_token(store, token)
+        return {"locked": job.entitlement is Entitlement.preview_only}
 
     @app.get("/j/{token}/media/{name}", include_in_schema=False, response_class=FileResponse)
     def public_media(token: str, name: str, store: StoreDep) -> FileResponse:

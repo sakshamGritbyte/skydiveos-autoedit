@@ -563,3 +563,103 @@ def test_unknown_link_mode_degrades_to_link(
     jump_dir = archive.archive_raw_footage(job, store, get_settings())
     assert jump_dir is not None
     assert (jump_dir / "raw" / "A.MP4").is_file()
+
+
+# --------------------------------------------------------------------------- #
+# C-2 — the READ side of the manifest hashes.
+#
+# A hash that is only ever written proves nothing. This is what lets an operator show
+# that the master they are holding is byte-identical to what the pipeline ingested.
+# --------------------------------------------------------------------------- #
+
+
+def _archived(store: JobStore, settings: Settings) -> tuple[Job, Path]:
+    job = _job(store)
+    _raw(store, job, "GH010001.MP4")
+    jd = store.dir(job.job_id)
+    (jd / "full_video.mp4").write_bytes(b"video")
+    job = store.update(
+        job.job_id, status=JobStatus.ready, outputs={"full_video": str(jd / "full_video.mp4")}
+    )
+    archive.archive_raw_footage(job, store, settings)
+    jump_dir = archive.archive_deliverables(job, store, settings)
+    assert jump_dir is not None
+    return job, jump_dir
+
+
+def test_verify_passes_on_an_untouched_archive(store: JobStore, settings: Settings) -> None:
+    _job_, jump_dir = _archived(store, settings)
+    mismatched, missing, checked = archive.verify_digests(jump_dir)
+    assert (mismatched, missing) == ([], [])
+    assert checked == 2  # the raw master + the render
+
+
+def test_verify_detects_a_tampered_file(store: JobStore, settings: Settings) -> None:
+    """The case the whole feature exists for."""
+    _job_, jump_dir = _archived(store, settings)
+    victim = jump_dir / "edited" / "full_video.mp4"
+    victim.write_bytes(b"someone else's video")
+
+    mismatched, missing, checked = archive.verify_digests(jump_dir)
+    assert mismatched == ["edited/full_video.mp4"]
+    assert missing == []
+    assert checked == 2
+
+
+def test_verify_ignores_the_size_mtime_cache(store: JobStore, settings: Settings) -> None:
+    """A tamper that preserves size AND mtime is exactly what a cache would wave through."""
+    _job_, jump_dir = _archived(store, settings)
+    victim = jump_dir / "edited" / "full_video.mp4"
+    before = victim.stat()
+    victim.write_bytes(b"video"[::-1])  # same length, different bytes
+    os.utime(victim, (before.st_atime, before.st_mtime))
+    assert victim.stat().st_size == before.st_size
+
+    mismatched, _missing, _checked = archive.verify_digests(jump_dir)
+    assert mismatched == ["edited/full_video.mp4"]
+
+
+def test_verify_reports_a_deleted_file_as_missing(store: JobStore, settings: Settings) -> None:
+    _job_, jump_dir = _archived(store, settings)
+    (jump_dir / "edited" / "full_video.mp4").unlink()
+
+    mismatched, missing, checked = archive.verify_digests(jump_dir)
+    assert missing == ["edited/full_video.mp4"]
+    assert mismatched == [] and checked == 1
+
+
+def test_verify_is_a_no_op_without_recorded_hashes(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ARCHIVE_ROOT", str(tmp_path / "raw-storage"))
+    monkeypatch.setenv("ARCHIVE_HASHES", "0")
+    get_settings.cache_clear()
+    _job_, jump_dir = _archived(store, get_settings())
+    assert archive.verify_digests(jump_dir) == ([], [], 0)
+
+
+def test_verify_never_rewrites_the_manifest(store: JobStore, settings: Settings) -> None:
+    """Read-only: a verify pass must not quietly re-bless a changed file."""
+    _job_, jump_dir = _archived(store, settings)
+    manifest = jump_dir / archive.MANIFEST_FILENAME
+    (jump_dir / "edited" / "full_video.mp4").write_bytes(b"tampered")
+    before = manifest.read_text()
+
+    archive.verify_digests(jump_dir)
+    assert manifest.read_text() == before
+    # And a second pass still reports it — the recorded hash stands.
+    assert archive.verify_digests(jump_dir)[0] == ["edited/full_video.mp4"]
+
+
+def test_find_jump_dir_never_creates_a_folder(store: JobStore, settings: Settings) -> None:
+    job = _job(store)
+    root = archive.archive_root(settings)
+    assert root is not None
+    assert archive.find_jump_dir(job, root) is None
+    day, instructor, customer = archive.jump_dir_parts(job)
+    assert not (root / day / instructor / customer).exists()
+
+    _raw(store, job, "GH010001.MP4")
+    archive.archive_raw_footage(job, store, settings)
+    found = archive.find_jump_dir(job, root)
+    assert found is not None and found.is_dir()

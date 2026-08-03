@@ -18,6 +18,13 @@ Usage::
     python scripts/archive_job.py <job_id> [<job_id>...]  # named jobs
     python scripts/archive_job.py --all --dry-run        # just show where each would go
     python scripts/archive_job.py --all --link-mode copy # real copies, not hardlinks
+    python scripts/archive_job.py --all --verify          # re-hash against the manifest
+
+``--verify`` is the read side of the manifest's file hashes: it re-hashes every
+archived file and reports anything whose content no longer matches what was recorded
+(bit-rot, a truncated rsync, a file replaced by hand). Read-only — it never rewrites
+a manifest or touches a file — and it exits non-zero if anything mismatched, so it
+works as a cron/monitoring check.
 
 Safe to re-run: mirroring is idempotent and hardlinked by default, so a repeat pass
 costs a stat per file and no extra disk. It never deletes anything — a folder left
@@ -70,6 +77,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="report the folder each job would file under, without touching the disk",
     )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="re-hash archived files against the manifest instead of archiving; "
+             "exits non-zero on any mismatch",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     return parser.parse_args(argv)
 
@@ -116,6 +129,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print(f"Archive root: {root}")
+
+    if args.verify:
+        return _verify(jobs, root, settings)
+
     failures = 0
     for job in jobs:
         day, instructor, customer = archive.jump_dir_parts(job)
@@ -140,6 +157,35 @@ def main(argv: list[str] | None = None) -> int:
     verb = "would be archived" if args.dry_run else "archived"
     print(f"{len(jobs)} job(s) {verb}.")
     return 0
+
+
+def _verify(jobs: list[Job], root: Path, settings: object) -> int:
+    """Re-hash each job's archive folder against its manifest. Non-zero on mismatch."""
+    bad = 0
+    total_checked = 0
+    for job in jobs:
+        day, instructor, customer = archive.jump_dir_parts(job)
+        jump_dir = archive.find_jump_dir(job, root)
+        if jump_dir is None:
+            print(f"  [none] {job.job_id}: not archived ({day}/{instructor}/{customer})")
+            continue
+        mismatched, missing, checked = archive.verify_digests(jump_dir)
+        total_checked += checked
+        rel = jump_dir.relative_to(root)
+        if mismatched:
+            bad += 1
+            print(f"  [BAD]  {job.job_id} -> {rel}: {len(mismatched)} file(s) CHANGED")
+            for f in mismatched:
+                print(f"           changed: {f}")
+        elif not checked:
+            print(f"  [skip] {job.job_id} -> {rel}: no hashes recorded (ARCHIVE_HASHES off?)")
+        else:
+            print(f"  [ok]   {job.job_id} -> {rel}: {checked} file(s) match")
+        for f in missing:
+            print(f"           MISSING: {f}")
+
+    print(f"{total_checked} file(s) hashed across {len(jobs)} job(s); {bad} job(s) with changes.")
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":

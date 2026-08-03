@@ -285,6 +285,34 @@ def _owner(candidate: Path) -> str | None:
     return job_id if isinstance(job_id, str) else None
 
 
+def _candidate_names(job: Job) -> tuple[str, ...]:
+    """Folder names this job may live under, most-preferred first.
+
+    Two jumps can collide on (day, instructor, customer) — the same person jumping
+    twice, or two customers who share a name — so a colliding job takes a job-id
+    suffixed sibling rather than merging two jumps' footage into one folder.
+    """
+    _, _, customer = jump_dir_parts(job)
+    short = job.job_id[:8]
+    return (customer, f"{customer}-{short}", f"{customer}-{job.job_id}")
+
+
+def find_jump_dir(job: Job, root: Path) -> Path | None:
+    """This job's archive folder if it already exists — never creates one.
+
+    The read-only counterpart to :func:`resolve_jump_dir`, for tools that inspect the
+    archive (``archive_job.py --verify``) and must not conjure an empty folder for a
+    job that was never filed.
+    """
+    day, instructor, _ = jump_dir_parts(job)
+    parent = root / day / instructor
+    for name in _candidate_names(job):
+        candidate = parent / name
+        if candidate.is_dir() and _owner(candidate) == job.job_id:
+            return candidate
+    return None
+
+
 def resolve_jump_dir(job: Job, root: Path) -> Path:
     """This job's archive folder, created and marked as its own.
 
@@ -296,10 +324,9 @@ def resolve_jump_dir(job: Job, root: Path) -> Path:
 
     Idempotent: the owning job always resolves back to the same folder.
     """
-    day, instructor, customer = jump_dir_parts(job)
+    day, instructor, _ = jump_dir_parts(job)
     parent = root / day / instructor
-    short = job.job_id[:8]
-    for name in (customer, f"{customer}-{short}", f"{customer}-{job.job_id}"):
+    for name in _candidate_names(job):
         candidate = parent / name
         owner = _owner(candidate) if candidate.is_dir() else None
         if owner == job.job_id:
@@ -381,6 +408,41 @@ def file_digests(
             out[rel] = {"sha256": digest, "size": size, "mtime": mtime}
     # Keep digests for files this pass didn't touch (raw survives a render pass).
     return {**{k: v for k, v in cache.items() if isinstance(v, dict)}, **out}
+
+
+def verify_digests(jump_dir: Path) -> tuple[list[str], list[str], int]:
+    """Re-hash a jump folder against its manifest. ``(mismatched, missing, checked)``.
+
+    A hash that is only ever *written* proves nothing — this is the read side, and the
+    reason the manifest records one at all: an operator holding a master can show it is
+    byte-identical to what the pipeline ingested (bit-rot, a truncated rsync, a file
+    swapped by hand). Recomputed in full here, deliberately ignoring the size/mtime
+    cache that :func:`file_digests` uses to stay cheap — a tampered file with a
+    preserved mtime is exactly the case a cache would wave through.
+
+    * ``mismatched`` — the file is there and its content changed. The alarming one.
+    * ``missing`` — recorded in the manifest, absent from disk.
+    * ``checked`` — how many entries were hashed.
+
+    Pure read: never rewrites the manifest, never touches the files.
+    """
+    recorded = _read_manifest(jump_dir).get("files")
+    if not isinstance(recorded, dict):
+        return ([], [], 0)
+    mismatched: list[str] = []
+    missing: list[str] = []
+    checked = 0
+    for rel, meta in sorted(recorded.items()):
+        if not isinstance(meta, dict) or not isinstance(meta.get("sha256"), str):
+            continue
+        path = jump_dir / rel
+        if not path.is_file():
+            missing.append(rel)
+            continue
+        checked += 1
+        if _sha256(path) != meta["sha256"]:
+            mismatched.append(rel)
+    return (mismatched, missing, checked)
 
 
 def _write_manifest(jump_dir: Path, job: Job, **updates: object) -> None:

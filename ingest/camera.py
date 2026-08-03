@@ -20,11 +20,14 @@ is exercised without hardware.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
 import subprocess
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -156,6 +159,31 @@ def _media_item_to_remote(item: Any) -> RemoteMedia:
         size=_to_int(getattr(item, "file_size", None)),
         has_lrv=has_lrv,
     )
+
+
+@contextmanager
+def _as_camera_error(what: str) -> Iterator[None]:
+    """Re-raise anything the SDK/transport throws as :class:`CameraError`.
+
+    This module's contract is that camera trouble surfaces as ``CameraError`` — that is
+    what callers catch, and :func:`ingest.pull._pull_one` relies on it to treat a
+    missing proxy or thumbnail as best-effort. But the SDK reaches the camera over
+    HTTP and lets ``requests`` exceptions through raw: a card whose thumbnail is
+    missing answers ``404``, ``raise_for_status()`` throws ``requests.HTTPError``, that
+    sails past ``except CameraError`` and kills the whole pull — nine staged clips
+    thrown away over one absent JPEG (observed 2026-08-03 on ``GX015312.MP4``).
+
+    So translate at the boundary that owns the SDK. ``CameraError`` subclasses are
+    passed through unchanged; ``asyncio.CancelledError`` is never swallowed.
+    """
+    try:
+        yield
+    except CameraError:
+        raise
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001 - the whole point is to normalise the type
+        raise CameraError(f"{what} failed: {type(e).__name__}: {e}") from e
 
 
 def _load_sdk() -> Any:
@@ -345,23 +373,26 @@ class _SdkGoProCamera(Camera):
 
     async def download_mp4(self, media: RemoteMedia, dest: Path) -> Path:
         gopro = self._require_open()
-        resp = await gopro.http_command.download_file(
-            camera_file=media.camera_path, local_file=dest
-        )
+        with _as_camera_error(f"download of {media.camera_path}"):
+            resp = await gopro.http_command.download_file(
+                camera_file=media.camera_path, local_file=dest
+            )
         return _downloaded_path(resp, dest)
 
     async def download_lrv(self, media: RemoteMedia, dest: Path) -> Path:
         gopro = self._require_open()
-        resp = await gopro.http_command.download_file(
-            camera_file=media.lrv_camera_path, local_file=dest
-        )
+        with _as_camera_error(f"LRV download of {media.lrv_camera_path}"):
+            resp = await gopro.http_command.download_file(
+                camera_file=media.lrv_camera_path, local_file=dest
+            )
         return _downloaded_path(resp, dest)
 
     async def download_thumbnail(self, media: RemoteMedia, dest: Path) -> Path:
         gopro = self._require_open()
-        resp = await gopro.http_command.get_thumbnail(
-            camera_file=media.camera_path, local_file=dest
-        )
+        with _as_camera_error(f"thumbnail of {media.camera_path}"):
+            resp = await gopro.http_command.get_thumbnail(
+                camera_file=media.camera_path, local_file=dest
+            )
         return _downloaded_path(resp, dest)
 
     async def delete_media(self, media: RemoteMedia) -> None:

@@ -78,20 +78,27 @@ async def _pull_one(
     # LRV and thumbnail are best-effort: a missing proxy must not strand an
     # otherwise-good MP4. Local names share the MP4 stem so the jump's assets
     # stay grouped (downstream analysis runs on the .LRV proxy).
+    #
+    # Caught broadly on purpose. `ingest.camera` normalises SDK failures to
+    # CameraError, but these two assets are cosmetic and this loop is holding a
+    # customer's masters: whatever a transport invents — an HTTP 404 for a thumbnail the
+    # card never wrote, a socket timeout, a full disk — must cost that one asset, never
+    # the pull. A real GoPro card served exactly this (404 on GX015312.MP4's thumbnail)
+    # and abandoned nine already-downloaded clips.
     lrv_dest: Path | None = None
     if media.has_lrv:
         candidate = mp4_dest.parent / f"{media.stem}.LRV"
         try:
             await cam.download_lrv(media, candidate)
             lrv_dest = candidate
-        except CameraError as e:
+        except Exception as e:  # noqa: BLE001 - a missing proxy is not a failed jump
             logger.warning("LRV download failed for %s: %s", media.filename, e)
 
     thumb_target = mp4_dest.parent / f"{media.stem}.thumbnail.jpg"
     thumb_dest: Path | None = thumb_target
     try:
         await cam.download_thumbnail(media, thumb_target)
-    except CameraError as e:
+    except Exception as e:  # noqa: BLE001 - a missing thumbnail is not a failed jump
         logger.warning("thumbnail download failed for %s: %s", media.filename, e)
         thumb_dest = None
 

@@ -443,3 +443,75 @@ def test_an_addressless_handle_falls_through_to_the_sdk(
     asyncio.run(controller().pair(_Handle("")))
 
     assert paired == [""]
+
+
+# --------------------------------------------------------------------------- #
+# A cosmetic asset must never cost the pull.
+#
+# Observed on a real card: GX015312.MP4 had no thumbnail, the camera answered 404,
+# requests raised HTTPError — which is NOT a CameraError, so it sailed past the
+# best-effort handler and aborted a pull that had already staged nine clips. The
+# masters are the product; a missing JPEG or proxy is not a failed jump.
+# --------------------------------------------------------------------------- #
+
+
+class _AssetFailingCamera(FakeCamera):
+    """A card that serves masters fine but fails a cosmetic asset with `boom`."""
+
+    def __init__(self, *, boom: BaseException, fail: str) -> None:
+        super().__init__([_media("GX010123.MP4")])
+        self._boom = boom
+        self._fail = fail
+
+    async def download_lrv(self, media: RemoteMedia, dest: Path) -> Path:
+        if self._fail == "lrv":
+            raise self._boom
+        return await super().download_lrv(media, dest)
+
+    async def download_thumbnail(self, media: RemoteMedia, dest: Path) -> Path:
+        if self._fail == "thumb":
+            raise self._boom
+        return await super().download_thumbnail(media, dest)
+
+
+@pytest.mark.parametrize("fail", ["thumb", "lrv"])
+@pytest.mark.parametrize(
+    "boom",
+    [
+        RuntimeError("404 Client Error: Not Found"),  # what requests actually raised
+        OSError("No space left on device"),
+        TimeoutError("read timed out"),
+    ],
+    ids=["http-404", "disk-full", "timeout"],
+)
+def test_a_failed_cosmetic_asset_still_stages_the_master(
+    tmp_path: Path, fail: str, boom: BaseException
+) -> None:
+    cam = _AssetFailingCamera(boom=boom, fail=fail)
+    jumps = asyncio.run(
+        pull_camera("1234", root=tmp_path, camera=cam, emit=False, now=lambda: FIXED_NOW)
+    )
+
+    assert len(jumps) == 1, "the pull must complete, not abort"
+    jump = jumps[0]
+    assert jump.mp4_path.is_file(), "the master is the product — it must be on disk"
+    # The manifest is what marks a jump complete/resumable, so it must still be written.
+    assert storage.manifest_path(jump.mp4_path).is_file()
+    if fail == "thumb":
+        assert jump.thumbnail_path is None
+    else:
+        assert jump.lrv_path is None
+
+
+def test_a_failed_master_download_still_aborts(tmp_path: Path) -> None:
+    """The inverse: the MP4 is NOT cosmetic, so its failure must not be swallowed."""
+
+    class _MasterFails(FakeCamera):
+        async def download_mp4(self, media: RemoteMedia, dest: Path) -> Path:
+            raise RuntimeError("connection reset mid-master")
+
+    cam = _MasterFails([_media("GX010123.MP4")])
+    with pytest.raises(RuntimeError, match="connection reset"):
+        asyncio.run(
+            pull_camera("1234", root=tmp_path, camera=cam, emit=False, now=lambda: FIXED_NOW)
+        )

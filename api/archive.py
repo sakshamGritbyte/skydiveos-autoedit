@@ -13,11 +13,14 @@ and the edit that went to the customer::
             raw/                      ← the camera masters, exactly as ingested
               instructor/GH010001.MP4 ←   (per-camera role for the Ultimate package)
               external/GH010002.MP4
-            edited/                   ← the rendered deliverables
+            edited/                   ← the rendered deliverables (the clean masters)
               full_video.mp4
               highlights.mp4
+            preview/                  ← the watermarked 720p previews (Path B jobs)
+              full_video.mp4
             photos/                   ← the selected stills
-            manifest.json             ← what this folder is (job id, booking, links)
+            manifest.json             ← what this folder is (job id, booking, links,
+                                        media_state, and a sha256 per file)
 
 ``<archive_root>`` is ``$ARCHIVE_ROOT``, defaulting to /ingest's ``$RAW_STORAGE_ROOT``
 (``./raw-storage``) so the archive lands where the operators already look. Camera-pull
@@ -42,6 +45,7 @@ just refreshes what changed, so the functions can sit on every "footage landed" 
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -49,18 +53,26 @@ import re
 import shutil
 import time
 import unicodedata
+from collections.abc import Iterable
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 from .config import Settings
 from .jobs import Job, JobStore
+from .lifecycle import media_state
 
 logger = logging.getLogger(__name__)
 
 #: Subdirectories of one jump's archive folder.
 RAW_DIRNAME = "raw"
 EDITED_DIRNAME = "edited"
+PREVIEW_DIRNAME = "preview"
 PHOTOS_DIRNAME = "photos"
+#: How a watermarked preview is named in the job's working dir (the ``preview_<name>``
+#: convention :mod:`api.preview` writes). Matched by glob rather than imported so the
+#: archive stays dependency-light — it must never drag Pillow/FFmpeg into a mirror pass.
+PREVIEW_GLOB = "preview_*.mp4"
+PREVIEW_PREFIX = "preview_"
 #: Sidecar naming the jump a folder belongs to (also the ownership marker used to
 #: disambiguate two same-named customers on the same day with the same instructor).
 MANIFEST_FILENAME = "manifest.json"
@@ -308,21 +320,81 @@ def resolve_jump_dir(job: Job, root: Path) -> Path:
 # --------------------------------------------------------------------------- #
 
 
+def _read_manifest(jump_dir: Path) -> dict[str, object]:
+    """The folder's manifest as a dict — ``{}`` when absent, empty, or corrupt."""
+    try:
+        current = json.loads((jump_dir / MANIFEST_FILENAME).read_text())
+    except (OSError, ValueError):
+        return {}
+    return current if isinstance(current, dict) else {}
+
+
+def _sha256(path: Path) -> str | None:
+    """Streaming sha256 of one file, or ``None`` if it can't be read."""
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as fh:
+            while chunk := fh.read(1 << 20):
+                digest.update(chunk)
+    except OSError as e:
+        logger.warning("archive: could not hash %s: %s", path, e)
+        return None
+    return digest.hexdigest()
+
+
+def file_digests(
+    jump_dir: Path, rel_paths: Iterable[str], *, enabled: bool = True
+) -> dict[str, dict[str, object]] | None:
+    """``{relative path: {sha256, size, mtime}}`` for archived files.
+
+    Lets an operator prove the master they're holding is the one that was ingested
+    (the design doc's ``job.json`` file hashes). A 4K master is expensive to read, and
+    this runs at every pipeline seam, so digests are **cached in the manifest** and
+    recomputed only when a file's size or mtime changed — a given file is hashed once.
+
+    Returns ``None`` when hashing is switched off (``ARCHIVE_HASHES=0``), which leaves
+    any existing section in the manifest untouched. Never raises.
+    """
+    if not enabled:
+        return None
+    cached = _read_manifest(jump_dir).get("files")
+    cache: dict[str, dict[str, object]] = cached if isinstance(cached, dict) else {}
+    out: dict[str, dict[str, object]] = {}
+    for rel in sorted(set(rel_paths)):
+        path = jump_dir / rel
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        size, mtime = st.st_size, int(st.st_mtime)
+        prior = cache.get(rel)
+        if (
+            isinstance(prior, dict)
+            and prior.get("size") == size
+            and prior.get("mtime") == mtime
+            and isinstance(prior.get("sha256"), str)
+        ):
+            out[rel] = prior  # unchanged since we last hashed it
+            continue
+        digest = _sha256(path)
+        if digest is not None:
+            out[rel] = {"sha256": digest, "size": size, "mtime": mtime}
+    # Keep digests for files this pass didn't touch (raw survives a render pass).
+    return {**{k: v for k, v in cache.items() if isinstance(v, dict)}, **out}
+
+
 def _write_manifest(jump_dir: Path, job: Job, **updates: object) -> None:
     """Merge ``updates`` into the folder's ``manifest.json`` (created if absent).
 
     Read-modify-write so the raw pass, the render pass, and the delivery pass each
     contribute their section without clobbering the others. Booking fields are
     refreshed every time, so a late correction to the customer's name shows up here
-    even though the folder keeps the name it was created under.
+    even though the folder keeps the name it was created under. A ``None`` update value
+    is dropped rather than written, so a pass can pass "nothing to say" for a section.
     """
     path = jump_dir / MANIFEST_FILENAME
-    try:
-        current = json.loads(path.read_text())
-        if not isinstance(current, dict):
-            current = {}
-    except (OSError, ValueError):
-        current = {}
+    current = _read_manifest(jump_dir)
+    updates = {k: v for k, v in updates.items() if v is not None}
 
     day, instructor, customer = jump_dir_parts(job)
     current.update(
@@ -330,7 +402,11 @@ def _write_manifest(jump_dir: Path, job: Job, **updates: object) -> None:
             "job_id": job.job_id,
             "booking_id": job.booking_id,
             "package": job.package.value,
+            "entitlement": job.entitlement.value,
             "status": job.status.value,
+            # The design doc's product-facing state (derived; see api.lifecycle) so a
+            # browsing operator sees the same word the SkydiveOS UI shows them.
+            "media_state": media_state(job).value,
             "jump_date": day,
             "instructor": instructor,
             "instructor_id": job.instructor_id,
@@ -386,7 +462,17 @@ def archive_raw_footage(job: Job, store: JobStore, settings: Settings) -> Path |
                 if place(src, raw_dst / src.name, mode=mode):
                     placed.append(src.name)
 
-        _write_manifest(jump_dir, job, raw=sorted(set(placed)))
+        rel = sorted(set(placed))
+        _write_manifest(
+            jump_dir,
+            job,
+            raw=rel,
+            files=file_digests(
+                jump_dir,
+                (f"{RAW_DIRNAME}/{r}" for r in rel),
+                enabled=settings.archive_hashes,
+            ),
+        )
         logger.info(
             "archive: job %s raw footage → %s (%d file(s), mode=%s)",
             job.job_id,
@@ -406,7 +492,9 @@ def archive_deliverables(job: Job, store: JobStore, settings: Settings) -> Path 
     Called at every "render finished" seam (the scene pipeline, the single-master
     pipeline, and a post-tweak re-render), so the folder always holds the *current*
     cut next to the footage it was cut from. Videos land in ``edited/`` under their
-    deliverable filename; a photos *directory* is mirrored into ``photos/``.
+    deliverable filename; a photos *directory* is mirrored into ``photos/``; a Path-B
+    job's watermarked previews are mirrored into ``preview/`` — the archive then shows
+    both what the customer could watch and what they'd get on unlocking.
 
     Returns the archive folder, or ``None`` when archiving is off or failed. Never raises.
     """
@@ -442,6 +530,16 @@ def archive_deliverables(job: Job, store: JobStore, settings: Settings) -> Path 
                     raw,
                 )
 
+        # Path B: the watermarked previews sit beside the masters they were made from.
+        # Found by api.preview's `preview_<name>.mp4` convention (they're deliberately
+        # absent from Job.outputs); the prefix is dropped so the file lines up with its
+        # master's name — edited/full_video.mp4 and preview/full_video.mp4.
+        previews: dict[str, str] = {}
+        for src in sorted(store.dir(job.job_id).glob(PREVIEW_GLOB)):
+            name = src.name[len(PREVIEW_PREFIX):]
+            if place(src, jump_dir / PREVIEW_DIRNAME / name, mode=mode):
+                previews[Path(name).stem] = f"{PREVIEW_DIRNAME}/{name}"
+
         # The photos dir also carries an index.json (scene/ts/score per still); count the
         # stills only, so the manifest number matches what the customer sees.
         n_photos = sum(1 for p in photos if p.lower().endswith((".jpg", ".jpeg", ".png")))
@@ -449,13 +547,20 @@ def archive_deliverables(job: Job, store: JobStore, settings: Settings) -> Path 
             jump_dir,
             job,
             edited=edited,
+            preview=previews or None,
             photos={"count": n_photos, "dir": PHOTOS_DIRNAME} if photos else None,
+            files=file_digests(
+                jump_dir,
+                [*edited.values(), *previews.values()],
+                enabled=settings.archive_hashes,
+            ),
         )
         logger.info(
-            "archive: job %s deliverables → %s (%d video(s), %d photo(s))",
+            "archive: job %s deliverables → %s (%d video(s), %d preview(s), %d photo(s))",
             job.job_id,
             jump_dir,
             len(edited),
+            len(previews),
             n_photos,
         )
         return jump_dir

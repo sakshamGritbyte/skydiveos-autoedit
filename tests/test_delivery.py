@@ -26,7 +26,7 @@ from api.delivery import (
     send_delivery_email,
     upload_and_link,
 )
-from api.jobs import Job, JobStatus, JobStore
+from api.jobs import Entitlement, Job, JobStatus, JobStore
 
 
 def _settings(**overrides: Any) -> Settings:
@@ -297,6 +297,115 @@ def test_deliver_without_email_ok_when_skydiveos_forwards(store: JobStore) -> No
 
 
 # --------------------------------------------------------------------------- #
+# F-14 — a locked (preview_only) job must never be handed a clean-master URL.
+#
+# The leak this closes: the legacy S3 gallery presigns `job.outputs` — the CLEAN
+# 1080p masters — and emails that page, with no entitlement check anywhere (a
+# presigned URL answers to whoever holds it). Path B was therefore delivered
+# unlocked, and the same URLs were persisted on the job, mirrored into the archive
+# manifest, and forwarded to SkydiveOS.
+# --------------------------------------------------------------------------- #
+
+
+def _locked_job(store: JobStore, **fields: Any) -> Job:
+    fields.setdefault("entitlement", Entitlement.preview_only)
+    return _rendered_job(store, **fields)
+
+
+def _served() -> Settings:
+    return _settings(public_base_url="https://freefall.ing")
+
+
+def test_locked_delivery_sends_the_served_gallery_link_and_nothing_else(
+    store: JobStore,
+) -> None:
+    """Positive half: the customer still gets a working link — the lock-aware one."""
+    job = _locked_job(store, customer_email="jane@example.com")
+    smtp, s3 = FakeSMTP(), FakeS3()
+
+    links = deliver_to_customer(
+        job, store, _served(), s3_client=s3, smtp_factory=lambda: smtp  # type: ignore[arg-type,return-value]
+    )
+
+    token = store.load(job.job_id).gallery_token
+    assert links == {"gallery": f"https://freefall.ing/j/{token}"}
+    assert len(smtp.sent) == 1
+    body = smtp.sent[0].get_content()
+    assert f"https://freefall.ing/j/{token}" in body
+    # The gallery route serves the watermarked preview while locked, and never
+    # expires — so the email must not carry a "valid for N days" line.
+    assert "valid for" not in body.lower()
+
+
+def test_locked_delivery_mints_no_presigned_url_anywhere(store: JobStore) -> None:
+    """Negative half: no delivery output may address the clean master."""
+    job = _locked_job(store, customer_email="jane@example.com")
+    smtp, s3 = FakeSMTP(), FakeS3()
+
+    links = deliver_to_customer(
+        job, store, _served(), s3_client=s3, smtp_factory=lambda: smtp  # type: ignore[arg-type,return-value]
+    )
+
+    # The master IS uploaded (durable copy; /unlock serves it instantly)...
+    assert [key for _, _, key, _ in s3.uploads] == [
+        f"{DELIVERY_KEY_PREFIX}/{job.job_id}/final.mp4"
+    ]
+    # ...but nothing hands out a URL to it: not the returned links (which get
+    # persisted + forwarded to SkydiveOS), not the email, and no gallery.html.
+    for url in links.values():
+        assert "s3.test" not in url
+    assert "s3.test" not in smtp.sent[0].get_content()
+    assert s3.objects == {}  # no legacy gallery.html was uploaded
+
+
+def test_locked_delivery_refuses_the_leaking_legacy_path(store: JobStore) -> None:
+    """With no PUBLIC_BASE_URL there is no safe link, so delivery must not proceed.
+
+    Failing loudly is the only non-leaking option: the alternative (the legacy S3
+    gallery) embeds presigned clean masters. The raw footage is archived, so a
+    re-queue after setting PUBLIC_BASE_URL is cheap.
+    """
+    job = _locked_job(store, customer_email="jane@example.com")
+    s3 = FakeS3()
+
+    with pytest.raises(RuntimeError, match="PUBLIC_BASE_URL"):
+        deliver_to_customer(
+            job, store, _settings(skydiveos_api_base="http://skydiveos.test"), s3_client=s3
+        )
+    assert s3.objects == {}  # nothing was published
+
+
+def test_locked_photo_set_is_not_presigned(store: JobStore) -> None:
+    """The photo zip is the same leak in another shape — the grid is teaser-only."""
+    job = _locked_job(store, customer_email="jane@example.com")
+    photos = store.dir(job.job_id) / "photos"
+    photos.mkdir(parents=True, exist_ok=True)
+    (photos / "a.jpg").write_bytes(b"jpeg")
+    store.update(job.job_id, outputs={"photos": str(photos)})
+    job = store.load(job.job_id)
+
+    links = deliver_to_customer(
+        job, store, _served(), s3_client=FakeS3(), smtp_factory=lambda: FakeSMTP()  # type: ignore[arg-type,return-value]
+    )
+    assert "photos" not in links
+    assert set(links) == {"gallery"}
+
+
+def test_path_a_delivery_is_unchanged_by_the_lock(store: JobStore) -> None:
+    """Regression guard: the paid flow keeps its presigned per-file links."""
+    job = _rendered_job(store, customer_email="jane@example.com")  # edited_download
+    smtp, s3 = FakeSMTP(), FakeS3()
+
+    links = deliver_to_customer(
+        job, store, _served(), s3_client=s3, smtp_factory=lambda: smtp  # type: ignore[arg-type,return-value]
+    )
+
+    assert set(links) == {"gallery", "final"}
+    assert links["final"].startswith("https://s3.test/")
+    assert len(smtp.sent) == 1
+
+
+# --------------------------------------------------------------------------- #
 # AUTO_DELIVER: the review-gate skip in api.tasks
 # --------------------------------------------------------------------------- #
 
@@ -416,6 +525,9 @@ def test_status_callback_hits_skydiveos_route_with_links_and_token(
     assert posted["url"] == "http://skydiveos.test/api/media/auto-edit/jobs/j1/status"
     assert posted["json"] == {
         "job_id": "j1", "status": "delivered",
+        "entitlement": "edited_download",
+        # The design doc's state vocabulary, derived from status + entitlement.
+        "media_state": "DELIVERED",
         "delivery_links": {"final": "https://s3.test/final.mp4"},
     }
     assert posted["headers"]["X-Auto-Edit-Token"] == "sekret"
@@ -615,3 +727,158 @@ def test_s3_ingest_download_failure_marks_failed(
     job = store.load("j1")
     assert job.status == JobStatus.failed
     assert "S3 ingest failed" in (job.error or "")
+
+
+# --------------------------------------------------------------------------- #
+# The served gallery link (PUBLIC_BASE_URL) vs the legacy S3 gallery.html
+# --------------------------------------------------------------------------- #
+
+
+def test_served_gallery_link_replaces_the_s3_page(store: JobStore) -> None:
+    """With PUBLIC_BASE_URL set the customer gets the short /j/{code} link.
+
+    No gallery.html is uploaded — the page is rendered per request, so it can flip
+    locked → unlocked and its link never expires.
+    """
+    job = _rendered_job(store, customer_email="jane@example.com")
+    smtp = FakeSMTP()
+    s3 = FakeS3()
+
+    links = deliver_to_customer(
+        job,
+        store,
+        _settings(public_base_url="https://freefall.ing"),
+        s3_client=s3,  # type: ignore[arg-type]
+        smtp_factory=lambda: smtp,  # type: ignore[return-value]
+    )
+
+    token = store.load(job.job_id).gallery_token
+    assert token
+    assert links["gallery"] == f"https://freefall.ing/j/{token}"
+    assert f"{DELIVERY_KEY_PREFIX}/{job.job_id}/gallery.html" not in s3.objects
+    # The clean master still goes to S3 — the durable copy, and what unlock serves.
+    master_key = f"{DELIVERY_KEY_PREFIX}/{job.job_id}/final.mp4"
+    assert any(key == master_key for _, _, key, _ in s3.uploads)
+
+    body = smtp.sent[0].get_content()
+    assert f"https://freefall.ing/j/{token}?s=e#tab-video" in body  # source-tagged
+    assert "valid for" not in body  # a served link doesn't expire
+
+
+def test_public_base_url_unset_keeps_the_legacy_s3_gallery(store: JobStore) -> None:
+    job = _rendered_job(store, customer_email="jane@example.com")
+    s3 = FakeS3()
+    smtp = FakeSMTP()
+
+    links = deliver_to_customer(
+        job, store, _settings(), s3_client=s3, smtp_factory=lambda: smtp  # type: ignore[arg-type,return-value]
+    )
+
+    assert f"{DELIVERY_KEY_PREFIX}/{job.job_id}/gallery.html" in s3.objects
+    assert "gallery.html" in links["gallery"] and "expires=" in links["gallery"]
+    assert "valid for" in smtp.sent[0].get_content()  # presigned → still expires
+
+
+def test_gallery_link_is_stable_across_deliveries(store: JobStore) -> None:
+    """A replay/re-delivery must not change the link already sent to the customer."""
+    job = _rendered_job(store, customer_email="jane@example.com")
+    settings = _settings(public_base_url="https://freefall.ing")
+
+    first = deliver_to_customer(
+        job, store, settings, s3_client=FakeS3(), smtp_factory=lambda: FakeSMTP()  # type: ignore[arg-type,return-value]
+    )
+    second = deliver_to_customer(
+        store.load(job.job_id),
+        store,
+        settings,
+        s3_client=FakeS3(),  # type: ignore[arg-type]
+        smtp_factory=lambda: FakeSMTP(),  # type: ignore[return-value]
+    )
+    assert first["gallery"] == second["gallery"]
+
+
+def test_gallery_link_helper_returns_none_without_a_public_base(store: JobStore) -> None:
+    from api.delivery import gallery_link
+
+    job = _rendered_job(store)
+    assert gallery_link(job, store, _settings()) is None
+
+
+def test_status_callback_forwards_entitlement_and_gallery_url(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SkydiveOS needs both to SMS the right link (design doc step 09)."""
+    import httpx
+
+    from api import tasks
+    from api.jobs import Entitlement, Job, JobStatus
+
+    store.create(
+        Job(
+            job_id="j-preview",
+            status=JobStatus.delivered,
+            entitlement=Entitlement.preview_only,
+            gallery_token="abc123XYZ98",
+        )
+    )
+    monkeypatch.setattr(
+        tasks,
+        "get_settings",
+        lambda: _settings(
+            jobs_root=str(tmp_path),
+            skydiveos_api_base="http://skydiveos.test",
+            public_base_url="https://freefall.ing",
+        ),
+    )
+    posted: dict[str, object] = {}
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, *, json, headers, timeout: (posted.update(json=json), _Resp())[1],  # noqa: ANN001
+    )
+
+    tasks._notify_skydiveos(store.load("j-preview"))
+
+    payload = posted["json"]
+    assert isinstance(payload, dict)
+    assert payload["entitlement"] == "preview_only"
+    assert payload["gallery_url"] == "https://freefall.ing/j/abc123XYZ98"
+
+
+def test_status_callback_omits_gallery_url_without_a_public_base(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx
+
+    from api import tasks
+    from api.jobs import Job, JobStatus
+
+    store.create(Job(job_id="j2", status=JobStatus.ready, gallery_token="abc123XYZ98"))
+    monkeypatch.setattr(
+        tasks,
+        "get_settings",
+        lambda: _settings(jobs_root=str(tmp_path), skydiveos_api_base="http://skydiveos.test"),
+    )
+    posted: dict[str, object] = {}
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, *, json, headers, timeout: (posted.update(json=json), _Resp())[1],  # noqa: ANN001
+    )
+
+    tasks._notify_skydiveos(store.load("j2"))
+
+    payload = posted["json"]
+    assert isinstance(payload, dict)
+    assert "gallery_url" not in payload
+    assert payload["entitlement"] == "edited_download"

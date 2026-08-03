@@ -10,11 +10,12 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from edl.schema import EditDecisionList
 
-from .jobs import Job, JobStatus, Package
+from .jobs import Entitlement, Job, JobStatus, Package
+from .lifecycle import MediaState, media_state
 
 
 class CreateJobRequest(BaseModel):
@@ -39,6 +40,21 @@ class CreateJobRequest(BaseModel):
     #: The instructor's display name — names their folder in the jump archive
     #: (``raw-storage/{date}/{instructor}/{customer}/``). Omitted → ``instructor_id``.
     instructor_name: str | None = Field(default=None, examples=["Marc Tremblay"])
+    #: Path A vs Path B: ``edited_download`` when the booking bought media,
+    #: ``preview_only`` for a speculative capture (watermarked preview + paywall).
+    #: Omitted → the :class:`Job` default (``edited_download``).
+    entitlement: Entitlement | None = Field(default=None, examples=["preview_only"])
+
+    @field_validator("entitlement", mode="before")
+    @classmethod
+    def _coerce_entitlement(cls, v: object) -> object:
+        """Accept the design doc's uppercase spellings (``PREVIEW_ONLY`` …).
+
+        Trimmed as well as lower-cased — a casing or whitespace mismatch on this
+        cross-service field must fail loudly (422) or resolve correctly, never
+        silently default to ``edited_download`` and give the edit away.
+        """
+        return v.strip().lower() if isinstance(v, str) else v
 
 
 class JobResponse(BaseModel):
@@ -48,6 +64,10 @@ class JobResponse(BaseModel):
 
     job_id: str
     status: JobStatus
+    #: The design doc's product-facing lifecycle state (Frame 02), **derived** from
+    #: ``status`` + ``entitlement`` + ``paid_at`` — never stored, so it can't drift.
+    #: Read-only: drive UI copy off this, drive the pipeline off ``status``.
+    media_state: MediaState
     customer_name: str
     customer_email: str | None
     jump_date: str | None
@@ -60,6 +80,11 @@ class JobResponse(BaseModel):
     instructor_id: str | None
     #: The instructor's display name (names their folder in the jump archive).
     instructor_name: str | None
+    #: Path A vs Path B lock state (``gallery_token`` itself is deliberately NOT
+    #: exposed here — the secret travels only via the status callback / delivery link).
+    entitlement: Entitlement
+    #: Epoch seconds when the paywall unlock was captured (``None`` = never).
+    paid_at: float | None
     reject_reason: str | None
     error: str | None
     #: Rendered deliverables, present (non-null) only once status == ready.
@@ -75,6 +100,7 @@ class JobResponse(BaseModel):
         return cls(
             job_id=job.job_id,
             status=job.status,
+            media_state=media_state(job),
             customer_name=job.customer_name,
             customer_email=job.customer_email,
             jump_date=job.jump_date,
@@ -85,6 +111,8 @@ class JobResponse(BaseModel):
             booking_id=job.booking_id,
             instructor_id=job.instructor_id,
             instructor_name=job.instructor_name,
+            entitlement=job.entitlement,
+            paid_at=job.paid_at,
             reject_reason=job.reject_reason,
             error=job.error,
             outputs=job.outputs,
@@ -246,6 +274,28 @@ class AssignCameraRequest(BaseModel):
     #: Two-camera (Ultimate) role: ``instructor`` (selfie cam) or ``external``
     #: (cameraman). Omit/``null`` for a single-camera setup.
     role: Literal["instructor", "external"] | None = Field(default=None, examples=["external"])
+
+
+class UnlockRequest(BaseModel):
+    """Body for ``POST /jobs/{id}/unlock`` — proof of the captured payment.
+
+    The reference is SkydiveOS's own payment/transaction id. It is **required**: an
+    unlock hands the customer the product, so it must be attributable to a real
+    capture rather than being an unattributable state flip. Persisted on the job as
+    ``payment_reference``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    payment_reference: str = Field(
+        min_length=1,
+        max_length=200,
+        description="SkydiveOS payment/transaction id for the captured unlock payment",
+        examples=["clover_txn_9f21c7"],
+    )
+    #: Optional amount captured, for the audit trail (display/reconciliation only —
+    #: this service never prices anything).
+    amount: float | None = Field(default=None, ge=0.0, examples=[39.0])
 
 
 class RejectRequest(BaseModel):

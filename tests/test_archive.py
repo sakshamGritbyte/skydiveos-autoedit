@@ -248,6 +248,129 @@ def test_archive_deliverables_splits_videos_and_photos(
     assert manifest["status"] == "ready"
 
 
+def test_archive_deliverables_mirrors_the_watermarked_previews(
+    store: JobStore, settings: Settings
+) -> None:
+    """Path B: preview/ holds what the locked customer watches, edited/ what they'd buy.
+
+    Previews are found by api.preview's ``preview_<name>.mp4`` convention (they're
+    deliberately absent from ``Job.outputs``), and the prefix is dropped so each
+    preview lines up with its master's name.
+    """
+    job = _job(store, entitlement="preview_only")
+    jd = store.dir(job.job_id)
+    (jd / "full_video.mp4").write_bytes(b"clean-master")
+    (jd / "preview_full_video.mp4").write_bytes(b"watermarked")
+    job = store.update(
+        job.job_id, status=JobStatus.ready, outputs={"full_video": str(jd / "full_video.mp4")}
+    )
+
+    jump_dir = archive.archive_deliverables(job, store, settings)
+    assert jump_dir is not None
+    assert (jump_dir / "edited" / "full_video.mp4").read_bytes() == b"clean-master"
+    assert (jump_dir / "preview" / "full_video.mp4").read_bytes() == b"watermarked"
+
+    manifest = json.loads((jump_dir / archive.MANIFEST_FILENAME).read_text())
+    assert manifest["preview"] == {"full_video": "preview/full_video.mp4"}
+    assert manifest["media_state"] == "LOCKED_PREVIEW"
+
+
+def test_path_a_job_archives_no_preview_section(store: JobStore, settings: Settings) -> None:
+    job = _job(store)
+    (store.dir(job.job_id) / "full_video.mp4").write_bytes(b"video")
+    job = store.update(
+        job.job_id,
+        status=JobStatus.ready,
+        outputs={"full_video": str(store.dir(job.job_id) / "full_video.mp4")},
+    )
+
+    jump_dir = archive.archive_deliverables(job, store, settings)
+    assert jump_dir is not None
+    assert not (jump_dir / "preview").exists()
+    manifest = json.loads((jump_dir / archive.MANIFEST_FILENAME).read_text())
+    assert "preview" not in manifest
+    assert manifest["media_state"] == "READY"
+
+
+# --------------------------------------------------------------------------- #
+# File hashes (the design doc's job.json digests)
+# --------------------------------------------------------------------------- #
+
+
+def test_manifest_records_a_sha256_per_archived_file(
+    store: JobStore, settings: Settings
+) -> None:
+    import hashlib
+
+    job = _job(store)
+    _raw(store, job, "GH010001.MP4")
+    archive.archive_raw_footage(job, store, settings)
+
+    jd = store.dir(job.job_id)
+    (jd / "full_video.mp4").write_bytes(b"video")
+    job = store.update(
+        job.job_id, status=JobStatus.ready, outputs={"full_video": str(jd / "full_video.mp4")}
+    )
+    jump_dir = archive.archive_deliverables(job, store, settings)
+    assert jump_dir is not None
+
+    files = json.loads((jump_dir / archive.MANIFEST_FILENAME).read_text())["files"]
+    # The render pass must not drop the raw pass's digests.
+    assert set(files) == {"raw/GH010001.MP4", "edited/full_video.mp4"}
+    assert files["edited/full_video.mp4"]["sha256"] == hashlib.sha256(b"video").hexdigest()
+    assert files["raw/GH010001.MP4"]["size"] == 16
+
+
+def test_digests_are_cached_until_a_file_changes(store: JobStore, settings: Settings) -> None:
+    """A 4K master is hashed once, not on every pipeline seam."""
+    job = _job(store)
+    _raw(store, job, "GH010001.MP4")
+    jump_dir = archive.archive_raw_footage(job, store, settings)
+    assert jump_dir is not None
+    rel = "raw/GH010001.MP4"
+
+    calls: list[Path] = []
+    real_sha256 = archive._sha256
+
+    def _counting(path: Path) -> str | None:
+        calls.append(path)
+        return real_sha256(path)
+
+    archive._sha256 = _counting  # type: ignore[assignment]
+    try:
+        archive.archive_raw_footage(job, store, settings)  # unchanged → cache hit
+        assert calls == []
+
+        # Re-ingest different content at the same path: the digest must follow.
+        placed = jump_dir / rel
+        placed.unlink()
+        (store.raw_dir(job.job_id) / "GH010001.MP4").write_bytes(b"different bytes here")
+        archive.archive_raw_footage(job, store, settings)
+        assert calls == [placed]
+    finally:
+        archive._sha256 = real_sha256  # type: ignore[assignment]
+
+    files = json.loads((jump_dir / archive.MANIFEST_FILENAME).read_text())["files"]
+    import hashlib
+
+    assert files[rel]["sha256"] == hashlib.sha256(b"different bytes here").hexdigest()
+
+
+def test_hashing_can_be_switched_off(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ARCHIVE_ROOT", str(tmp_path / "raw-storage"))
+    monkeypatch.setenv("ARCHIVE_HASHES", "0")
+    get_settings.cache_clear()
+    settings = get_settings()
+
+    job = _job(store)
+    _raw(store, job, "GH010001.MP4")
+    jump_dir = archive.archive_raw_footage(job, store, settings)
+    assert jump_dir is not None
+    assert "files" not in json.loads((jump_dir / archive.MANIFEST_FILENAME).read_text())
+
+
 def test_archive_deliverables_falls_back_to_final_mp4(
     store: JobStore, settings: Settings
 ) -> None:

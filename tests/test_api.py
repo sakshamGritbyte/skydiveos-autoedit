@@ -20,6 +20,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api.app import create_app, get_queue, get_store
+from api.config import get_settings
 from api.jobs import ADJUSTMENTS_FILENAME, JobStatus, JobStore
 from edl.schema import Clip, EditDecisionList
 from edl.storage import edl_path, job_dir
@@ -77,8 +78,8 @@ def client(tmp_path: Path, queue: FakeQueue) -> Iterator[TestClient]:
     app.dependency_overrides.clear()
 
 
-def _create(client: TestClient, **body: object) -> str:
-    resp = client.post("/jobs", json=body)
+def _create(client: TestClient, *, headers: dict[str, str] | None = None, **body: object) -> str:
+    resp = client.post("/jobs", json=body, headers=headers)
     assert resp.status_code == 201, resp.text
     return resp.json()["job_id"]
 
@@ -810,3 +811,498 @@ def test_openapi_documents_all_endpoints(client: TestClient) -> None:
             "/jobs/{job_id}/edl", "/jobs/{job_id}/approve", "/jobs/{job_id}/reject",
             "/jobs/{job_id}/tweak", "/jobs/{job_id}/preview"} <= set(paths)
     assert spec["info"]["title"] == "SkydiveOS Auto-Edit API"
+
+
+# --------------------------------------------------------------------------- #
+# Entitlement: Path A / Path B, the paywall unlock, and the /j/{code} gallery
+# --------------------------------------------------------------------------- #
+
+
+#: Every unlock must carry proof of a captured payment (F-16).
+_PAYMENT_BODY = {"payment_reference": "clover_txn_test"}
+
+
+def _token(client: TestClient, job_id: str) -> str:
+    """The job's gallery short code (minted at creation)."""
+    token = JobStore(client.jobs_root).load(job_id).gallery_token
+    assert token, "every job should carry a gallery token from creation"
+    return token
+
+
+def test_new_job_defaults_to_edited_download_and_gets_a_short_code(
+    client: TestClient,
+) -> None:
+    job_id = _create(client, customer_name="Sophie")
+    job = client.get(f"/jobs/{job_id}").json()
+    assert job["entitlement"] == "edited_download"  # Path A unless told otherwise
+    assert job["paid_at"] is None
+    token = _token(client, job_id)
+    assert 10 <= len(token) <= 12 and token.isalnum()  # SMS-short, base62
+    # The secret must not leak through the public job view.
+    assert "gallery_token" not in job
+
+
+def test_create_job_accepts_preview_only_in_either_casing(client: TestClient) -> None:
+    lower = _create(client, entitlement="preview_only")
+    upper = _create(client, entitlement="PREVIEW_ONLY")  # the design doc's spelling
+    for job_id in (lower, upper):
+        assert client.get(f"/jobs/{job_id}").json()["entitlement"] == "preview_only"
+
+
+def test_each_job_gets_a_distinct_short_code(client: TestClient) -> None:
+    codes = {_token(client, _create(client)) for _ in range(5)}
+    assert len(codes) == 5
+
+
+def test_unlock_flips_entitlement_and_stamps_paid_at(client: TestClient) -> None:
+    job_id = _create(client, entitlement="preview_only")
+    resp = client.post(f"/jobs/{job_id}/unlock", json=_PAYMENT_BODY)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["entitlement"] == "edited_download"
+    assert body["paid_at"] and body["paid_at"] > 0
+
+
+def test_unlock_is_idempotent_and_never_touches_status(client: TestClient) -> None:
+    job_id = _create(client, entitlement="preview_only")
+    _mark(client, job_id, JobStatus.ready)  # where the scene pipeline leaves a job
+    first = client.post(f"/jobs/{job_id}/unlock", json=_PAYMENT_BODY).json()
+    second = client.post(f"/jobs/{job_id}/unlock", json=_PAYMENT_BODY).json()
+    assert second["entitlement"] == "edited_download"
+    assert second["paid_at"] == first["paid_at"]  # not re-stamped
+    assert second["status"] == "ready"  # the review/delivery machine is untouched
+
+
+def test_unlock_on_an_already_unlocked_job_is_a_no_op(client: TestClient) -> None:
+    job_id = _create(client)  # already edited_download
+    body = client.post(f"/jobs/{job_id}/unlock", json=_PAYMENT_BODY).json()
+    assert body["entitlement"] == "edited_download"
+    assert body["paid_at"] is None  # nothing was purchased, so nothing is stamped
+
+
+def test_unlock_unknown_job_is_404(client: TestClient) -> None:
+    assert client.post("/jobs/nope/unlock", json=_PAYMENT_BODY).status_code == 404
+
+
+def _rendered(client: TestClient, job_id: str, *, locked: bool) -> None:
+    """Put clean masters (and, when locked, the watermarked previews) on disk."""
+    store = JobStore(client.jobs_root)
+    jd = store.dir(job_id)
+    jd.mkdir(parents=True, exist_ok=True)
+    (jd / "full_video.mp4").write_bytes(b"CLEAN-MASTER-BYTES")
+    if locked:
+        (jd / "preview_full_video.mp4").write_bytes(b"WATERMARKED")
+    store.update(
+        job_id, status=JobStatus.ready, outputs={"full_video": str(jd / "full_video.mp4")}
+    )
+
+
+def test_gallery_page_renders_unlocked_with_downloads(client: TestClient) -> None:
+    job_id = _create(client, customer_name="Sophie Lavoie")
+    _rendered(client, job_id, locked=False)
+    resp = client.get(f"/j/{_token(client, job_id)}")
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers["content-type"]
+    assert "Sophie Lavoie" in resp.text
+    assert "Your jump is ready" in resp.text
+    assert "Unlock full video" not in resp.text
+
+
+def test_gallery_page_renders_locked_with_the_paywall(client: TestClient) -> None:
+    job_id = _create(client, entitlement="preview_only", customer_name="Sophie")
+    _rendered(client, job_id, locked=True)
+    resp = client.get(f"/j/{_token(client, job_id)}", params={"s": "e"})
+    assert resp.status_code == 200
+    assert "We filmed it anyway" in resp.text
+    assert "Unlock full video" in resp.text
+    assert "720P PREVIEW" in resp.text
+
+
+def test_gallery_page_shows_the_hero_meta_and_download_action(client: TestClient) -> None:
+    """Frame 03: date · product · instructor, then one primary download button."""
+    job_id = _create(
+        client,
+        customer_name="Sophie Lavoie",
+        instructor_name="Marc Tremblay",
+        jump_date="2026-08-14",
+        package="selfie",
+    )
+    _rendered(client, job_id, locked=False)
+    page = client.get(f"/j/{_token(client, job_id)}").text
+    assert "14 AUG 2026" in page
+    assert "Tandem · Handcam" in page
+    assert "Instructor Marc Tremblay" in page
+    assert "1080P · FULL QUALITY" in page
+    assert "Download video" in page
+    assert "yours to keep" in page
+
+
+def test_gallery_shows_the_upsell_row_in_both_states(client: TestClient) -> None:
+    """The row is entitlement-independent — the operator's second revenue line."""
+    for locked in (False, True):
+        job_id = _create(client, entitlement="preview_only" if locked else "edited_download")
+        _rendered(client, job_id, locked=locked)
+        page = client.get(f"/j/{_token(client, job_id)}").text
+        assert "Add to your day" in page
+        for title in ("Raw Footage", "Photo Pack", "Book Again"):
+            assert title in page
+
+
+def test_upsell_tiles_link_through_the_checkout_template(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CHECKOUT_URL_TEMPLATE", "https://pay.test/c?j={job_id}&i={item}")
+    monkeypatch.setenv("UPSELL_TILES", "raw:Raw Footage:Every unedited minute:$29")
+    get_settings.cache_clear()
+    try:
+        job_id = _create(client, entitlement="preview_only")
+        _rendered(client, job_id, locked=True)
+        page = client.get(f"/j/{_token(client, job_id)}").text
+        # {item} resolves per tile, and the unlock CTA still resolves with it present.
+        assert f'href="https://pay.test/c?j={job_id}&amp;i=raw"' in page
+        assert f'href="https://pay.test/c?j={job_id}&amp;i=unlock"' in page
+    finally:
+        get_settings.cache_clear()
+
+
+def test_job_response_carries_the_derived_media_state(client: TestClient) -> None:
+    """The design doc's Frame 02 vocabulary, projected from status + entitlement."""
+    job_id = _create(client, entitlement="preview_only")
+    assert client.get(f"/jobs/{job_id}").json()["media_state"] == "PENDING_CAPTURE"
+    _mark(client, job_id, JobStatus.processing)
+    assert client.get(f"/jobs/{job_id}").json()["media_state"] == "EDITING"
+    _mark(client, job_id, JobStatus.ready)
+    assert client.get(f"/jobs/{job_id}").json()["media_state"] == "LOCKED_PREVIEW"
+    # Unlock is the only thing that moves the paywall — status stays put.
+    body = client.post(f"/jobs/{job_id}/unlock", json=_PAYMENT_BODY).json()
+    assert body["media_state"] == "UNLOCKED" and body["status"] == "ready"
+
+
+def test_gallery_ignores_any_source_tag(client: TestClient) -> None:
+    """``?s=`` is analytics for SkydiveOS, never auth or lock state."""
+    job_id = _create(client, entitlement="preview_only")
+    _rendered(client, job_id, locked=True)
+    token = _token(client, job_id)
+    plain = client.get(f"/j/{token}")
+    tagged = client.get(f"/j/{token}", params={"s": "m"})
+    spoofed = client.get(f"/j/{token}", params={"s": "edited_download"})
+    assert plain.status_code == tagged.status_code == spoofed.status_code == 200
+    assert plain.text == tagged.text == spoofed.text
+    assert "Unlock full video" in spoofed.text  # can't talk your way past the paywall
+
+
+def test_gallery_before_the_render_shows_a_still_editing_page(client: TestClient) -> None:
+    job_id = _create(client)
+    resp = client.get(f"/j/{_token(client, job_id)}")
+    assert resp.status_code == 200
+    assert "still being edited" in resp.text
+
+
+def test_unknown_gallery_code_is_404(client: TestClient) -> None:
+    assert client.get("/j/deadbeef123").status_code == 404
+    assert client.get("/j/deadbeef123/media/full_video").status_code == 404
+
+
+def test_locked_gallery_serves_only_the_watermarked_preview(client: TestClient) -> None:
+    """The entitlement, never the URL, picks the file — the master stays unreachable."""
+    job_id = _create(client, entitlement="preview_only")
+    _rendered(client, job_id, locked=True)
+    resp = client.get(f"/j/{_token(client, job_id)}/media/full_video")
+    assert resp.status_code == 200
+    assert resp.content == b"WATERMARKED"
+    assert b"CLEAN-MASTER-BYTES" not in resp.content
+
+
+def test_unlock_makes_the_gallery_serve_the_clean_master(client: TestClient) -> None:
+    job_id = _create(client, entitlement="preview_only")
+    _rendered(client, job_id, locked=True)
+    token = _token(client, job_id)
+    assert client.get(f"/j/{token}/media/full_video").content == b"WATERMARKED"
+
+    client.post(f"/jobs/{job_id}/unlock", json=_PAYMENT_BODY)
+
+    # Same URL, same token — no re-render, no re-delivery, just the clean file.
+    assert client.get(f"/j/{token}/media/full_video").content == b"CLEAN-MASTER-BYTES"
+    assert "Unlock full video" not in client.get(f"/j/{token}").text
+
+
+def test_locked_gallery_hides_the_photos(client: TestClient) -> None:
+    job_id = _create(client, entitlement="preview_only")
+    _rendered(client, job_id, locked=True)
+    store = JobStore(client.jobs_root)
+    photos = store.dir(job_id) / "photos"
+    photos.mkdir(parents=True, exist_ok=True)
+    (photos / "a.jpg").write_bytes(b"jpeg")
+    (photos / "index.json").write_text(json.dumps([{"filename": "a.jpg"}]))
+    token = _token(client, job_id)
+
+    page = client.get(f"/j/{token}")
+    assert "1 photos included" in page.text  # a teaser, not the grid
+    assert client.get(f"/j/{token}/photos/a.jpg").status_code == 404
+
+    client.post(f"/jobs/{job_id}/unlock", json=_PAYMENT_BODY)
+    assert client.get(f"/j/{token}/photos/a.jpg").status_code == 200
+
+
+def test_gallery_media_route_rejects_traversal_and_unknown_names(
+    client: TestClient,
+) -> None:
+    job_id = _create(client)
+    _rendered(client, job_id, locked=False)
+    token = _token(client, job_id)
+    for name in ("../job", "../../etc/passwd", "highlights", "photos"):
+        assert client.get(f"/j/{token}/media/{name}").status_code in (404, 400)
+    for filename in ("../job.json", "..%2Fjob.json"):
+        assert client.get(f"/j/{token}/photos/{filename}").status_code in (404, 400)
+
+
+def test_gallery_needs_no_identity_headers_even_when_auth_is_enforced(
+    tmp_path: Path, queue: FakeQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The customer has no SkydiveOS account — the short code is the only credential."""
+    monkeypatch.setenv("ENFORCE_INSTRUCTOR_AUTH", "1")
+    from api.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        app = create_app()
+        store = JobStore(tmp_path)
+        app.dependency_overrides[get_store] = lambda: store
+        app.dependency_overrides[get_queue] = lambda: queue
+        with TestClient(app) as c:
+            c.jobs_root = tmp_path
+            # Set up as SkydiveOS would (an admin caller); the customer has no identity.
+            admin = {"X-Instructor-Id": "root", "X-Role": "admin"}
+            resp = c.post(
+                "/jobs",
+                json={"entitlement": "preview_only", "customer_name": "Sophie"},
+                headers=admin,
+            )
+            assert resp.status_code == 201, resp.text
+            job_id = resp.json()["job_id"]
+            store.update(job_id, instructor_id="inst-42")  # owned by someone
+            _rendered(c, job_id, locked=True)
+            token = _token(c, job_id)
+            # An instructor-scoped route is unreachable without the header …
+            assert c.get(f"/jobs/{job_id}").status_code == 401
+            # … but the customer's gallery works with no identity at all.
+            assert c.get(f"/j/{token}").status_code == 200
+            assert c.get(f"/j/{token}/media/full_video").status_code == 200
+    finally:
+        get_settings.cache_clear()
+
+
+# --------------------------------------------------------------------------- #
+# Path B go-live gate: a locked job may only be CREATED where it can be delivered.
+#
+# Delivery refuses the legacy S3 gallery for a preview_only job (it would presign the
+# clean master), so without PUBLIC_BASE_URL such a job is undeliverable. Catch it at
+# creation — before footage, before a render — so the delivery-time failure can never
+# be reached in production.
+# --------------------------------------------------------------------------- #
+
+
+def test_preview_only_is_refused_without_a_public_base_url(
+    tmp_path: Path, queue: FakeQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+    get_settings.cache_clear()
+    try:
+        app = create_app()
+        store = JobStore(tmp_path)
+        app.dependency_overrides[get_store] = lambda: store
+        app.dependency_overrides[get_queue] = lambda: queue
+        with TestClient(app) as c:
+            c.jobs_root = tmp_path
+            resp = c.post(
+                "/jobs", json={"entitlement": "preview_only", "customer_name": "Sophie"}
+            )
+            assert resp.status_code == 422
+            assert "PUBLIC_BASE_URL" in resp.text
+            assert c.get("/jobs").json()["count"] == 0  # nothing was created
+    finally:
+        get_settings.cache_clear()
+
+
+def test_preview_only_is_accepted_once_the_gallery_has_an_origin(
+    client: TestClient,
+) -> None:
+    """The pinned test env sets PUBLIC_BASE_URL — the deliverable configuration."""
+    resp = client.post("/jobs", json={"entitlement": "PREVIEW_ONLY"})
+    assert resp.status_code == 201
+    assert resp.json()["job"]["entitlement"] == "preview_only"
+    assert resp.json()["job"]["media_state"] == "PENDING_CAPTURE"
+
+
+def test_path_a_creation_never_needs_a_public_base_url(client: TestClient) -> None:
+    """Regression guard: the paid flow is untouched by the gate."""
+    for body in ({}, {"entitlement": "edited_download"}, {"customer_name": "Ann"}):
+        assert client.post("/jobs", json=body).status_code == 201
+
+
+# --------------------------------------------------------------------------- #
+# The service-token gate (risk probe / Fix #4).
+#
+# The hole this closes, verified against production on 2026-08-03: the service is
+# internet-facing (the SkydiveOS frontend was built to call it from the browser),
+# its identity headers are self-asserted, and with ENFORCE_INSTRUCTOR_AUTH off
+# every anonymous caller is an admin — so `GET /jobs` returned every customer's
+# name, email and delivery links, and /deliverables/{name} streamed their video.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def gated(tmp_path: Path, queue: FakeQueue, monkeypatch: pytest.MonkeyPatch):
+    """A client whose app requires the shared service token (AUTO_EDIT_API_KEY)."""
+    monkeypatch.setenv("AUTO_EDIT_API_KEY", "s3cret-token")
+    get_settings.cache_clear()
+    app = create_app()
+    store = JobStore(tmp_path)
+    app.dependency_overrides[get_store] = lambda: store
+    app.dependency_overrides[get_queue] = lambda: queue
+    try:
+        with TestClient(app) as c:
+            c.jobs_root = tmp_path
+            yield c
+    finally:
+        app.dependency_overrides.clear()
+        get_settings.cache_clear()
+
+
+_AUTH = {"Authorization": "Bearer s3cret-token"}
+
+
+def test_anonymous_calls_are_rejected_when_the_token_is_set(gated: TestClient) -> None:
+    """Every staff/admin surface — including the enumeration that leaked PII."""
+    for path in ("/jobs", "/cameras", "/docs", "/openapi.json"):
+        resp = gated.get(path)
+        assert resp.status_code == 401, f"{path} was reachable anonymously"
+        assert "s3cret-token" not in resp.text  # never echo the secret
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"Authorization": "Bearer wrong-token"},
+        {"Authorization": "s3cret-token"},          # no scheme
+        {"Authorization": "Basic s3cret-token"},    # wrong scheme
+        {"Authorization": "Bearer "},
+        {"Authorization": "Bearer s3cret-token "},  # trailing space is tolerated
+        {"X-Role": "admin", "X-Instructor-Id": "root"},  # self-asserted ≠ authorised
+    ],
+)
+def test_only_the_exact_bearer_token_is_accepted(
+    gated: TestClient, headers: dict[str, str]
+) -> None:
+    expected = 200 if headers.get("Authorization", "").strip() == "Bearer s3cret-token" else 401
+    assert gated.get("/jobs", headers=headers).status_code == expected
+
+
+def test_the_customer_gallery_stays_public_under_the_gate(gated: TestClient) -> None:
+    """The one exemption: a customer holds a short code, not a service token."""
+    job_id = _create(gated, headers=_AUTH)
+    _rendered(gated, job_id, locked=False)
+    token = _token(gated, job_id)
+
+    assert gated.get(f"/j/{token}").status_code == 200
+    assert gated.get(f"/j/{token}/media/full_video").status_code == 200
+    assert gated.get(f"/j/{token}/photos/nope.jpg").status_code in (400, 404)
+    # And the gate is still shut on the job routes behind that same gallery.
+    assert gated.get(f"/jobs/{job_id}").status_code == 401
+
+
+def test_a_deliverable_cannot_be_streamed_anonymously(gated: TestClient) -> None:
+    job_id = _create(gated, headers=_AUTH)
+    _rendered(gated, job_id, locked=False)
+    assert gated.get(f"/jobs/{job_id}/deliverables/full_video").status_code == 401
+    assert (
+        gated.get(f"/jobs/{job_id}/deliverables/full_video", headers=_AUTH).status_code == 200
+    )
+
+
+def test_path_a_flow_is_unchanged_when_no_token_is_configured(client: TestClient) -> None:
+    """Regression guard: with AUTO_EDIT_API_KEY unset nothing needs a header."""
+    job_id = _create(client)
+    assert client.get("/jobs").status_code == 200
+    assert client.get(f"/jobs/{job_id}").status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# Unlock hardening (F-16): admin + service token + payment proof
+# --------------------------------------------------------------------------- #
+
+_PAYMENT = {"payment_reference": "clover_txn_9f21c7"}
+
+
+def test_unlock_requires_the_service_token(gated: TestClient) -> None:
+    """Anonymous unlock = a free video. This is the revenue-leak test."""
+    job_id = _create(gated, entitlement="preview_only", headers=_AUTH)
+    assert gated.post(f"/jobs/{job_id}/unlock", json=_PAYMENT).status_code == 401
+    # The paywall did not move.
+    assert (
+        gated.get(f"/jobs/{job_id}", headers=_AUTH).json()["entitlement"] == "preview_only"
+    )
+
+
+def test_unlock_requires_a_payment_reference(gated: TestClient) -> None:
+    job_id = _create(gated, entitlement="preview_only", headers=_AUTH)
+    for body in ({}, {"payment_reference": ""}, {"amount": 39.0}):
+        resp = gated.post(f"/jobs/{job_id}/unlock", json=body, headers=_AUTH)
+        assert resp.status_code == 422, body
+    assert (
+        gated.get(f"/jobs/{job_id}", headers=_AUTH).json()["entitlement"] == "preview_only"
+    )
+
+
+def test_unlock_requires_an_admin_role(
+    tmp_path: Path, queue: FakeQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plain instructor identity must not be able to self-serve an unlock."""
+    monkeypatch.setenv("AUTO_EDIT_API_KEY", "s3cret-token")
+    monkeypatch.setenv("ENFORCE_INSTRUCTOR_AUTH", "1")
+    get_settings.cache_clear()
+    try:
+        app = create_app()
+        store = JobStore(tmp_path)
+        app.dependency_overrides[get_store] = lambda: store
+        app.dependency_overrides[get_queue] = lambda: queue
+        with TestClient(app) as c:
+            c.jobs_root = tmp_path
+            admin = {**_AUTH, "X-Instructor-Id": "root", "X-Role": "admin"}
+            job_id = c.post(
+                "/jobs", json={"entitlement": "preview_only"}, headers=admin
+            ).json()["job_id"]
+            store.update(job_id, instructor_id="inst-42")
+
+            instructor = {**_AUTH, "X-Instructor-Id": "inst-42", "X-Role": "instructor"}
+            assert (
+                c.post(f"/jobs/{job_id}/unlock", json=_PAYMENT, headers=instructor).status_code
+                == 403
+            )
+            # The owning admin can.
+            ok = c.post(f"/jobs/{job_id}/unlock", json=_PAYMENT, headers=admin)
+            assert ok.status_code == 200 and ok.json()["entitlement"] == "edited_download"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_authorised_unlock_records_the_payment_reference(gated: TestClient) -> None:
+    job_id = _create(gated, entitlement="preview_only", headers=_AUTH)
+    body = gated.post(f"/jobs/{job_id}/unlock", json=_PAYMENT, headers=_AUTH).json()
+
+    assert body["entitlement"] == "edited_download"
+    assert body["paid_at"] > 0
+    # Every unlock is attributable to a real capture.
+    assert JobStore(gated.jobs_root).load(job_id).payment_reference == "clover_txn_9f21c7"
+
+
+def test_unlock_stays_idempotent_and_keeps_the_first_reference(gated: TestClient) -> None:
+    job_id = _create(gated, entitlement="preview_only", headers=_AUTH)
+    first = gated.post(f"/jobs/{job_id}/unlock", json=_PAYMENT, headers=_AUTH).json()
+    second = gated.post(
+        f"/jobs/{job_id}/unlock", json={"payment_reference": "a-retry"}, headers=_AUTH
+    ).json()
+
+    assert second["paid_at"] == first["paid_at"]  # not re-stamped
+    assert JobStore(gated.jobs_root).load(job_id).payment_reference == "clover_txn_9f21c7"

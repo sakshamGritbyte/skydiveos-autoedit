@@ -43,9 +43,11 @@ Two runtime media roots, with different audiences:
     <Instructor-Name>/
       <Customer-Name>/
         raw/          — camera masters as ingested (instructor/ + external/ for ultimum)
-        edited/       — the rendered deliverables
+        edited/       — the rendered deliverables (the clean masters)
+        preview/      — the watermarked 720p previews (preview_only jobs)
         photos/       — the selected stills
-        manifest.json — job id, booking, package, status, files, delivery links
+        manifest.json — job id, booking, package, status, media_state, delivery links,
+                        and `files`: a sha256 per archived file (cached by size+mtime)
   _camera-staging/    — per-camera card mirror from a pull: <camera_id>/<date>/ (machine-owned)
 ```
 
@@ -64,10 +66,13 @@ Two runtime media roots, with different audiences:
    `AUTO_DELIVER=1`: a finished render is auto-approved and delivery fires immediately)
 7. **Deliver** — `api/delivery.py`: upload every rendered deliverable to
    `s3://$S3_BUCKET/deliveries/{job_id}/` (a photos dir is zipped first), presign
-   download links (`DELIVERY_LINK_TTL_DAYS`, ≤7), email them to `Job.customer_email`
-   via SMTP, persist them as `Job.delivery_links`, and forward them in the SkydiveOS
-   status callback. Missing email/SMTP is tolerated only if `SKYDIVEOS_API_BASE` is
-   set to forward the links; otherwise the job fails rather than lying `delivered`.
+   download links (`DELIVERY_LINK_TTL_DAYS`, ≤7), email the **customer gallery link**
+   to `Job.customer_email` via SMTP, persist the links as `Job.delivery_links`, and
+   forward them + `entitlement` + `gallery_url` in the SkydiveOS status callback.
+   Missing email/SMTP is tolerated only if `SKYDIVEOS_API_BASE` is set to forward the
+   links; otherwise the job fails rather than lying `delivered`. With
+   `PUBLIC_BASE_URL` set the customer link is the **served** `/j/{code}` gallery
+   (never expires, flips on unlock); unset falls back to the legacy S3 `gallery.html`.
 
 ## Key Conventions
 - All timestamps in seconds (float), not frames
@@ -77,7 +82,7 @@ Two runtime media roots, with different audiences:
 - One job per jump; jobs are idempotent and resumable
 - **Jump archive** (`api/archive.py`): `jobs/<job_id>/` stays the pipeline's opaque
   working dir, and every job is *mirrored* into the human-browsable
-  `<ARCHIVE_ROOT>/{jump date}/{instructor}/{customer}/{raw,edited,photos}/` + a
+  `<ARCHIVE_ROOT>/{jump date}/{instructor}/{customer}/{raw,edited,preview,photos}/` + a
   `manifest.json`. `ARCHIVE_ROOT` defaults to `$RAW_STORAGE_ROOT` (`./raw-storage`).
   Called at every "footage landed" seam (both `POST /jobs/{id}/upload` paths,
   `ingest_s3_job`, `pull_camera_job`) and every "render finished" seam (`process_job`,
@@ -91,7 +96,13 @@ Two runtime media roots, with different audiences:
   `instructor_id`, then `_no-instructor`) and `Job.customer_name`. Two different jumps
   that would collide (same day, instructor, and customer name) get a job-id-suffixed
   sibling rather than merging — ownership is recorded in the manifest's `job_id`.
-  Backfill or re-file with `python scripts/archive_job.py`.
+  Backfill or re-file with `python scripts/archive_job.py`. A Path-B job's watermarked
+  previews are mirrored into `preview/` (found by `api.preview`'s `preview_<name>.mp4`
+  convention, prefix stripped so `preview/full_video.mp4` lines up with
+  `edited/full_video.mp4`), and the manifest carries a **sha256 per file**
+  (`ARCHIVE_HASHES`, on by default) so an operator can prove a master is the one that
+  was ingested — digests are **cached by (size, mtime)** in the manifest, so a 4K file
+  is read once no matter how many seams fire, and hashing never runs on the photo set.
 - Never call Claude API in a tight loop — one call per jump, max
 - A job's **package** (`api.jobs.Package`) selects the pipeline & deliverables. Most
   run through the multi-clip scene pipeline (`api/selfie.py`): `selfie`/`external`
@@ -185,6 +196,81 @@ Two runtime media roots, with different audiences:
   is already named or the library is empty. Drop 2–4 licensed tracks in
   `templates/music/` for real variety (see its README) — with one track it always
   picks that one.
+- **Entitlement = the "film it anyway" paywall** (`api.jobs.Entitlement`, business
+  decision 2026-07 / Media Module design doc REV 03). Every jump is filmed whether or
+  not the customer paid; `Job.entitlement` decides what their gallery shows:
+  `edited_download` (Path A — media purchased: the clean 1080p deliverables, downloads
+  enabled) or `preview_only` (Path B — speculative capture: watermarked 720p previews
+  behind an unlock CTA, photos hidden behind a count teaser). SkydiveOS sends it on
+  `POST /jobs`; `ingest.match.package_and_entitlement_for` derives it for our own
+  matcher (no purchase → the role-default package + `preview_only`, instead of the old
+  "no job at all"). Four rules:
+  * **The clean masters are ALWAYS rendered and delivered to S3**, both paths. Path B
+    then adds a cheap second-pass transcode per video (`api/preview.py` →
+    `<job_dir>/preview_<name>.mp4`, 720p + a Pillow watermark PNG composited with
+    `overlay` — see `render/watermark.py`). So `POST /jobs/{id}/unlock` is instant:
+    no re-render, no re-delivery, same link. Previews are found by the `preview_`
+    filename convention and are deliberately **NOT** in `Job.outputs` (they'd leak
+    into the S3 delivery set and the duplicated deliverable-name maps).
+  * **A `preview_only` job whose preview render fails, fails** (`_render_previews`
+    runs inside each task's `try`) — a locked gallery with nothing watchable breaks
+    the product, and the raw footage is archived so a re-queue is cheap. An
+    `edited_download` job returns early and gains no new failure mode.
+  * **The entitlement — never the URL — picks the file** at `GET /j/{code}/media/{name}`:
+    while locked the clean master is unreachable at any URL. `locked` is computed **per
+    request**, so unlock flips the page with no regeneration.
+  * **`POST /jobs/{id}/unlock` is idempotent and never touches `status`** — it sets
+    `entitlement`+`paid_at`+`payment_reference` only, staying clear of the
+    review/delivery machine (notably the `ready` vs `ready_for_review` approve quirk).
+    It gives the product away, so it is the one endpoint with three gates: the
+    **service token**, the **admin** role, and a non-empty **`payment_reference`**
+    (SkydiveOS's captured-transaction id, persisted so every unlock is auditable).
+    SkydiveOS calls it server-to-server from the payment-captured seam
+    (`paymentEventHandler` → `autoEditOrchestrationService.unlockPaidMedia`), gated on
+    `paymentScope === 'media-unlock'` so paying for the *jump* never unlocks media.
+  * **A locked job is delivered as the `/j/{code}` gallery or not at all**
+    (`api/delivery.py`). A presigned URL answers to whoever holds it — there is no
+    entitlement check on a URL — so a `preview_only` job mints **none**: the masters
+    and photo zip still upload to S3 (durable; what `/unlock` serves instantly) with
+    `presign=False`, and delivery **fails with an actionable error** if
+    `PUBLIC_BASE_URL` is unset rather than falling back to the legacy S3 gallery,
+    which embeds presigned *clean masters* and would hand over the unbought edit
+    (it also persists them on the job, mirrors them into the archive manifest, and
+    forwards them to SkydiveOS).
+- **The customer gallery is a LIVE route, not a file** (`GET /j/{code}` in `api.app`,
+  HTML from the pure `api.gallery.render_gallery_html`). `Job.gallery_token` is an
+  11-char base62 short code minted once at `POST /jobs` (stable across replays, like
+  the persisted music pick) so the link is SMS-short and never changes:
+  `{PUBLIC_BASE_URL}/j/{code}?s=e#tab-video` — `?s=` is an opaque source tag the
+  server accepts and **ignores** (never auth, never lock state), `#tab-video` picks
+  the Video/Photos tab. The code is the page's **only** credential: `/j/` carries no
+  `{job_id}` so `enforce_job_ownership` is a no-op, and `api.auth.PUBLIC_PATH_PREFIX`
+  resolves these requests to an anonymous owns-nothing principal even when
+  `ENFORCE_INSTRUCTOR_AUTH=1` (the customer has no SkydiveOS account). Never log a
+  token. Media streams from the job dir per request (`FileResponse`, range-enabled),
+  so nothing expires — S3 stays the durable copy. With `PUBLIC_BASE_URL` unset,
+  delivery falls back to the legacy presigned S3 `gallery.html` unchanged.
+- **The landing page's two states share ONE layout** (design doc Frame 03): the hero
+  (`eyebrow · customer · "14 AUG 2026 · Tandem · Handcam · Instructor Marc Tremblay"`),
+  the players, and the upsell row are identical; only the **player treatment** (`1080P ·
+  FULL QUALITY` vs `720P PREVIEW` + `nodownload`) and the **primary action** (green
+  `⬇ Download video` + "1080p MP4 · 214 MB · yours to keep" vs amber `🔒 Unlock full
+  video — $39`) change — so the paid path never feels like a different product. The
+  accent colour is the state (`#5bbd84` unlocked / `#e2a13f` locked) on the `#0c1218`
+  base. The **"Add to your day" upsell row is entitlement-independent** (`api/upsell.py`,
+  `$UPSELL_TILES` → `key:title:blurb:price|…`, linked through
+  `CHECKOUT_URL_TEMPLATE`'s extra `{item}` placeholder): it's the operator's second
+  revenue line whether or not the video was pre-purchased, so it renders on both pages
+  and on the legacy S3 fallback. A malformed tile is dropped, and a tile with no
+  checkout URL renders as **text** — same rule as the unlock CTA, never a dead link.
+- **`media_state` is a DERIVED view, not a status** (`api/lifecycle.py`). The design
+  doc's Frame 02 machine (`PENDING_CAPTURE → … → READY →` `DELIVERED` |
+  `LOCKED_PREVIEW → UNLOCKED`, `FAILED`) is offered to SkydiveOS as a *projection* of
+  `(status, entitlement, paid_at)` — exposed read-only on `JobResponse`, the status
+  callback, and the archive manifest — because the two axes move independently:
+  `POST /jobs/{id}/unlock` must flip the paywall **without** touching `status`. It is
+  pure, never persisted (so it can't drift), and nothing in the pipeline branches on
+  it: drive UI copy off `media_state`, drive the pipeline off `JobStatus`.
 
 ## Bash Commands
 - `pip install -r requirements.txt` — install Python deps
@@ -213,7 +299,11 @@ Two runtime media roots, with different audiences:
   render to S3, presigns links, and emails them — catching the mail in a throwaway
   local SMTP sink (`aiosmtpd`) so you see the exact customer email with no real mail
   server. `--email/--smtp-host/...` to send for real, `--no-email` for links only,
-  `--source` for your own footage, `--keep` to retain the S3 uploads (default: deleted)
+  `--source` for your own footage, `--keep` to retain the S3 uploads (default: deleted).
+  `--preview-only` runs the **Path B** flow instead and asserts the paywall end to end:
+  watermarked previews rendered → locked `/j/{code}` page serves the *preview* bytes →
+  `POST /unlock` → same URL now serves the clean master. Exits non-zero if the lock
+  ever leaks the master or the unlock doesn't flip
 - `python scripts/qa_all_packages.py [--packages <p,…>] [--email <you>] [--no-email]` —
   the pre-demo audit: drives **every** package through the live API (no GoPro — it
   reuses the real masters already in `jobs/*/raw/`) and then opens each job's working
@@ -241,6 +331,15 @@ Two runtime media roots, with different audiences:
   cameras owned by nobody); `--day` replays every load that day as one simulated clip
   per camera and prints `deliverable / no-media / FAILED`, exiting non-zero on any
   FAILED — a morning pre-flight before jumping
+- `python scripts/demo_from_load.py --dir <folder-of-MP4s> [--serial <s>] [--api <url>]`
+  — drive the FULL edit→deliver flow from a camera's footage matched to the load it
+  belongs to, bypassing discovery/BLE/WiFi. Reads the earliest clip's capture time,
+  resolves it via `ingest.match.FootageMatcher` (serial → today's load → jumper →
+  customer + package + role), prints the match, then drives the live API exactly as
+  `demo_full_auto` does — so the gallery is delivered to *the customer on the load*, not
+  a name you typed. The workaround when the unattended pull is blocked (macOS Wi-Fi, a
+  headless service without Location Services, or SkydiveOS not yet turning the raw-upload
+  into a job). Needs `MONGO_URL` + the auto-edit API at `--api` with `AUTO_DELIVER=1`
 - `python scripts/diagnose_ultimum.py <job_id>` — read-only diagnostic for an Ultimate job: per-camera scene classification, combo clip selection by `(camera, scene)`, video-vs-audio stream-duration sync on scene files + rendered outputs (catches the "video freezes, audio continues" desync), per-camera freefall cuts, and photo count — with findings flagging a camera collapsed to one scene, the cameraman absent from a scene, or any desync
 - `ffmpeg -version` — must be 6.0+ for our speed-ramp filter
 - `uvicorn api.app:app --reload` — serve the /api FastAPI service (OpenAPI docs at `/docs`); SkydiveOS calls it to create jobs, upload footage, review, approve, and stream previews
@@ -263,6 +362,20 @@ Two runtime media roots, with different audiences:
   to keep the file) — that return value *is* the delete authorisation
 - `CAMERA_SCANNER` selects the discovery transport: `ble` (default — BLE scan + WiFi pull, wireless), `usb` (mDNS detect + `ingest.camera.WiredGoProCamera` pull — the kiosk path, one camera per scan), or `static` (no-hardware simulation: `StaticCameraScanner` + `ingest.camera.LocalSampleCamera` stage `DISCOVERY_SAMPLE_MP4` through the *real* pull path; needs `DISCOVERY_FAKE_CAMERAS`). USB and WiFi share one HTTP download path (`_SdkGoProCamera`); both need the hardware-only Open GoPro SDK.
 - `python scripts/check_camera.py --usb` / `--wifi --camera <id>` — hardware smoke test: open a real GoPro and list its media (read-only), using the same Camera classes the pull uses. Verifies the SDK + connectivity before enabling discovery.
+- **The service-token gate is what makes this API safe to expose** (`api.auth`
+  `service_token_allows`, enforced as a middleware in `create_app`). Every route
+  except `/j/*` needs `Authorization: Bearer $AUTO_EDIT_API_KEY` — the value
+  SkydiveOS already sends. It's a **middleware, not a route dependency**, because
+  FastAPI serves `/docs` / `/openapi.json` as raw Starlette routes that skip app
+  dependencies. Off until the env var is set (same opt-in pattern as
+  `ENFORCE_INSTRUCTOR_AUTH`); `OPTIONS` is exempt so CORS preflight still works.
+  Why it exists: identity here is **self-asserted** (`X-Instructor-Id`/`X-Role`), so
+  with enforcement off every caller is an admin — and the service is internet-facing
+  (the SkydiveOS frontend was built to call it from the browser; that dependency has
+  since been proxied through the SkydiveOS backend). Verified 2026-08-03 on prod:
+  anonymous `GET /jobs` returned every customer's name, email and delivery links, and
+  a range request on `/jobs/{id}/deliverables/{name}` streamed their finished video.
+  Network rules are the other half — see `deploy/PROXY_LOCKDOWN.md`
 - Instructor ownership / access scoping (`api.auth`): each camera carries an `instructor_id` (set at `--pair --instructor-id` or via `POST /cameras/{id}/assign`); auto-discovery sends it with the raw upload (and locally-created jobs carry `Job.instructor_id`), so footage lands in that instructor's SkydiveOS account. SkydiveOS forwards identity as `X-Instructor-Id` + `X-Role` (`instructor`/`admin`); when `ENFORCE_INSTRUCTOR_AUTH=1` an instructor sees only their own jobs/cameras (`GET /jobs`, `GET /cameras`) and admins see all + manage the registry. Off by default (every caller is admin), so the open flow is unchanged; ownership *tagging* always happens regardless.
 - `npm run dev` — local SkydiveOS API + review UI
 - `npm test` — Jest tests for API/UI
@@ -282,7 +395,14 @@ Two runtime media roots, with different audiences:
   automatic delivery adds `AUTO_DELIVER`, `SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/
   `SMTP_PASSWORD`/`SMTP_STARTTLS`, `DELIVERY_FROM_EMAIL`, `DELIVERY_LINK_TTL_DAYS`;
   the jump archive adds `ARCHIVE_ENABLED` (on by default), `ARCHIVE_ROOT` (defaults to
-  `$RAW_STORAGE_ROOT`), `ARCHIVE_LINK_MODE` (`link` | `copy` | `symlink`)
+  `$RAW_STORAGE_ROOT`), `ARCHIVE_LINK_MODE` (`link` | `copy` | `symlink`),
+  `ARCHIVE_HASHES` (on by default); the entitlement/paywall adds `PUBLIC_BASE_URL` (the
+  customer-facing origin, e.g. `https://freefall.ing` — unset keeps the legacy S3
+  gallery), `PREVIEW_PRICE_DISPLAY` (CTA text only), `CHECKOUT_URL_TEMPLATE`
+  (SkydiveOS's checkout page, with `{job_id}`/`{booking_id}`/`{item}`; unset → the CTA
+  and the upsell tiles are text, never dead links), `UPSELL_TILES` (the landing page's
+  "Add to your day" row, `key:title:blurb:price|…`; unset → the design's three
+  defaults, `off` → no row)
 - Under Docker the archive is a **host bind mount** (`./raw-storage:/data/raw-storage`),
   not a named volume: the container layer is wiped by `up --build`, and a bind mount can
   be rsync'd off the box without `docker exec`. Being a separate mount from the `jobs`
@@ -325,6 +445,28 @@ Two runtime media roots, with different audiences:
   **syncing it down from wherever the pipeline ran** (`deploy/mac/sync-archive.sh`,
   rsync pull, `raw/` excluded because the Mac already holds those masters)
 - Don't mine a "deployment" beat from the `canopy`/`landing` scene — it's positionally unreliable; the deploy beat comes from the freefall scene at `deploy_offset`
+- Don't let a locked (`preview_only`) job's clean master become reachable: the
+  entitlement picks the file, never the request. No "preview" URL parameter, no
+  client-side gating, no `?s=` value that unlocks, and the clean bytes are never put
+  in the locked gallery's HTML. The one way to unlock is `POST /jobs/{id}/unlock`
+- **Don't presign anything for a `preview_only` job** — not the master, not the photo
+  zip, not "just for SkydiveOS". A presigned URL carries no entitlement check, and
+  those links are persisted, archived and forwarded onward. Upload with
+  `presign=False`; the customer's only address for a locked jump is `/j/{code}`
+- Don't add a route that assumes the network is the security boundary: the identity
+  headers are self-asserted, so anything outside `/j/*` must sit behind the service
+  token (it does automatically — the gate is a middleware; don't add exemptions)
+- Don't watermark with FFmpeg `drawtext` — the deployed FFmpeg lacks libfreetype. Draw
+  the mark with Pillow into a full-frame RGBA PNG and composite it with `overlay`
+  (the pattern in `render/caption.py`, `render/watermark.py`, `api/selfie.py`)
+- Don't add preview files to `Job.outputs`, and don't re-render on unlock — the clean
+  masters already exist and are already in S3; unlock is a one-field state change
+- Don't persist `media_state`, branch pipeline logic on it, or rename `JobStatus` to the
+  design doc's vocabulary — it's a derived view (`api/lifecycle.py`) precisely so unlock
+  can flip the paywall without touching `status`
+- Don't let the gallery emit a dead link: an upsell tile or unlock CTA with no
+  `CHECKOUT_URL_TEMPLATE` renders as text. And don't gate the upsell row on entitlement
+  — the row is the same on the locked and unlocked page
 
 ## Workflow Rules
 - Before writing new code, read related modules to understand existing patterns

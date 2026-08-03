@@ -57,6 +57,20 @@ def _fmt(seconds: float) -> str:
     return f"{int(seconds) // 60}m{int(seconds) % 60:02d}s"
 
 
+def _auth_headers() -> dict[str, str]:
+    """The service token this API requires (``AUTO_EDIT_API_KEY``), or ``{}``.
+
+    Same header SkydiveOS sends. Keeps this driver working once the token gate is
+    on, and stays a no-op on a deployment that hasn't enabled it yet.
+    """
+    try:
+        from api.auth import service_auth_headers
+
+        return service_auth_headers()
+    except Exception:  # noqa: BLE001 - a demo/QA driver must not die on config import
+        return {}
+
+
 def _post_json(client: Any, url: str, payload: dict[str, object]) -> dict[str, Any]:
     resp = client.post(url, json=payload, timeout=30.0)
     if resp.status_code >= 400:
@@ -152,6 +166,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         choices=["selfie", "external", "video_only", "photo_only", "ultimum"],
         help="product booked for this jump",
     )
+    parser.add_argument(
+        "--entitlement",
+        default=None,
+        choices=["edited_download", "preview_only"],
+        help="Path A (media purchased, default) vs Path B (speculative capture: the "
+             "gallery streams a watermarked 720p preview behind the unlock paywall)",
+    )
     parser.add_argument("--customer", default="Demo Customer", help="customer name")
     parser.add_argument("--instructor", default=None, help="instructor name (names the folder)")
     parser.add_argument("--email", default=None, help="where the gallery link is emailed")
@@ -202,6 +223,7 @@ def main(argv: list[str] | None = None) -> int:
         ("jump_date", args.jump_date),
         ("booking_id", args.booking_id),
         ("music", args.music),
+        ("entitlement", args.entitlement),
     ):
         if value:
             booking[key] = value
@@ -211,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
         print("note: no --email given; delivery will only hand the links to SkydiveOS")
 
     started = time.monotonic()
-    with httpx.Client() as client:
+    with httpx.Client(headers=_auth_headers()) as client:
         created = _post_json(client, f"{api}/jobs", booking)
         job_id = str(created["job_id"])
         print(f"\n✓ job {job_id} created — package={args.package}, customer={args.customer!r}")
@@ -254,6 +276,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nDeliverables ({len(outputs)}):")
     for name, path in outputs.items():
         print(f"  • {name}: {path}")
+
+    entitlement = str(job.get("entitlement") or "edited_download")
+    if entitlement == "preview_only":
+        print(
+            "\nEntitlement: PREVIEW_ONLY — the gallery streams the watermarked 720p "
+            f"previews behind the paywall. Unlock it with:\n"
+            f"  curl -sX POST {api}/jobs/{job_id}/unlock"
+        )
 
     links = job.get("delivery_links") or {}
     if links:

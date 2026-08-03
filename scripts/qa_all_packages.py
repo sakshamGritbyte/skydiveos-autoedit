@@ -62,6 +62,20 @@ if str(_REPO_ROOT) not in sys.path:
 _DONE = {"ready", "ready_for_review", "delivered", "failed", "rejected"}
 
 
+def _auth_headers() -> dict[str, str]:
+    """The service token this API requires (``AUTO_EDIT_API_KEY``), or ``{}``.
+
+    Same header SkydiveOS sends. Keeps this driver working once the token gate is
+    on, and stays a no-op on a deployment that hasn't enabled it yet.
+    """
+    try:
+        from api.auth import service_auth_headers
+
+        return service_auth_headers()
+    except Exception:  # noqa: BLE001 - a demo/QA driver must not die on config import
+        return {}
+
+
 def _jobs_root() -> Path:
     """Where the pipeline actually keeps job dirs — NOT always ``<repo>/jobs``.
 
@@ -760,7 +774,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.audit_job:
         print(f"API        : {api}\nauditing   : {len(args.audit_job)} existing job(s)")
-        with httpx.Client() as client:
+        with httpx.Client(headers=_auth_headers()) as client:
             runs = [_audit_existing(client, api, jid) for jid in args.audit_job]
         return 0 if _report(runs, _REPO_ROOT) else 1
 
@@ -798,7 +812,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"error: API not reachable at {api} ({exc})") from exc
 
     runs: list[PackageRun] = []
-    with httpx.Client() as client:
+    with httpx.Client(headers=_auth_headers()) as client:
         for package in packages:
             print(f"\n── {package} ─────────────────────────────────────")
             cameras: list[tuple[str | None, list[Path]]] = (

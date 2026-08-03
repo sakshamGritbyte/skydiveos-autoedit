@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings
-from .jobs import Job, JobStore
+from .jobs import Entitlement, Job, JobStore
 
 logger = logging.getLogger(__name__)
 
@@ -98,12 +98,19 @@ def upload_and_link(
     job_id: str,
     settings: Settings,
     s3_client: Any | None = None,
+    presign: bool = True,
 ) -> dict[str, str]:
-    """Upload each deliverable to S3 and return a presigned URL per name.
+    """Upload each deliverable to S3; return a presigned URL per name.
 
     Keys are ``deliveries/{job_id}/{filename}``; URLs expire after
     ``delivery_link_ttl_days`` (≤ 7, the SigV4 maximum). ``ContentType`` is set so
     browsers stream the videos instead of prompting a raw download.
+
+    ``presign=False`` uploads without minting any URL and returns ``{}`` — the
+    durable copy still lands in S3, but nothing hands out a link to it. That is the
+    ``preview_only`` (Path B) case: the clean masters must exist so ``/unlock`` is
+    instant, and a presigned URL to one of them **is** the paywall bypass (a URL,
+    unlike the gallery route, carries no entitlement check).
     """
     if not settings.s3_bucket:
         raise RuntimeError(
@@ -118,11 +125,12 @@ def upload_and_link(
         client.upload_file(
             str(path), settings.s3_bucket, key, ExtraArgs={"ContentType": content_type}
         )
-        links[name] = client.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": settings.s3_bucket, "Key": key},
-            ExpiresIn=ttl_seconds,
-        )
+        if presign:
+            links[name] = client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": settings.s3_bucket, "Key": key},
+                ExpiresIn=ttl_seconds,
+            )
         logger.info("job %s: uploaded %s → s3://%s/%s", job_id, name, settings.s3_bucket, key)
     return links
 
@@ -163,18 +171,34 @@ def _upload_gallery_html(
     )
 
 
+def gallery_link(job: Job, store: JobStore, settings: Settings) -> str | None:
+    """The served customer gallery URL (``{PUBLIC_BASE_URL}/j/{code}``), or ``None``.
+
+    ``None`` when ``PUBLIC_BASE_URL`` isn't set — delivery then falls back to the
+    legacy S3-hosted gallery. The short code is minted (idempotently) on first use
+    so the link is stable across replays. Bare — no ``?s=`` source tag; each channel
+    (the email here, SkydiveOS's SMS) appends its own.
+    """
+    if not settings.public_base_url:
+        return None
+    token = store.ensure_gallery_token(job.job_id)
+    return f"{settings.public_base_url}/j/{token}"
+
+
 def send_gallery_email(
     job: Job,
     gallery_url: str,
     settings: Settings,
     *,
     smtp_factory: Callable[[], smtplib.SMTP] | None = None,
+    link_expires: bool = True,
 ) -> bool:
     """Email the customer ONE gallery link (all videos + photos on one page).
 
     Same skip-not-fail contract as :func:`send_delivery_email`: returns False (with a
     warning) when there's no ``customer_email`` / SMTP, so the caller can fall back to
-    the SkydiveOS hand-off.
+    the SkydiveOS hand-off. ``link_expires=False`` drops the "valid for N days" line —
+    the served ``/j/{code}`` link never expires.
     """
     if not job.customer_email:
         logger.warning("job %s has no customer_email — not emailing", job.job_id)
@@ -197,8 +221,11 @@ def send_gallery_email(
         "",
         f"  {gallery_url}",
         "",
-        f"The link is valid for {expiry_days} days — save your files soon.",
-        "",
+        *(
+            [f"The link is valid for {expiry_days} days — save your files soon.", ""]
+            if link_expires
+            else []
+        ),
         "Blue skies!",
     ]
     msg = EmailMessage()
@@ -283,14 +310,32 @@ def deliver_to_customer(
     s3_client: Any | None = None,
     smtp_factory: Callable[[], smtplib.SMTP] | None = None,
 ) -> dict[str, str]:
-    """Run the full hand-off for an approved job; returns the presigned links.
+    """Run the full hand-off for an approved job; returns the customer links.
 
-    Raises when there's nothing to deliver, when S3 isn't configured, or when the
-    links reached nobody (no email went out *and* no SkydiveOS callback is
-    configured to forward them) — a job must never read ``delivered`` when the
-    customer has no way to get the files.
+    The clean deliverables always upload to S3 (the durable copy — and for a
+    ``preview_only`` job, the masters the unlock will serve instantly). The customer
+    link depends on ``PUBLIC_BASE_URL``:
+
+    * set → the served ``/j/{code}`` gallery: short, never expires, and re-renders
+      locked/unlocked per request. No gallery.html or per-photo uploads needed.
+    * unset → the legacy S3-hosted gallery.html with presigned URLs baked in.
+
+    **A ``preview_only`` job may only be delivered as the served gallery.** The
+    legacy page embeds presigned URLs to the *clean masters*, and a presigned URL
+    answers to whoever holds it — there is no entitlement check on a URL — so that
+    page (and any per-deliverable link in the return value, which is persisted on the
+    job, mirrored into the archive and forwarded to SkydiveOS) would hand over the
+    very file the customer hasn't bought. Locked jobs therefore mint **no** presigned
+    URLs, and delivery raises with an actionable error when there's no served gallery
+    to point at, instead of falling back to the leaking path.
+
+    Raises when there's nothing to deliver, when S3 isn't configured, when a locked
+    job has no served gallery, or when the links reached nobody (no email went out
+    *and* no SkydiveOS callback is configured to forward them) — a job must never
+    read ``delivered`` when the customer has no way to get the files.
     """
     from . import gallery
+    from .upsell import link_tiles
 
     files = collect_deliverables(job, store)  # videos + photos.zip (photos dir zipped)
     if not files:
@@ -301,47 +346,99 @@ def deliver_to_customer(
         )
     client = s3_client if s3_client is not None else _default_s3_client(settings)
     ttl = int(settings.delivery_link_ttl_days * 86400)
+    served_url = gallery_link(job, store, settings)
 
-    # Videos → a presigned URL each (the gallery's inline players).
+    # ── Path B: the paywall decides what may be LINKED, not just what's shown ──
+    # A presigned URL bypasses every entitlement check by construction, so a locked
+    # job mints none: the masters and the photo zip still upload (durable, and what
+    # /unlock serves instantly), but the customer's only address for this jump is
+    # the lock-aware `/j/{code}` route, which picks preview-vs-master per request.
+    locked = job.entitlement is Entitlement.preview_only
+    if locked and served_url is None:
+        raise RuntimeError(
+            f"job {job.job_id} is preview_only but PUBLIC_BASE_URL is not set: the only "
+            "safe customer link is the served /j/{code} gallery (the legacy S3 gallery "
+            "hands out presigned clean masters, which would bypass the paywall). Set "
+            "PUBLIC_BASE_URL and re-queue delivery."
+        )
+
+    # Videos → durable copy in S3, presigned only when the customer owns the edit.
     video_files = {n: p for n, p in files.items() if n != "photos"}
     video_links = upload_and_link(
-        video_files, job_id=job.job_id, settings=settings, s3_client=client
+        video_files,
+        job_id=job.job_id,
+        settings=settings,
+        s3_client=client,
+        presign=not locked,
     )
 
-    # Photos → individual URLs for the grid, plus the zip for "download all".
-    photo_urls: list[str] = []
+    # Photos zip → durable copy + "download all" (locked: no link; the gallery
+    # shows a count teaser instead of the stills).
     zip_url: str | None = None
     if "photos" in files:
         zip_url = upload_and_link(
-            {"photos": files["photos"]}, job_id=job.job_id, settings=settings, s3_client=client
-        )["photos"]
-        photos_dir = (
-            Path(job.outputs["photos"])
-            if job.outputs and job.outputs.get("photos")
-            else None
+            {"photos": files["photos"]},
+            job_id=job.job_id,
+            settings=settings,
+            s3_client=client,
+            presign=not locked,
+        ).get("photos")
+
+    if served_url is not None:
+        # Served gallery: the page and its media stream live from this API, so no
+        # gallery.html / per-photo uploads. The email carries the source-tagged link.
+        gallery_url = served_url
+        emailed = send_gallery_email(
+            job,
+            f"{served_url}?s=e#tab-video",
+            settings,
+            smtp_factory=smtp_factory,
+            link_expires=False,
         )
-        if photos_dir and photos_dir.is_dir():
-            photo_urls = _upload_photos_individually(client, photos_dir, job.job_id, settings, ttl)
+    else:
+        # Legacy: photos → individual URLs for the grid, then host the static page.
+        photo_urls: list[str] = []
+        if "photos" in files:
+            photos_dir = (
+                Path(job.outputs["photos"])
+                if job.outputs and job.outputs.get("photos")
+                else None
+            )
+            if photos_dir and photos_dir.is_dir():
+                photo_urls = _upload_photos_individually(
+                    client, photos_dir, job.job_id, settings, ttl
+                )
+        page = gallery.render_gallery_html(
+            brand=settings.delivery_brand_name,
+            customer_name=job.customer_name,
+            jump_date=job.jump_date,
+            location=settings.delivery_location,
+            videos=[(n, video_links[n]) for n in video_files],
+            photos=photo_urls,
+            download_all_url=zip_url,
+            instructor_name=job.instructor_name,
+            product_label=job.package.display_label,
+            # The upsell row is entitlement-independent, and so is the host: the
+            # fallback S3 page carries the same offers as the served gallery.
+            upsells=link_tiles(
+                settings.upsell_tiles,
+                template=settings.checkout_url_template,
+                job_id=job.job_id,
+                booking_id=job.booking_id,
+            ),
+        )
+        gallery_url = _upload_gallery_html(client, page, job.job_id, settings, ttl)
+        emailed = send_gallery_email(job, gallery_url, settings, smtp_factory=smtp_factory)
 
-    # Build the one-page gallery and host it; its link is what the customer gets.
-    page = gallery.render_gallery_html(
-        brand=settings.delivery_brand_name,
-        customer_name=job.customer_name,
-        jump_date=job.jump_date,
-        location=settings.delivery_location,
-        videos=[(n, video_links[n]) for n in video_files],
-        photos=photo_urls,
-        download_all_url=zip_url,
-    )
-    gallery_url = _upload_gallery_html(client, page, job.job_id, settings, ttl)
-
-    emailed = send_gallery_email(job, gallery_url, settings, smtp_factory=smtp_factory)
     if not emailed and not settings.skydiveos_api_base:
         raise RuntimeError(
             f"job {job.job_id}: gallery generated but unreachable — no customer_email/SMTP "
             "and no SKYDIVEOS_API_BASE to forward it to"
         )
     # gallery is the customer link; individual links ride along for SkydiveOS.
+    # A locked job contributes NO per-deliverable links: these are persisted on the
+    # job, mirrored into the archive manifest and forwarded to SkydiveOS, so one
+    # clean-master URL here would leak the paywalled edit through any of those.
     links = {"gallery": gallery_url, **video_links}
     if zip_url:
         links["photos"] = zip_url

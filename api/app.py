@@ -24,6 +24,10 @@ Endpoints (all under the OpenAPI docs at ``/docs``):
 ``POST /jobs/{id}/music``               upload/replace a deliverable's backing track
 ``GET  /jobs/{id}/music/{deliverable}`` fetch an uploaded track
 ``DELETE /jobs/{id}/music/{deliverable}`` remove an uploaded track
+``POST /jobs/{id}/unlock``  payment captured (SkydiveOS) → entitlement unlocked
+``GET  /j/{code}``          the customer gallery landing page (token-authed)
+``GET  /j/{code}/media/{name}``   stream a deliverable (preview while locked)
+``GET  /j/{code}/photos/{filename}`` fetch one photo (unlocked only)
 ==========================  ===============================================
 
 Run locally with ``uvicorn api.app:app --reload`` (and a Celery worker — see
@@ -34,24 +38,28 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from html import escape as html_escape
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi import Path as PathParam
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from edl.schema import EditDecisionList
 from ingest.registry import CameraRegistry
 
 from . import archive
-from .auth import AdminDep, PrincipalDep
+from .auth import AdminDep, PrincipalDep, service_token_allows
 from .config import Settings, get_settings
-from .jobs import MUSIC_SUFFIXES, REVIEWABLE, Job, JobStatus, JobStore
+from .gallery import render_gallery_html
+from .jobs import MUSIC_SUFFIXES, REVIEWABLE, Entitlement, Job, JobStatus, JobStore
+from .preview import preview_path
 from .queue import CeleryJobQueue, JobQueue
 from .schemas import (
     AssignCameraRequest,
@@ -70,8 +78,10 @@ from .schemas import (
     PhotosResponse,
     RejectRequest,
     TweakRequest,
+    UnlockRequest,
     UploadResponse,
 )
+from .upsell import link_tiles
 
 if TYPE_CHECKING:
     from ingest.events import EventEmitter
@@ -157,9 +167,14 @@ def enforce_job_ownership(
     Registered as an application dependency so it runs ahead of *every* request and
     automatically covers any route carrying a ``{job_id}`` path parameter — no
     per-endpoint wiring. Routes without a ``job_id`` (create, the jobs list, the
-    camera registry, docs) are a no-op. A non-owner gets a 404 (not 403) so an
-    instructor can't probe another instructor's job ids. With ``ENFORCE_INSTRUCTOR_AUTH``
-    off every caller is an admin, so this is a no-op and behaviour is unchanged.
+    camera registry, the customer gallery, docs) are a no-op. A non-owner gets a 404
+    (not 403) so an instructor can't probe another instructor's job ids. With
+    ``ENFORCE_INSTRUCTOR_AUTH`` off every caller is an admin, so this is a no-op and
+    behaviour is unchanged.
+
+    The customer gallery (``/j/{code}``) carries no ``job_id`` and no SkydiveOS
+    identity — see :data:`api.auth.PUBLIC_PATH_PREFIX` for how the principal is
+    resolved there; its unguessable short code is its only credential.
     """
     job_id = request.path_params.get("job_id")
     if job_id is None:
@@ -440,6 +455,47 @@ def _simulated_clip_count(settings: Settings, camera_id: str) -> int:
     return base
 
 
+def _log_paywall_readiness(settings: Settings) -> None:
+    """Report at boot whether Path B (the paywall) is deliverable on this deployment.
+
+    A locked job can only be handed to a customer as the served ``/j/{code}`` gallery,
+    so ``PUBLIC_BASE_URL`` is a hard prerequisite for the "film it anyway" product.
+    ``POST /jobs`` already refuses to *create* a ``preview_only`` job without it, so a
+    fresh deployment can't get into trouble — but a box that had it and lost it (an
+    env edit, a bad restart) could be holding locked jobs it can no longer deliver.
+    That case is an ERROR with the count, deliberately not a crash: refusing to boot
+    would take every *other* customer's gallery offline too.
+    """
+    if settings.public_base_url:
+        logger.info(
+            "customer galleries served at %s/j/{code}; the paywall (Path B) is available",
+            settings.public_base_url,
+        )
+        return
+
+    logger.warning(
+        "PUBLIC_BASE_URL is unset: customer links fall back to the legacy presigned S3 "
+        "gallery, and preview_only (Path B) jobs are REFUSED at creation — the paywalled "
+        "gallery has nowhere to be served from."
+    )
+    try:
+        stranded = [
+            j.job_id
+            for j in JobStore(settings.jobs_root).list_jobs()
+            if j.entitlement is Entitlement.preview_only
+        ]
+    except Exception:  # noqa: BLE001 - a readiness log must never break startup
+        return
+    if stranded:
+        logger.error(
+            "%d preview_only job(s) exist but PUBLIC_BASE_URL is unset — these CANNOT be "
+            "delivered (delivery refuses the legacy gallery, which would presign the clean "
+            "master). Set PUBLIC_BASE_URL and re-queue delivery. First few: %s",
+            len(stranded),
+            stranded[:5],
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Run the camera auto-discovery service for the lifetime of the API process.
@@ -530,6 +586,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 service = None
     else:
         logger.info("camera auto-discovery disabled (ENABLE_AUTO_DISCOVERY unset)")
+    _log_paywall_readiness(settings)
     try:
         yield
     finally:
@@ -559,12 +616,44 @@ def create_app() -> FastAPI:
         description=API_DESCRIPTION,
         openapi_tags=TAGS_METADATA,
         lifespan=lifespan,
-        # Runs ahead of every request; enforces per-instructor job ownership on any
-        # route with a {job_id} (no-op when ENFORCE_INSTRUCTOR_AUTH is off).
+        # Both run ahead of every request, in this order:
+        #  1. require_service_token — may this caller talk to us at all? Everything
+        #     except the customer gallery /j/{code} needs the shared secret (no-op
+        #     until AUTO_EDIT_API_KEY is set). This is what keeps an internet-facing
+        #     deployment from treating anonymous callers as admins, since the identity
+        #     headers below are self-asserted.
+        #  2. enforce_job_ownership — may they touch THIS job? Applies to any route
+        #     with a {job_id} (no-op when ENFORCE_INSTRUCTOR_AUTH is off).
         dependencies=[Depends(enforce_job_ownership)],
     )
-    
-    
+
+    @app.middleware("http")
+    async def _service_token_gate(
+        request: Request, call_next: Callable[[Request], Awaitable[Any]]
+    ) -> Any:
+        """Reject any request that doesn't hold the shared service token.
+
+        A middleware, not a route dependency, because FastAPI serves ``/docs``,
+        ``/redoc`` and ``/openapi.json`` as raw Starlette routes that skip app-level
+        dependencies — publishing the entire API surface to an anonymous caller — and
+        because a middleware also covers routes added later. Exemptions and the
+        "off until AUTO_EDIT_API_KEY is set" rule live in
+        :func:`api.auth.service_token_allows`.
+        """
+        if not service_token_allows(
+            request.url.path,
+            request.method,
+            request.headers.get("authorization"),
+            get_settings(),
+        ):
+            logger.warning("rejected an unauthenticated request to %s", request.url.path)
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "a valid service token is required"},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return await call_next(request)
+
     # CORS
     app.add_middleware(
         CORSMiddleware,
@@ -588,16 +677,42 @@ def create_app() -> FastAPI:
         tags=["jobs"],
         summary="Create a job",
     )
-    def create_job(body: CreateJobRequest, store: StoreDep) -> CreateJobResponse:
+    def create_job(
+        body: CreateJobRequest, store: StoreDep, settings: SettingsDep
+    ) -> CreateJobResponse:
         """Open a new job for one jump and return its ``job_id``.
 
         The footage is attached separately via ``POST /jobs/{id}/upload``; the job
         starts ``queued`` and carries the booking metadata supplied here.
+
+        **A ``preview_only`` job is refused unless ``PUBLIC_BASE_URL`` is set.** This
+        is the go-live gate for Path B: a locked job can only be delivered as the
+        served ``/j/{code}`` gallery (:func:`api.delivery.deliver_to_customer` refuses
+        the legacy S3 page, which would presign the clean masters). Rejecting it here
+        — before any footage is uploaded or a single frame is rendered — means that
+        delivery-time failure can never be reached in production, and the operator
+        finds out at booking time instead of after the jump.
         """
+        if (
+            body.entitlement is Entitlement.preview_only
+            and not settings.public_base_url
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "preview_only (Path B) needs PUBLIC_BASE_URL set: the paywalled "
+                    "gallery is served live at {PUBLIC_BASE_URL}/j/{code}, and there is "
+                    "no other way to deliver a locked job without handing out the clean "
+                    "master. Set PUBLIC_BASE_URL, or create the job as edited_download."
+                ),
+            )
         job_id = uuid.uuid4().hex
         fields = body.model_dump(exclude_none=True)
-        job = store.create(Job(job_id=job_id, **fields))
-        return CreateJobResponse(job_id=job_id, job=JobResponse.from_job(job))
+        store.create(Job(job_id=job_id, **fields))
+        # Every job carries its gallery short code from birth, so the customer link
+        # exists (and stays stable) before anything renders or delivers.
+        store.ensure_gallery_token(job_id)
+        return CreateJobResponse(job_id=job_id, job=JobResponse.from_job(store.load(job_id)))
 
     @app.get(
         "/jobs",
@@ -827,6 +942,56 @@ def create_app() -> FastAPI:
         return JobResponse.from_job(updated)
 
     @app.post(
+        "/jobs/{job_id}/unlock",
+        response_model=JobResponse,
+        tags=["jobs"],
+        summary="Mark the media purchased (SkydiveOS calls this after payment capture)",
+    )
+    def unlock(
+        job_id: JobId, body: UnlockRequest, store: StoreDep, principal: AdminDep
+    ) -> JobResponse:
+        """Flip a ``preview_only`` job to ``edited_download`` — the paywall unlock.
+
+        Called by SkydiveOS **server-to-server** once the $-unlock payment is captured
+        (design doc Path B: "payment captured → watermark-free file unlocked").
+
+        This endpoint gives away the product, so it is the one place where "trusted on
+        the network boundary" isn't enough. Three checks stand between a request and a
+        free video:
+
+        * the app-wide **service token** (:func:`api.auth.require_service_token`) — no
+          browser or stranger can reach it, only the SkydiveOS backend;
+        * the **admin** role, so a plain instructor identity can't self-serve;
+        * a non-empty ``payment_reference`` — the id of the captured payment in
+          SkydiveOS. It is recorded on the job, so every unlock is auditable back to a
+          real transaction rather than being an unattributable state flip.
+
+        Idempotent — an already unlocked job returns 200 unchanged (with its original
+        reference intact), so SkydiveOS may retry freely. Never touches ``status``: the
+        clean deliverables were rendered up front, so the gallery serves them on its
+        very next request — no re-render, no re-delivery.
+
+        (``JobStore`` is single-writer by design; this one-field update's lost-update
+        window against a running worker is microseconds, and a retry heals it.)
+        """
+        job = _load_or_404(store, job_id)
+        if job.entitlement is Entitlement.edited_download:
+            return JobResponse.from_job(job)  # already unlocked — idempotent
+        updated = store.update(
+            job_id,
+            entitlement=Entitlement.edited_download,
+            paid_at=time.time(),
+            payment_reference=body.payment_reference,
+        )
+        logger.info(
+            "job %s unlocked (preview_only -> edited_download) payment=%s by=%s",
+            job_id,
+            body.payment_reference,
+            principal.instructor_id or "service",
+        )
+        return JobResponse.from_job(updated)
+
+    @app.post(
         "/jobs/{job_id}/reject",
         response_model=JobResponse,
         tags=["review"],
@@ -1003,6 +1168,155 @@ def create_app() -> FastAPI:
         if not _is_safe_segment(filename):
             raise HTTPException(status_code=400, detail="invalid photo filename")
         photos_dir = store.dir(job_id) / "photos"
+        path = photos_dir / filename
+        if not path.exists() or not _served_under(path, photos_dir):
+            raise HTTPException(status_code=404, detail="photo not found")
+        return FileResponse(path, media_type="image/jpeg", filename=filename)
+
+    # ----------------------------------------------------------------------- #
+    # Customer gallery (the /j/{code} short link SkydiveOS SMS/emails out).
+    # No {job_id} path param, so enforce_job_ownership is a deliberate no-op:
+    # the unguessable short code is the page's only auth. Never log the code.
+    # Served live, so the page flips locked -> unlocked the moment /unlock runs,
+    # and the link never expires (media streams from the job dir per request).
+    # ----------------------------------------------------------------------- #
+
+    def _job_by_token(store: JobStore, token: str) -> Job:
+        job = store.find_by_gallery_token(token)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown gallery link")
+        return job
+
+    def _gallery_videos(store: JobStore, job: Job) -> list[str]:
+        """The video deliverable names this job's gallery can stream, in order."""
+        names = [n for n in (job.outputs or {}) if n != "photos"]
+        if not names and store.final_path(job.job_id).is_file():
+            names = ["final"]
+        return names
+
+    def _gallery_photo_names(store: JobStore, job: Job) -> list[str]:
+        index = store.dir(job.job_id) / "photos" / "index.json"
+        if not index.exists():
+            return []
+        try:
+            return [e["filename"] for e in json.loads(index.read_text())]
+        except (ValueError, KeyError, TypeError):
+            return []
+
+    def _primary_download(
+        store: JobStore, job: Job, token: str, video_names: list[str]
+    ) -> tuple[str | None, str | None]:
+        """The unlocked page's primary action: ``(url, note)`` for the main video.
+
+        The design's hero action is one button on *the* video — the full edit when the
+        package has one, else the first deliverable. The note carries the reassurance
+        line ("1080p MP4 · 214 MB · yours to keep"); the size is dropped rather than
+        guessed if the file can't be stat'd.
+        """
+        if not video_names:
+            return None, None
+        name = "full_video" if "full_video" in video_names else video_names[0]
+        bits = ["1080p MP4"]
+        try:
+            size = (store.dir(job.job_id) / f"{name}.mp4").stat().st_size
+        except OSError:
+            size = 0
+        if size:
+            bits.append(f"{size / 1_000_000:.0f} MB")
+        bits.append("yours to keep")
+        return f"/j/{token}/media/{name}", "  ·  ".join(bits)
+
+    @app.get("/j/{token}", response_class=HTMLResponse, include_in_schema=False)
+    def public_gallery(
+        token: str, store: StoreDep, settings: SettingsDep
+    ) -> HTMLResponse:
+        """The customer landing page — Path A unlocked, Path B watermarked + paywalled.
+
+        Accepts (and ignores) an ``s`` query param: an opaque source tag on the
+        outbound links (``?s=e`` email, ``?s=m`` SMS) — analytics for SkydiveOS,
+        never auth. Lock state is computed per request, never from the URL.
+        """
+        job = _job_by_token(store, token)
+        locked = job.entitlement is Entitlement.preview_only
+        video_names = _gallery_videos(store, job)
+        photo_names = _gallery_photo_names(store, job)
+        if not video_names and not photo_names:
+            brand = html_escape(settings.delivery_brand_name)
+            return HTMLResponse(
+                "<!doctype html><html><head><meta charset='utf-8'>"
+                "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+                f"<title>{brand}</title></head>"
+                "<body style='background:#0d0d0d;color:#f2f2f2;font-family:sans-serif;"
+                "text-align:center;padding:60px 20px'>"
+                f"<h1>{brand}</h1><p>Your jump video is still being edited — "
+                "check back in a few minutes.</p></body></html>"
+            )
+
+        unlock_url = None
+        if locked and settings.checkout_url_template:
+            unlock_url = settings.checkout_url_template.format(
+                job_id=job.job_id, booking_id=job.booking_id or "", item="unlock"
+            )
+        dl_url, dl_note = (None, None) if locked else _primary_download(
+            store, job, token, video_names
+        )
+        html_page = render_gallery_html(
+            brand=settings.delivery_brand_name,
+            customer_name=job.customer_name,
+            jump_date=job.jump_date,
+            location=settings.delivery_location,
+            videos=[(n, f"/j/{token}/media/{n}") for n in video_names],
+            photos=[] if locked else [f"/j/{token}/photos/{n}" for n in photo_names],
+            download_all_url=None,
+            locked=locked,
+            unlock_url=unlock_url,
+            price_display=settings.preview_price_display,
+            photo_count_teaser=len(photo_names),
+            tabbed=True,
+            show_downloads=not locked,
+            instructor_name=job.instructor_name,
+            product_label=job.package.display_label,
+            primary_download_url=dl_url,
+            primary_download_note=dl_note,
+            # Entitlement-independent: the same row on the locked and unlocked page.
+            upsells=link_tiles(
+                settings.upsell_tiles,
+                template=settings.checkout_url_template,
+                job_id=job.job_id,
+                booking_id=job.booking_id,
+            ),
+        )
+        return HTMLResponse(html_page)
+
+    @app.get("/j/{token}/media/{name}", include_in_schema=False, response_class=FileResponse)
+    def public_media(token: str, name: str, store: StoreDep) -> FileResponse:
+        """Stream one deliverable to the customer (range-enabled).
+
+        The **entitlement**, never the ``name``, selects the file: a locked
+        (``preview_only``) job serves only its watermarked ``preview_<name>.mp4`` —
+        the clean master is unreachable by any request until ``/unlock``.
+        """
+        job = _job_by_token(store, token)
+        if not _is_safe_segment(name) or name not in _gallery_videos(store, job):
+            raise HTTPException(status_code=404, detail="no such video")
+        job_dir = store.dir(job.job_id)
+        if job.entitlement is Entitlement.preview_only:
+            path = preview_path(job_dir, name)
+        else:
+            path = job_dir / f"{name}.mp4"
+        if not path.exists() or not _served_under(path, job_dir):
+            raise HTTPException(status_code=404, detail="video not found")
+        return FileResponse(path, media_type="video/mp4", filename=f"{name}.mp4")
+
+    @app.get("/j/{token}/photos/{filename}", include_in_schema=False, response_class=FileResponse)
+    def public_photo(token: str, filename: str, store: StoreDep) -> FileResponse:
+        """Serve one full-res still to the customer — unlocked jobs only."""
+        job = _job_by_token(store, token)
+        if job.entitlement is Entitlement.preview_only:
+            raise HTTPException(status_code=404, detail="photos unlock with the full video")
+        if not _is_safe_segment(filename):
+            raise HTTPException(status_code=400, detail="invalid photo filename")
+        photos_dir = store.dir(job.job_id) / "photos"
         path = photos_dir / filename
         if not path.exists() or not _served_under(path, photos_dir):
             raise HTTPException(status_code=404, detail="photo not found")

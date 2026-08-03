@@ -16,6 +16,8 @@ import os
 from dataclasses import dataclass
 from functools import lru_cache
 
+from .upsell import DEFAULT_TILES, UpsellTile, parse_tiles
+
 # Load a local ``.env`` (if present) into the process environment *before* anything
 # reads it, so keys put there — ANTHROPIC_API_KEY, REDIS_URL, JOBS_ROOT, … — reach
 # both the FastAPI app and the Celery workers without the operator exporting them by
@@ -155,6 +157,37 @@ class Settings:
     #: hardlink, so a 4K master costs no extra disk, falling back to a copy across
     #: filesystems), ``copy`` (always a real copy), or ``symlink``.
     archive_link_mode: str = "link"
+    #: Public origin the customer gallery is served from (``PUBLIC_BASE_URL``, e.g.
+    #: ``https://freefall.ing``) — this API must be reachable there. When set, delivery
+    #: emails/callbacks carry the short, never-expiring ``/j/{code}`` link instead of
+    #: uploading a presigned-URL gallery.html to S3. ``None`` → today's S3 gallery.
+    public_base_url: str | None = None
+    #: Price string shown on the locked gallery's unlock CTA
+    #: (``PREVIEW_PRICE_DISPLAY``, display only — billing lives in SkydiveOS).
+    preview_price_display: str = "$39"
+    #: Checkout URL for the locked gallery's CTA (``CHECKOUT_URL_TEMPLATE``, with
+    #: ``{job_id}`` / ``{booking_id}`` placeholders — and ``{item}`` for an upsell
+    #: tile). ``None`` → the CTA renders as text ("ask at the desk") until SkydiveOS
+    #: provides its checkout page.
+    checkout_url_template: str | None = None
+    #: The gallery's "Add to your day" upsell tiles (``UPSELL_TILES``; see
+    #: :mod:`api.upsell`). Shown on both the unlocked and the locked page — the row is
+    #: entitlement-independent. Unset → the design's three defaults; ``off`` → no row.
+    upsell_tiles: tuple[UpsellTile, ...] = DEFAULT_TILES
+    #: Shared secret every caller must present as ``Authorization: Bearer`` on every
+    #: route except the customer gallery ``/j/{code}`` (``AUTO_EDIT_API_KEY`` — the
+    #: same value SkydiveOS sends from its ``AI_BACKEND_API_KEY``/``AUTO_EDIT_API_KEY``).
+    #: ``None`` → the gate is OFF and the surface is open, which is only safe on a
+    #: private network: this service's identity headers are self-asserted, so a
+    #: reachable-and-ungated deployment treats an anonymous caller as an admin.
+    #: See :func:`api.auth.require_service_token`.
+    service_token: str | None = None
+    #: Record a sha256 per archived file in the jump manifest (``ARCHIVE_HASHES``, on by
+    #: default) so an operator can prove the master they hold is the one that was
+    #: ingested. Hashes are cached per (size, mtime) in the manifest, so a file is read
+    #: once and later archive passes are free; turn it off on a box where even that
+    #: one pass is too much I/O.
+    archive_hashes: bool = True
 
 
 def _flag(name: str, *, default: bool = False) -> bool:
@@ -219,4 +252,17 @@ def get_settings() -> Settings:
         archive_enabled=_flag("ARCHIVE_ENABLED", default=True),
         archive_root=os.environ.get("ARCHIVE_ROOT") or None,
         archive_link_mode=(os.environ.get("ARCHIVE_LINK_MODE") or "link").strip().lower(),
+        public_base_url=(os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/") or None,
+        preview_price_display=os.environ.get("PREVIEW_PRICE_DISPLAY") or "$39",
+        checkout_url_template=os.environ.get("CHECKOUT_URL_TEMPLATE") or None,
+        upsell_tiles=parse_tiles(os.environ.get("UPSELL_TILES")),
+        # Accept the SkydiveOS-side spellings too, so one secret can be pasted into
+        # both env files under whichever name that side already uses.
+        service_token=(
+            os.environ.get("AUTO_EDIT_API_KEY")
+            or os.environ.get("AI_BACKEND_API_KEY")
+            or os.environ.get("AUTO_EDIT_SERVICE_TOKEN")
+            or None
+        ),
+        archive_hashes=_flag("ARCHIVE_HASHES", default=True),
     )

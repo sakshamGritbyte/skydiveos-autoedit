@@ -110,6 +110,80 @@ def _cleanup_s3(job_id: str, settings) -> None:  # noqa: ANN001
         print(f"  cleaned up s3://{settings.s3_bucket}/{obj['Key']}")
 
 
+def _check_paywall(store, job_id: str) -> int:  # noqa: ANN001 - JobStore, imported late
+    """Drive the Path-B paywall in-process: locked page → unlock → unlocked page.
+
+    Uses a ``TestClient`` against the real app so the served gallery, the
+    preview-vs-master file selection, and the unlock endpoint are all exercised
+    exactly as they are in production. Returns 0 on success.
+    """
+    from fastapi.testclient import TestClient
+
+    from api.app import create_app, get_store
+    from api.preview import PREVIEW_PREFIX, preview_path
+
+    job = store.load(job_id)
+    token = job.gallery_token
+    app = create_app()
+    app.dependency_overrides[get_store] = lambda: store
+
+    print("\n── Path B: the paywall ───────────────────────────────")
+    previews = sorted(p.name for p in store.dir(job_id).glob(f"{PREVIEW_PREFIX}*.mp4"))
+    print(f"  watermarked previews rendered: {previews or 'NONE'}")
+    if not previews:
+        print("  ✗ no preview files — a locked gallery would have nothing to stream")
+        return 1
+
+    # The app reads the same .env, so if the service-token gate is on this
+    # in-process client must present it too.
+    from api.auth import service_auth_headers
+
+    with TestClient(app, headers=service_auth_headers()) as client:
+        locked = client.get(f"/j/{token}", params={"s": "e"})
+        if locked.status_code != 200:
+            print(f"  ✗ locked gallery → HTTP {locked.status_code}")
+            return 1
+        assert_locked = "Unlock full video" in locked.text and "720P PREVIEW" in locked.text
+        print(f"  GET /j/{token}?s=e → 200, shows the unlock CTA: {assert_locked}")
+
+        name = next(iter(job.outputs or {"final": ""}))
+        served = client.get(f"/j/{token}/media/{name}")
+        expected = preview_path(store.dir(job_id), name)
+        print(
+            f"  GET /j/{token}/media/{name} → HTTP {served.status_code}, "
+            f"{len(served.content)} bytes (the preview, {expected.stat().st_size} bytes on disk)"
+        )
+        if served.status_code != 200 or len(served.content) != expected.stat().st_size:
+            print("  ✗ locked gallery did not serve the watermarked preview")
+            return 1
+
+        unlocked_resp = client.post(
+            f"/jobs/{job_id}/unlock",
+            # Unlock requires proof of a captured payment (F-16).
+            json={"payment_reference": "demo-auto-deliver"},
+        )
+        print(f"  POST /jobs/{job_id}/unlock → HTTP {unlocked_resp.status_code} "
+              f"(entitlement={unlocked_resp.json().get('entitlement')})")
+
+        page = client.get(f"/j/{token}")
+        clean = client.get(f"/j/{token}/media/{name}")
+        master = store.dir(job_id) / f"{name}.mp4"
+        ok = (
+            page.status_code == 200
+            and "Unlock full video" not in page.text
+            and clean.status_code == 200
+            and master.is_file()
+            and len(clean.content) == master.stat().st_size
+        )
+        print(f"  after unlock: page is clean and serves the {master.name} master: {ok}")
+        if not ok:
+            print("  ✗ unlock did not flip the gallery to the clean master")
+            return 1
+
+    print("  ✓ locked → paid → unlocked, no re-render")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", default=str(_DEFAULT_SOURCE), help="sample MP4 to edit")
@@ -122,6 +196,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--from-email", default="videos@dropzone.local")
     parser.add_argument("--no-email", action="store_true", help="only generate S3 links")
     parser.add_argument("--keep", action="store_true", help="don't delete the S3 uploads")
+    parser.add_argument(
+        "--preview-only",
+        action="store_true",
+        help="run the Path-B (speculative capture) flow: render the watermarked 720p "
+             "preview, serve the LOCKED gallery, then unlock it and show the flip",
+    )
+    parser.add_argument(
+        "--public-base-url",
+        default=None,
+        help="origin the served /j/{code} gallery is reachable at (default: a local "
+             "TestClient-only URL, since this demo drives the app in-process)",
+    )
     args = parser.parse_args(argv)
 
     source = Path(args.source)
@@ -137,6 +223,10 @@ def main(argv: list[str] | None = None) -> int:
     os.environ["AUTO_DELIVER"] = "1"  # the flag under test: skip the review gate
     os.environ["SKYDIVEOS_API_BASE"] = ""  # no web layer in this demo
     os.environ.setdefault("DELIVERY_FROM_EMAIL", args.from_email)
+    if args.preview_only:
+        # The served-gallery path: delivery emails the short /j/{code} link instead of
+        # uploading a presigned gallery.html, and the page is rendered per request.
+        os.environ["PUBLIC_BASE_URL"] = args.public_base_url or "http://127.0.0.1:8000"
 
     sink: _MailSink | None = None
     if args.no_email:
@@ -180,6 +270,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    from api.jobs import Entitlement
+
     store = JobStore(settings.jobs_root)
     job = store.create(
         Job(
@@ -188,9 +280,16 @@ def main(argv: list[str] | None = None) -> int:
             customer_email=None if args.no_email else args.email,
             jump_date="2026-07-27",
             source_path=str(source),
+            entitlement=(
+                Entitlement.preview_only if args.preview_only else Entitlement.edited_download
+            ),
         )
     )
-    print(f"→ job {job.job_id} created (status={job.status.value}); editing {source.name} ...")
+    store.ensure_gallery_token(job.job_id)
+    print(
+        f"→ job {job.job_id} created (status={job.status.value}, "
+        f"entitlement={job.entitlement.value}); editing {source.name} ..."
+    )
 
     ctx = sink if sink is not None else _nullcontext()
     with ctx:
@@ -213,6 +312,9 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  {line}")
             if not sink.caught:
                 print("  (no email captured — check the customer_email / SMTP settings)")
+
+    if args.preview_only and _check_paywall(store, final.job_id) != 0:
+        return 1
 
     if not args.keep:
         print("\nCleaning up demo uploads ...")

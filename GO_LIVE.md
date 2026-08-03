@@ -12,6 +12,23 @@ Both containers (`api` + `worker`) read the same `.env` (see `docker-compose.yml
 `/…/skydiveos-autoedit/.env` on the EC2 box:
 
 ```bash
+# ── HARD GATES: the paywall (Path B) will not run without these ───
+# 1. Where customers reach their gallery. This is a PREREQUISITE, not a nicety: a
+#    preview_only ("we filmed it anyway") job can only be delivered as the served
+#    /j/{code} page, because the legacy S3 gallery presigns the CLEAN masters and
+#    would hand over the unbought edit. `POST /jobs` REFUSES to create a
+#    preview_only job while this is unset (422), and the API logs it at boot — so
+#    the delivery-time failure can't reach production, but Path B is simply
+#    unavailable until this is set. Must be the origin this API answers on.
+PUBLIC_BASE_URL=https://ai.ultimatedzm.com
+# 2. Shared secret gating every route except /j/*. Identity here is self-asserted
+#    (X-Instructor-Id / X-Role), so on a reachable box an ungated API treats
+#    strangers as admins — anonymous /jobs leaks customer names/emails/links, and
+#    /unlock gives paid videos away. Same value as SkydiveOS's AI_BACKEND_API_KEY.
+AUTO_EDIT_API_KEY=<long-random-secret>
+# 3. Network rules are the other half of #2 — only /j/* may be public:
+#    see deploy/PROXY_LOCKDOWN.md (human-owned, do before deploying the paywall).
+
 # ── Turn on fully-automatic delivery ──────────────────────────────
 AUTO_DELIVER=1                         # skip the review gate; deliver on render finish
 

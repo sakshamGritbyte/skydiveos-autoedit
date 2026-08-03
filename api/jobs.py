@@ -26,12 +26,14 @@ The status machine the REST endpoints drive:
 from __future__ import annotations
 
 import json
+import secrets
+import string
 import time
 from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from edl.schema import EditDecisionList
 from edl.storage import edl_path, job_dir, jobs_root, persist_edl
@@ -116,6 +118,22 @@ class Package(StrEnum):
         return self is Package.ultimum
 
     @property
+    def display_label(self) -> str:
+        """Customer-facing product name for the gallery's hero meta line.
+
+        Every package here is a tandem media product (this module exists for tandem
+        footage), so the label leads with the discipline the customer recognises from
+        their booking and qualifies it with the angle they bought.
+        """
+        return {
+            Package.selfie: "Tandem · Handcam",
+            Package.external: "Tandem · Outside Camera",
+            Package.video_only: "Tandem · Video",
+            Package.photo_only: "Tandem · Photos",
+            Package.ultimum: "Tandem · Ultimate",
+        }[self]
+
+    @property
     def music_deliverables(self) -> tuple[str, ...]:
         """The video deliverables that take a backing track, for this package.
 
@@ -128,6 +146,35 @@ class Package(StrEnum):
         if self.makes_videos:  # selfie / external / video_only
             return ("full_video", "highlights", "freefall")
         return ()
+
+
+class Entitlement(StrEnum):
+    """What the customer bought — drives the gallery's lock state (design doc Path A/B).
+
+    * ``edited_download`` — media purchased (pre-booked, or unlocked later at the
+      paywall): the gallery streams the clean 1080p deliverables with downloads.
+    * ``preview_only`` — speculative capture ("we filmed it anyway"): the gallery
+      streams only the watermarked 720p previews behind an unlock CTA; the clean
+      masters are rendered and stored but unreachable until ``POST /jobs/{id}/unlock``.
+
+    Lowercase wire values by repo convention; the design doc's ``EDITED_DOWNLOAD`` /
+    ``PREVIEW_ONLY`` spellings are accepted on input (see ``Job._coerce_entitlement``).
+    """
+
+    edited_download = "edited_download"
+    preview_only = "preview_only"
+
+
+#: Alphabet + length for the gallery short code (``/j/{code}``). 11 chars of base62
+#: ≈ 65 bits — short enough for an SMS link, unguessable enough to be the page's
+#: only auth.
+_GALLERY_CODE_ALPHABET = string.ascii_letters + string.digits
+_GALLERY_CODE_LENGTH = 11
+
+
+def _new_gallery_token() -> str:
+    """A fresh URL-safe short code for the customer gallery link."""
+    return "".join(secrets.choice(_GALLERY_CODE_ALPHABET) for _ in range(_GALLERY_CODE_LENGTH))
 
 
 class JobStatus(StrEnum):
@@ -183,6 +230,22 @@ class Job(BaseModel):
     #: is absent — so an omitted name degrades the folder name, nothing else.
     instructor_name: str | None = None
 
+    #: Path A vs Path B (design doc): whether the customer already owns the edit.
+    #: SkydiveOS sends it on ``POST /jobs``; ``POST /jobs/{id}/unlock`` flips a
+    #: ``preview_only`` job to ``edited_download`` after payment capture.
+    entitlement: Entitlement = Entitlement.edited_download
+    #: Short code backing the customer gallery link (``{PUBLIC_BASE_URL}/j/{code}``).
+    #: The code is the page's only auth — never expose it in list endpoints or logs.
+    #: Minted once by :meth:`JobStore.ensure_gallery_token` (NOT a default_factory:
+    #: a legacy job.json missing the field must not mint a new code on every load).
+    gallery_token: str | None = None
+    #: Epoch seconds when the paywall unlock was captured (``None`` = never).
+    paid_at: float | None = None
+    #: SkydiveOS's payment/transaction id for that unlock (``None`` = never unlocked).
+    #: Required on ``POST /jobs/{id}/unlock`` so giving away the product is always
+    #: attributable to a real capture; kept for audit/reconciliation only.
+    payment_reference: str | None = None
+
     # Annotations from the review gate.
     reject_reason: str | None = None
     error: str | None = None  # populated when status == failed
@@ -197,6 +260,18 @@ class Job(BaseModel):
 
     created_at: float = 0.0
     updated_at: float = 0.0
+
+    @field_validator("entitlement", mode="before")
+    @classmethod
+    def _coerce_entitlement(cls, v: object) -> object:
+        """Accept the design doc's uppercase spellings (``PREVIEW_ONLY`` …).
+
+        Also trims whitespace: this value crosses a service boundary (SkydiveOS sends
+        it on ``POST /jobs``), and a stray space or a different casing must not fall
+        through to the ``edited_download`` default — that would silently unlock a
+        speculative capture.
+        """
+        return v.strip().lower() if isinstance(v, str) else v
 
 
 class JobStore:
@@ -352,6 +427,39 @@ class JobStore:
                 jobs.append(job)
         jobs.sort(key=lambda j: j.created_at, reverse=True)
         return jobs
+
+    def ensure_gallery_token(self, job_id: str) -> str:
+        """Return the job's gallery short code, minting + persisting one on first use.
+
+        Idempotent — an existing code is never regenerated (the customer's link must
+        stay stable across replays/tweaks, like the persisted music pick).
+        """
+        job = self.load(job_id)
+        if job.gallery_token:
+            return job.gallery_token
+        token = _new_gallery_token()
+        self.update(job_id, gallery_token=token)
+        return token
+
+    def find_by_gallery_token(self, token: str) -> Job | None:
+        """Resolve a gallery short code to its job, or ``None``.
+
+        A directory scan like :meth:`list_jobs` — O(n) per lookup, fine at dropzone
+        volume. Empty/missing tokens never match (legacy jobs carry ``None``).
+        """
+        if not token:
+            return None
+        root = jobs_root(self._root)
+        if not root.is_dir():
+            return None
+        for job_file in root.glob(f"*/{JOB_FILENAME}"):
+            try:
+                job = Job.model_validate_json(job_file.read_text())
+            except (OSError, ValueError):
+                continue
+            if job.gallery_token == token:
+                return job
+        return None
 
     def save(self, job: Job) -> Job:
         """Persist an updated job, refreshing ``updated_at``."""

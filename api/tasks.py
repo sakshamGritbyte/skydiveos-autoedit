@@ -36,6 +36,7 @@ from . import archive
 from .celery_app import celery_app
 from .config import Settings, get_settings
 from .jobs import Job, JobStatus, JobStore
+from .lifecycle import media_state
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +90,18 @@ def _notify_skydiveos(job: Job) -> None:
     base = settings.skydiveos_api_base
     if not base:
         return
-    payload: dict[str, object] = {"job_id": job.job_id, "status": job.status.value}
+    payload: dict[str, object] = {
+        "job_id": job.job_id,
+        "status": job.status.value,
+        "entitlement": job.entitlement.value,
+        # The design doc's state-machine vocabulary (derived — see api.lifecycle), so
+        # SkydiveOS's UI can label the jump without re-deriving it from two fields.
+        "media_state": media_state(job).value,
+    }
+    if job.gallery_token and settings.public_base_url:
+        # The short, never-expiring customer gallery link — what SkydiveOS should
+        # SMS/email on `delivered` (it may append its own ?s= source tag).
+        payload["gallery_url"] = f"{settings.public_base_url}/j/{job.gallery_token}"
     if job.delivery_links:
         # On `delivered`, forward the presigned customer links so the web layer can
         # show/send them too (its booking record knows channels we don't, e.g. WhatsApp).
@@ -115,6 +127,19 @@ def _archive_deliverables(store: JobStore, job_id: str) -> None:
     not fail a customer's edit.
     """
     archive.archive_deliverables(store.load(job_id), store, get_settings())
+
+
+def _render_previews(store: JobStore, job_id: str) -> None:
+    """Render the watermarked 720p previews for a Path-B (``preview_only``) job.
+
+    Called at every "render finished" seam, INSIDE the task's ``try`` — a
+    ``preview_only`` job whose previews can't be produced must fail (a locked
+    gallery with nothing watchable breaks the product), while an
+    ``edited_download`` job returns immediately and gains no new failure mode.
+    """
+    from .preview import render_job_previews
+
+    render_job_previews(store.load(job_id), store, get_settings())
 
 
 def _maybe_auto_deliver(store: JobStore, job_id: str) -> None:
@@ -164,6 +189,7 @@ def process_job(job_id: str) -> str:
             jobs_root=get_settings().jobs_root,
             target_duration=job.target_duration,
         )
+        _render_previews(store, job_id)
     except Exception as e:  # noqa: BLE001 - surface failures as a job status, then re-raise
         logger.exception("processing failed for job %s", job_id)
         store.update(job_id, status=JobStatus.failed, error=str(e))
@@ -193,6 +219,7 @@ def process_selfie_package(job_id: str) -> str:
         from .selfie import run_selfie_pipeline
 
         run_selfie_pipeline(job_id, store=store, jobs_root=get_settings().jobs_root)
+        _render_previews(store, job_id)
     except Exception as e:  # noqa: BLE001 - surface failures as a job status, then re-raise
         logger.exception("selfie processing failed for job %s", job_id)
         store.update(job_id, status=JobStatus.failed, error=str(e))
@@ -229,6 +256,7 @@ def rerender_job(job_id: str) -> str:
             jobs_root=get_settings().jobs_root,
             music=job.music,
         )
+        _render_previews(store, job_id)
     except Exception as e:  # noqa: BLE001
         logger.exception("re-render failed for job %s", job_id)
         store.update(job_id, status=JobStatus.failed, error=str(e))

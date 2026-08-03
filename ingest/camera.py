@@ -194,6 +194,7 @@ def _load_sdk() -> Any:
         raise CameraError(_SDK_MISSING) from e
     _skip_cohn_wait()
     _skip_redundant_ble_pairing()
+    _bound_camera_ready_wait()
     return WirelessGoPro
 
 
@@ -289,6 +290,115 @@ def _skip_redundant_ble_pairing() -> None:
 
     _pair_only_if_needed._patched_by_autoedit = True  # type: ignore[attr-defined]
     BleakWrapperController.pair = _pair_only_if_needed
+
+
+#: Default cap on "wait for the camera to report itself idle" (seconds). A camera that
+#: is genuinely finishing an encode settles in a few seconds; a minute means something
+#: is wrong on the device, not on the wire.
+_READY_TIMEOUT_DEFAULT_S = 60.0
+
+
+def _ready_timeout_s() -> float:
+    """How long to wait for a camera to report itself idle. Never raises.
+
+    Read per call (not at import) so an operator can raise ``GOPRO_READY_TIMEOUT_S``
+    for a camera that legitimately needs longer, without a code change.
+    """
+    raw = os.environ.get("GOPRO_READY_TIMEOUT_S", "").strip()
+    if not raw:
+        return _READY_TIMEOUT_DEFAULT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("ignoring non-numeric GOPRO_READY_TIMEOUT_S=%r", raw)
+        return _READY_TIMEOUT_DEFAULT_S
+    return value if value > 0 else _READY_TIMEOUT_DEFAULT_S
+
+
+#: Actionable text for a camera that never goes idle. The cause is almost always on the
+#: device (QuikCapture starting a recording on a bumped shutter), so say so.
+_READY_TIMEOUT_HELP = (
+    "camera never reported itself idle within {timeout:g}s, so no media could be "
+    "transferred. It is almost certainly still recording or finishing an encode: stop "
+    "the recording, turn QuikCapture off (Preferences > General > QuikCapture), "
+    "power-cycle the camera, and pull again. Set GOPRO_READY_TIMEOUT_S to wait longer."
+)
+
+
+def _bound_camera_ready_wait() -> None:
+    """Put a deadline on the SDK's "wait for the camera to be ready" gate.
+
+    ``WirelessGoPro.open()`` gates every session on the camera reporting
+    ``BUSY: False`` + ``ENCODING: False``, by acquiring ``_ReadyLock``
+    (``gopro_wireless.py``: seeded busy at ``open()``, acquired in ``_open_ble``,
+    released only from ``_update_internal_state`` when a status notification says
+    otherwise). The gate itself is *right* — pulling a file the camera is still writing
+    yields a truncated master — but it has two defects that turn a busy camera into a
+    process that never returns:
+
+    * **The wait is unbounded.** ``await self._ready_lock.acquire(...)`` has no timeout,
+      logs nothing further and raises nothing. Observed on a HERO12 whose QuikCapture
+      kept starting recordings: the pull sat on that line for minutes with the BLE link
+      up. Unattended (the dropzone Mac's discovery loop) it would park forever — no
+      error, no retry, footage silently stops arriving.
+    * **The lock leaks across ``open()``'s retries.** ``_ready_lock`` is built *once*,
+      before the ``for retry in range(RETRIES)`` loop, but ``_open_ble`` acquires it on
+      *every* attempt, and ``close()`` (which runs between attempts) cancels the status
+      tasks without releasing it. So once attempt 1 has acquired the lock, attempt 2
+      waits on a lock whose only releaser — a status notification — no longer has a
+      subscriber. That is a hard deadlock, and it is reached by the ordinary path of a
+      WiFi failure on the first attempt: the second attempt then hangs even against a
+      camera that is perfectly idle.
+
+    So bound both ways in, and reset a lock that a previous attempt leaked (a
+    state-manager acquire finding the lock *already* owned by the state manager can only
+    be a re-entry — :meth:`_update_internal_state` guards its own acquire on the owner
+    being someone else). The result: a leaked lock no longer deadlocks, and a genuinely
+    busy camera fails with an actionable :class:`CameraError` that the next scan retries.
+    """
+    try:
+        from open_gopro.gopro_wireless import _ReadyLock
+    except ImportError:  # pragma: no cover - SDK layout differs across versions
+        return
+
+    owners = getattr(_ReadyLock, "_LockOwner", None)
+    state_manager = getattr(owners, "STATE_MANAGER", None)
+    if state_manager is None:  # pragma: no cover - unknown SDK shape; leave it alone
+        return
+
+    if getattr(_ReadyLock.acquire, "_patched_by_autoedit", False):
+        return
+
+    original_acquire = _ReadyLock.acquire
+    original_aenter = _ReadyLock.__aenter__
+
+    def _reset_if_leaked(lock: Any, owner: Any) -> None:
+        """Drop a lock a previous ``open()`` attempt acquired and never released."""
+        if owner is state_manager and lock.owner is state_manager and lock.lock.locked():
+            logger.warning(
+                "the SDK's camera-ready lock was still held from an earlier connection "
+                "attempt; releasing it so this attempt can wait on the camera's real state"
+            )
+            lock.release()
+
+    async def _bounded_acquire(self: Any, owner: Any) -> None:
+        _reset_if_leaked(self, owner)
+        timeout = _ready_timeout_s()
+        try:
+            await asyncio.wait_for(original_acquire(self, owner), timeout)
+        except TimeoutError:
+            raise CameraError(_READY_TIMEOUT_HELP.format(timeout=timeout)) from None
+
+    async def _bounded_aenter(self: Any) -> Any:
+        timeout = _ready_timeout_s()
+        try:
+            return await asyncio.wait_for(original_aenter(self), timeout)
+        except TimeoutError:
+            raise CameraError(_READY_TIMEOUT_HELP.format(timeout=timeout)) from None
+
+    _bounded_acquire._patched_by_autoedit = True  # type: ignore[attr-defined]
+    _ReadyLock.acquire = _bounded_acquire
+    _ReadyLock.__aenter__ = _bounded_aenter
 
 
 def _load_wired_sdk() -> Any:

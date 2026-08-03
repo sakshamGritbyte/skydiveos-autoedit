@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -515,3 +516,204 @@ def test_a_failed_master_download_still_aborts(tmp_path: Path) -> None:
         asyncio.run(
             pull_camera("1234", root=tmp_path, camera=cam, emit=False, now=lambda: FIXED_NOW)
         )
+
+
+# --------------------------------------------------------------------------- #
+# SDK correction: the "camera is ready" gate must have a deadline.
+#
+# The gate is correct in principle (never transfer a file the camera is still writing),
+# but as shipped it can never end: the acquire has no timeout, and _ready_lock is built
+# once *outside* open()'s retry loop while _open_ble acquires it on every attempt — so
+# attempt 2 waits on a lock whose only releaser (a BUSY/ENCODING notification) no longer
+# has a subscriber. Observed on a HERO12: the pull sat on that line for minutes with BLE
+# up. These tests pin both corrections against a faithful stand-in for the SDK's
+# _ReadyLock, so they run with or without the hardware SDK installed.
+# --------------------------------------------------------------------------- #
+
+import enum as _enum  # noqa: E402
+
+from ingest.camera import (  # noqa: E402
+    _bound_camera_ready_wait,
+    _ready_timeout_s,
+)
+
+
+def _stub_ready_lock(monkeypatch: pytest.MonkeyPatch) -> type:
+    """Install a stub ``gopro_wireless`` module exposing the SDK's ``_ReadyLock`` shape.
+
+    Mirrors the real class (``asyncio.Lock`` + an ``owner`` tag, released only by
+    whoever observes the camera going idle) so the patch is exercised against the
+    same semantics it corrects.
+    """
+
+    class StubReadyLock:
+        class _LockOwner(_enum.Enum):
+            RULE_ENFORCER = _enum.auto()
+            STATE_MANAGER = _enum.auto()
+
+        def __init__(self) -> None:
+            self.lock = asyncio.Lock()
+            self.owner: object | None = None
+
+        async def __aenter__(self) -> StubReadyLock:
+            await self.lock.acquire()
+            return self
+
+        async def __aexit__(self, *_exc: object) -> None:
+            self.release()
+
+        async def acquire(self, owner: object) -> None:
+            await self.lock.acquire()
+            self.owner = owner
+
+        def release(self) -> None:
+            if self.lock.locked():
+                self.lock.release()
+                self.owner = None
+
+    module = _types.ModuleType("open_gopro.gopro_wireless")
+    module._ReadyLock = StubReadyLock  # type: ignore[attr-defined]
+    monkeypatch.setitem(_sys.modules, "open_gopro.gopro_wireless", module)
+    return StubReadyLock
+
+
+def _patched_lock(monkeypatch: pytest.MonkeyPatch, *, timeout: str = "0.05") -> Any:
+    """A patched lock instance with a short deadline, so tests stay fast."""
+    monkeypatch.setenv("GOPRO_READY_TIMEOUT_S", timeout)
+    cls = _stub_ready_lock(monkeypatch)
+    _bound_camera_ready_wait()
+    return cls()
+
+
+def test_a_ready_camera_is_not_made_to_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The healthy path is untouched: a free lock is acquired, and stays held."""
+    lock = _patched_lock(monkeypatch)
+    state_manager = type(lock)._LockOwner.STATE_MANAGER
+
+    asyncio.run(lock.acquire(state_manager))
+
+    assert lock.lock.locked()
+    assert lock.owner is state_manager
+
+
+def test_a_lock_leaked_by_an_earlier_attempt_does_not_deadlock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deadlock: open() retries, but close() never released the state manager's lock.
+
+    Nothing can release it (the status observables are gone), so without the reset this
+    waits forever — here, with a 50 ms deadline, it would raise instead.
+    """
+    lock = _patched_lock(monkeypatch)
+    state_manager = type(lock)._LockOwner.STATE_MANAGER
+
+    async def _first_then_second_attempt() -> None:
+        await lock.acquire(state_manager)  # attempt 1 parks the lock and dies
+        await lock.acquire(state_manager)  # attempt 2 must not hang on it
+
+    asyncio.run(_first_then_second_attempt())
+
+    assert lock.lock.locked(), "the retry still ends up holding the gate"
+    assert lock.owner is state_manager
+
+
+def test_a_busy_camera_fails_with_an_actionable_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Held by someone else and never released == the camera never goes idle."""
+    lock = _patched_lock(monkeypatch)
+    owners = type(lock)._LockOwner
+
+    async def _wait_behind_another_owner() -> None:
+        await lock.acquire(owners.RULE_ENFORCER)
+        await lock.acquire(owners.STATE_MANAGER)
+
+    with pytest.raises(CameraError) as excinfo:
+        asyncio.run(_wait_behind_another_owner())
+
+    message = str(excinfo.value)
+    # The cause is on the device, so the error has to say what to do to the device.
+    assert "never reported itself idle" in message
+    assert "QuikCapture" in message
+    assert "GOPRO_READY_TIMEOUT_S" in message
+
+
+def test_the_rule_enforcers_context_manager_is_bounded_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bounding only acquire() would just move the hang to the first real command.
+
+    ``_enforce_message_rules`` takes the same gate via ``async with``, which calls
+    ``__aenter__`` directly — so a held lock would hang ``get_media_list()`` instead of
+    ``open()``.
+    """
+    lock = _patched_lock(monkeypatch)
+
+    async def _wait_behind_a_held_lock() -> None:
+        await lock.acquire(type(lock)._LockOwner.STATE_MANAGER)
+        async with lock:
+            pass
+
+    with pytest.raises(CameraError, match="never reported itself idle"):
+        asyncio.run(_wait_behind_a_held_lock())
+
+
+def test_the_context_manager_still_passes_through_when_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock = _patched_lock(monkeypatch)
+
+    async def _use_it() -> bool:
+        async with lock as held:
+            return held.lock.locked()
+
+    assert asyncio.run(_use_it()) is True
+    assert not lock.lock.locked(), "the context manager still releases on exit"
+
+
+def test_patching_the_ready_wait_twice_does_not_stack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_load_sdk() runs on every camera open; the patch must be idempotent."""
+    cls = _stub_ready_lock(monkeypatch)
+
+    _bound_camera_ready_wait()
+    once_acquire, once_aenter = cls.acquire, cls.__aenter__
+    _bound_camera_ready_wait()
+
+    assert cls.acquire is once_acquire
+    assert cls.__aenter__ is once_aenter
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("", 60.0),
+        ("120", 120.0),
+        ("2.5", 2.5),
+        ("0", 60.0),        # a zero deadline would fail every pull instantly
+        ("-5", 60.0),
+        ("soon", 60.0),     # a typo must not disable the pull
+    ],
+)
+def test_ready_timeout_reads_the_env_and_falls_back_safely(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: float
+) -> None:
+    monkeypatch.setenv("GOPRO_READY_TIMEOUT_S", raw)
+    assert _ready_timeout_s() == expected
+
+
+def test_an_unknown_sdk_shape_is_left_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A future SDK without ``_LockOwner`` must not be half-patched."""
+
+    class Bare:
+        async def acquire(self, owner: object) -> None:
+            return None
+
+    module = _types.ModuleType("open_gopro.gopro_wireless")
+    module._ReadyLock = Bare  # type: ignore[attr-defined]
+    monkeypatch.setitem(_sys.modules, "open_gopro.gopro_wireless", module)
+
+    _bound_camera_ready_wait()
+
+    assert Bare.acquire.__name__ == "acquire"

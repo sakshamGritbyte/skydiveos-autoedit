@@ -23,12 +23,16 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+#: Cap on the bluetoothctl bond query — a hung helper must not stall a pull.
+_BLUETOOTHCTL_TIMEOUT_S = 10.0
 
 
 class CameraError(RuntimeError):
@@ -160,7 +164,103 @@ def _load_sdk() -> Any:
         from open_gopro import WirelessGoPro
     except ImportError as e:
         raise CameraError(_SDK_MISSING) from e
+    _skip_cohn_wait()
+    _skip_redundant_ble_pairing()
     return WirelessGoPro
+
+
+def _skip_cohn_wait() -> None:
+    """Stop the SDK's COHN handshake from failing an otherwise-healthy connection.
+
+    ``WirelessGoPro.open()`` awaits ``CohnFeature.wait_until_ready()`` unconditionally —
+    even for a BLE-only or BLE+WiFi session, which is all we ever ask for. When a camera
+    never pushes a COHN status (observed on a HERO12 that has BLE connected and has
+    already answered ``GET_THIRD_PARTY_API_VERSION``), that await burns 30 s and then
+    raises, so pairing and every pull fail on a feature we do not use: COHN is GoPro's
+    "camera on your home network" HTTP mode, and we reach the camera over its own WiFi
+    AP or USB instead. Neutralise the wait; nothing downstream reads COHN state.
+    """
+    try:
+        from open_gopro.features.cohn_feature import CohnFeature
+    except ImportError:  # pragma: no cover - SDK layout differs across versions
+        return
+
+    if getattr(CohnFeature.wait_until_ready, "_skipped_by_autoedit", False):
+        return
+
+    async def _no_wait(self: Any) -> None:
+        logger.debug("skipping the SDK's COHN readiness wait (COHN is unused here)")
+
+    _no_wait._skipped_by_autoedit = True  # type: ignore[attr-defined]
+    CohnFeature.wait_until_ready = _no_wait  # type: ignore[method-assign]
+
+
+def _ble_bond_exists(address: str) -> bool:
+    """Whether BlueZ already holds a bond for ``address``. Never raises.
+
+    Asks ``bluetoothctl info`` rather than parsing a device *list*, because the answer
+    for one address is a stable ``Paired: yes`` line — no prompt or delimiter to guess
+    at (which is precisely where the SDK's own check goes wrong).
+    """
+    try:
+        result = subprocess.run(
+            ["bluetoothctl", "info", address],
+            capture_output=True,
+            text=True,
+            timeout=_BLUETOOTHCTL_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        # No bluetoothctl, or it hung: fall through to the SDK's own pairing attempt
+        # rather than claiming a bond we can't see.
+        logger.debug("could not query BlueZ for a bond with %s (%s)", address, e)
+        return False
+    return "Paired: yes" in result.stdout or "Bonded: yes" in result.stdout
+
+
+def _skip_redundant_ble_pairing() -> None:
+    """Stop the SDK re-pairing a camera BlueZ has already bonded.
+
+    ``BleakWrapperController.pair()`` decides "am I already paired?" by parsing
+    ``bluetoothctl devices Paired``: it waits for a ``#`` delimiter, then compares
+    ``line.split()[1]`` against the address. Neither holds on bluetoothctl 5.85 — the
+    prompt is ``[GoPro 9362]>`` (no ``#``) and every line is wrapped in ANSI colour
+    codes — so the check never matches. The SDK then issues ``pair`` against an
+    already-bonded camera, BlueZ answers ``ConnectionAttemptFailed``, and because the
+    SDK only expects ``Accept pairing``/``Pairing successful`` it burns a 30 s timeout
+    per retry and gives up.
+
+    The effect is that a camera pairs **once** and can never be connected again: the
+    first ``--pair`` works, every pull afterwards fails. Observed on a HERO with
+    bluetoothctl 5.85; the dropzone's Mac ingest host hits the same wall on its second
+    connect to any camera.
+
+    So ask BlueZ directly (:func:`_ble_bond_exists`) and skip the pairing dance when a
+    bond is already there, falling through to the SDK for a genuinely new camera.
+    Same shape as :func:`_skip_cohn_wait`: patch the SDK's Linux assumption once, at
+    import, and leave the rest of it alone.
+    """
+    try:
+        from open_gopro.network.ble.adapters.bleak_wrapper import BleakWrapperController
+    except ImportError:  # pragma: no cover - SDK layout differs across versions
+        return
+
+    if getattr(BleakWrapperController.pair, "_patched_by_autoedit", False):
+        return
+
+    original = BleakWrapperController.pair
+
+    async def _pair_only_if_needed(self: Any, handle: Any) -> None:
+        address = getattr(handle, "address", "") or ""
+        if address and _ble_bond_exists(address):
+            logger.info(
+                "BLE bond with %s already exists — skipping the SDK's pair step", address
+            )
+            return
+        await original(self, handle)
+
+    _pair_only_if_needed._patched_by_autoedit = True  # type: ignore[attr-defined]
+    BleakWrapperController.pair = _pair_only_if_needed
 
 
 def _load_wired_sdk() -> Any:

@@ -319,3 +319,127 @@ def test_force_us_english_locale_keeps_an_existing_en_us(monkeypatch):
     monkeypatch.setenv("LANG", "en_US.ISO8859-1")
     _force_us_english_locale()
     assert os.environ["LANG"] == "en_US.ISO8859-1"
+
+
+# --------------------------------------------------------------------------- #
+# SDK correction: never re-pair a camera BlueZ has already bonded.
+#
+# The SDK's own "am I already paired?" check parses `bluetoothctl devices Paired` by
+# waiting for a `#` delimiter and comparing line.split()[1] to the address. On
+# bluetoothctl 5.85 the prompt is `[GoPro 9362]>` and lines carry ANSI colour codes, so
+# it never matches — the SDK then pairs an already-bonded camera, BlueZ answers
+# ConnectionAttemptFailed, and every pull after the first one fails. These tests pin the
+# correction; the SDK is stubbed so they run with or without the hardware SDK installed.
+# --------------------------------------------------------------------------- #
+
+import subprocess as _subprocess  # noqa: E402
+import sys as _sys  # noqa: E402
+import types as _types  # noqa: E402
+
+from ingest.camera import _ble_bond_exists, _skip_redundant_ble_pairing  # noqa: E402
+
+
+class _Handle:
+    def __init__(self, address: str) -> None:
+        self.address = address
+
+
+def _stub_sdk_pair_module(monkeypatch: pytest.MonkeyPatch) -> tuple[type, list[str]]:
+    """Install a stub ``bleak_wrapper`` whose pair() records the addresses it pairs."""
+    paired: list[str] = []
+
+    class StubController:
+        async def pair(self, handle: object) -> None:
+            paired.append(getattr(handle, "address", ""))
+
+    module = _types.ModuleType("open_gopro.network.ble.adapters.bleak_wrapper")
+    module.BleakWrapperController = StubController  # type: ignore[attr-defined]
+    monkeypatch.setitem(
+        _sys.modules, "open_gopro.network.ble.adapters.bleak_wrapper", module
+    )
+    return StubController, paired
+
+
+def _fake_bluetoothctl(monkeypatch: pytest.MonkeyPatch, stdout: str) -> None:
+    def _run(*_a: object, **_k: object) -> object:
+        return _subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr("ingest.camera.subprocess.run", _run)
+
+
+@pytest.mark.parametrize(
+    ("info_output", "expected"),
+    [
+        ("\tPaired: yes\n\tBonded: yes\n", True),
+        ("\tPaired: no\n\tBonded: no\n", False),
+        ("\tBonded: yes\n", True),                      # bonded is enough
+        ("Device DA:BC:C7:6F:33:33 not available\n", False),
+        ("", False),
+    ],
+)
+def test_ble_bond_exists_reads_bluetoothctl(
+    monkeypatch: pytest.MonkeyPatch, info_output: str, expected: bool
+) -> None:
+    _fake_bluetoothctl(monkeypatch, info_output)
+    assert _ble_bond_exists("DA:BC:C7:6F:33:33") is expected
+
+
+def test_ble_bond_exists_survives_a_missing_or_hung_bluetoothctl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No bluetoothctl → report "no bond" and let the SDK try, rather than raising."""
+    for boom in (FileNotFoundError("no bluetoothctl"), _subprocess.TimeoutExpired("x", 10)):
+        def _run(*_a: object, _e: BaseException = boom, **_k: object) -> object:
+            raise _e
+
+        monkeypatch.setattr("ingest.camera.subprocess.run", _run)
+        assert _ble_bond_exists("DA:BC:C7:6F:33:33") is False
+
+
+def test_pairing_is_skipped_when_a_bond_already_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, paired = _stub_sdk_pair_module(monkeypatch)
+    _fake_bluetoothctl(monkeypatch, "\tPaired: yes\n\tConnected: yes\n")
+
+    _skip_redundant_ble_pairing()
+    asyncio.run(controller().pair(_Handle("DA:BC:C7:6F:33:33")))
+
+    assert paired == []  # the SDK's pairing dance never ran
+
+
+def test_a_new_camera_still_pairs(monkeypatch: pytest.MonkeyPatch) -> None:
+    controller, paired = _stub_sdk_pair_module(monkeypatch)
+    _fake_bluetoothctl(monkeypatch, "\tPaired: no\n")
+
+    _skip_redundant_ble_pairing()
+    asyncio.run(controller().pair(_Handle("AA:BB:CC:DD:EE:FF")))
+
+    assert paired == ["AA:BB:CC:DD:EE:FF"]  # first-time pairing is untouched
+
+
+def test_patching_twice_does_not_stack_wrappers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_load_sdk() runs on every camera open; the patch must be idempotent."""
+    controller, paired = _stub_sdk_pair_module(monkeypatch)
+    _fake_bluetoothctl(monkeypatch, "\tPaired: no\n")
+
+    _skip_redundant_ble_pairing()
+    once = controller.pair
+    _skip_redundant_ble_pairing()
+    assert controller.pair is once
+
+    asyncio.run(controller().pair(_Handle("AA:BB:CC:DD:EE:FF")))
+    assert paired == ["AA:BB:CC:DD:EE:FF"]  # wrapped exactly once
+
+
+def test_an_addressless_handle_falls_through_to_the_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing to ask BlueZ about → don't silently skip pairing."""
+    controller, paired = _stub_sdk_pair_module(monkeypatch)
+    _fake_bluetoothctl(monkeypatch, "\tPaired: yes\n")
+
+    _skip_redundant_ble_pairing()
+    asyncio.run(controller().pair(_Handle("")))
+
+    assert paired == [""]

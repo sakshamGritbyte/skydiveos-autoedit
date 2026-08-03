@@ -9,7 +9,7 @@ and the edit that went to the customer::
     <archive_root>/
       2026-07-28/                     ← date of jump (YYYY-MM-DD, sorts naturally)
         Marc-Tremblay/                ← instructor
-          Marie-Dupont/               ← customer
+          14-35_Marie-Dupont/         ← time of jump (DZ-local) + customer
             raw/                      ← the camera masters, exactly as ingested
               instructor/GH010001.MP4 ←   (per-camera role for the Ultimate package)
               external/GH010002.MP4
@@ -54,10 +54,11 @@ import shutil
 import time
 import unicodedata
 from collections.abc import Iterable
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime, tzinfo
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-from .config import Settings
+from .config import Settings, get_settings
 from .jobs import Job, JobStore
 from .lifecycle import media_state
 
@@ -116,26 +117,84 @@ def slugify(value: str | None, *, fallback: str) -> str:
     return slug if slug and slug.strip(".") else fallback
 
 
-def _jump_date(job: Job) -> str:
-    """The jump's date as ``YYYY-MM-DD``: the booking's, else when the job was created.
+def _dz_zone(settings: Settings | None = None) -> tzinfo:
+    """The dropzone's own timezone (``CAMERA_CLOCK_TZ``), falling back to UTC.
 
-    Falls back to the creation timestamp (then today) rather than inventing an
-    ``_unknown`` bucket — a jump always happened on *some* day, and an approximate
-    date still files the folder where an operator will look for it.
+    The archive is browsed by people standing at the dropzone, so its day boundary has
+    to be *their* midnight. Deriving it in UTC files an evening jump under tomorrow —
+    at Parachute MTL (UTC−4 in summer) everything after 20:00 local lands in the wrong
+    folder, which is precisely when the last loads of the day fly.
     """
-    if job.jump_date:
-        # Tolerate a full ISO datetime as well as a plain date.
+    name = (settings or get_settings()).camera_clock_tz
+    if not name:
+        return UTC
+    try:
+        return ZoneInfo(name)
+    except Exception:  # noqa: BLE001 - a bad tz name must not break archiving
+        logger.warning("CAMERA_CLOCK_TZ %r is not a known timezone — using UTC", name)
+        return UTC
+
+
+def _jump_moment(job: Job, settings: Settings | None = None) -> datetime:
+    """When the jump happened, in dropzone-local time — the folder's date and time.
+
+    Preference order, best information first:
+
+    1. ``jump_date`` as a full ISO **datetime** (what SkydiveOS sends from the load's
+       departure time) — the actual flight, so both the date and the ``HH-MM`` prefix
+       are real.
+    2. ``jump_date`` as a plain date — the right day; the time is unknown, so the
+       prefix is dropped rather than invented (see :func:`_jump_time_prefix`).
+    3. ``created_at`` — when the job was opened, which for an auto-discovered jump is
+       minutes after landing. An approximation, but a local one.
+    """
+    zone = _dz_zone(settings)
+    raw = (job.jump_date or "").strip()
+    if raw:
         try:
-            return date.fromisoformat(job.jump_date[:10]).isoformat()
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         except ValueError:
             logger.warning(
                 "job %s has an unparseable jump_date %r — filing under its created date",
                 job.job_id,
                 job.jump_date,
             )
-    if job.created_at:
-        return datetime.fromtimestamp(job.created_at, tz=UTC).date().isoformat()
-    return datetime.now(UTC).date().isoformat()
+        else:
+            # A bare date carries no zone: it is already the dropzone's own day, so
+            # stamp the zone on rather than converting (which would shift the date).
+            return (
+                parsed.replace(tzinfo=zone)
+                if parsed.tzinfo is None
+                else parsed.astimezone(zone)
+            )
+    stamp = job.created_at or time.time()
+    return datetime.fromtimestamp(stamp, tz=zone)
+
+
+def _jump_date(job: Job, settings: Settings | None = None) -> str:
+    """The jump's date as ``YYYY-MM-DD``, in dropzone-local time."""
+    return _jump_moment(job, settings).date().isoformat()
+
+
+def _jump_time_prefix(job: Job, settings: Settings | None = None) -> str:
+    """``HH-MM_`` for the jump folder, or ``""`` when the time isn't actually known.
+
+    REV03 names the folder ``time + instructor + customer``. A prefix is only worth
+    having if it's true: a job whose ``jump_date`` is a bare date (no time) would get
+    the meaningless ``00-00``, so it gets no prefix at all and keeps the legacy name.
+    """
+    raw = (job.jump_date or "").strip()
+    if raw and len(raw) > 10:  # a datetime, not just a date
+        try:
+            datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return ""
+        return _jump_moment(job, settings).strftime("%H-%M_")
+    if not raw and job.created_at:
+        # No booking time at all: the job's own clock is the best available stand-in,
+        # and it's within minutes of the jump for an auto-discovered pull.
+        return _jump_moment(job, settings).strftime("%H-%M_")
+    return ""
 
 
 def archive_root(settings: Settings) -> Path | None:
@@ -262,16 +321,22 @@ def _place_tree(src_dir: Path, dst_dir: Path, *, mode: str) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
-def jump_dir_parts(job: Job) -> tuple[str, str, str]:
+def jump_dir_parts(job: Job, settings: Settings | None = None) -> tuple[str, str, str]:
     """The three path segments a jump files under: ``(date, instructor, customer)``.
 
-    Pure — safe to call for logging, tests, or a UI that wants to show the operator
-    where a job's footage lives without touching the disk.
+    The date is dropzone-local, and the customer segment carries REV03's ``HH-MM_``
+    time prefix when the jump's time is actually known — so the leaf folder reads
+    ``14-35_Sophie-Lavoie``, and two jumps by the same customer on one day sort by
+    time instead of colliding.
+
+    Safe to call for logging, tests, or a UI that wants to show the operator where a
+    job's footage lives without touching the disk.
     """
     return (
-        _jump_date(job),
+        _jump_date(job, settings),
         slugify(job.instructor_name or job.instructor_id, fallback=UNKNOWN_INSTRUCTOR),
-        slugify(job.customer_name, fallback=UNKNOWN_CUSTOMER),
+        _jump_time_prefix(job, settings)
+        + slugify(job.customer_name, fallback=UNKNOWN_CUSTOMER),
     )
 
 
@@ -294,7 +359,14 @@ def _candidate_names(job: Job) -> tuple[str, ...]:
     """
     _, _, customer = jump_dir_parts(job)
     short = job.job_id[:8]
-    return (customer, f"{customer}-{short}", f"{customer}-{job.job_id}")
+    names = [customer, f"{customer}-{short}", f"{customer}-{job.job_id}"]
+    # Folders written before the HH-MM prefix existed are still this job's home: an
+    # already-claimed legacy folder wins over minting a prefixed sibling, so the
+    # change is invisible to jumps already on disk (nothing is moved or duplicated).
+    legacy = slugify(job.customer_name, fallback=UNKNOWN_CUSTOMER)
+    if legacy != customer:
+        names += [legacy, f"{legacy}-{short}", f"{legacy}-{job.job_id}"]
+    return tuple(names)
 
 
 def find_jump_dir(job: Job, root: Path) -> Path | None:
@@ -322,15 +394,20 @@ def resolve_jump_dir(job: Job, root: Path) -> Path:
     and a later job that finds the folder owned by someone else gets a suffixed
     sibling (``Marie-Dupont-1a2b3c4d``) instead of silently merging two jumps' footage.
 
-    Idempotent: the owning job always resolves back to the same folder.
+    Idempotent: the owning job always resolves back to the same folder. That check runs
+    **first**, across every candidate name — including the pre-``HH-MM``-prefix spelling
+    — so a jump already filed on disk keeps its folder instead of gaining a differently
+    named sibling when the naming scheme changes. Nothing is ever moved or re-filed.
     """
+    already_ours = find_jump_dir(job, root)
+    if already_ours is not None:
+        return already_ours
+
     day, instructor, _ = jump_dir_parts(job)
     parent = root / day / instructor
     for name in _candidate_names(job):
         candidate = parent / name
         owner = _owner(candidate) if candidate.is_dir() else None
-        if owner == job.job_id:
-            return candidate
         if owner is None:
             # Free, or an unmarked folder for this very jump (an operator's mkdir, or
             # an archive written before manifests). Claim it by stamping the manifest

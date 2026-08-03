@@ -663,3 +663,108 @@ def test_find_jump_dir_never_creates_a_folder(store: JobStore, settings: Setting
     archive.archive_raw_footage(job, store, settings)
     found = archive.find_jump_dir(job, root)
     assert found is not None and found.is_dir()
+
+
+# --------------------------------------------------------------------------- #
+# C-1 — REV03's "time + instructor + customer", and the dropzone's own midnight.
+#
+# The bug: the date was derived in UTC, so at Parachute MTL (UTC-4 in summer) every
+# jump after 20:00 local filed under TOMORROW — exactly when the last loads fly.
+# --------------------------------------------------------------------------- #
+
+_TORONTO = "America/Toronto"
+
+
+@pytest.fixture
+def dz_tz(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Settings:
+    monkeypatch.setenv("ARCHIVE_ROOT", str(tmp_path / "raw-storage"))
+    monkeypatch.setenv("ARCHIVE_ENABLED", "1")
+    monkeypatch.setenv("CAMERA_CLOCK_TZ", _TORONTO)
+    get_settings.cache_clear()
+    return get_settings()
+
+
+def test_evening_jump_files_under_the_dropzone_day_not_utc(
+    store: JobStore, dz_tz: Settings
+) -> None:
+    """21:30 in Toronto is already tomorrow in UTC. The folder must say the 14th."""
+    job = _job(store, jump_date="2026-08-14T21:30:00")
+    day, _instructor, customer = archive.jump_dir_parts(job, dz_tz)
+    assert day == "2026-08-14"
+    assert customer == "21-30_Marie-Dupont"
+
+
+def test_evening_jump_from_created_at_also_uses_the_dropzone_day(
+    store: JobStore, dz_tz: Settings
+) -> None:
+    """No booking time at all: the job's own clock, read in the DZ's zone."""
+    from datetime import UTC, datetime
+
+    landed = datetime(2026, 8, 15, 1, 30, tzinfo=UTC).timestamp()  # 21:30 on the 14th
+    job = _job(store, jump_date=None)
+    job = store.update(job.job_id, created_at=landed)
+    day, _i, customer = archive.jump_dir_parts(job, dz_tz)
+    assert day == "2026-08-14"
+    assert customer == "21-30_Marie-Dupont"
+
+
+def test_an_aware_jump_date_is_converted_not_reinterpreted(
+    store: JobStore, dz_tz: Settings
+) -> None:
+    job = _job(store, jump_date="2026-08-15T01:30:00Z")  # UTC instant
+    day, _i, customer = archive.jump_dir_parts(job, dz_tz)
+    assert (day, customer) == ("2026-08-14", "21-30_Marie-Dupont")
+
+
+def test_a_bare_date_gets_no_invented_time_prefix(store: JobStore, dz_tz: Settings) -> None:
+    """A prefix is only worth having if it's true — no 00-00 placeholders."""
+    job = _job(store, jump_date="2026-07-28")
+    day, _i, customer = archive.jump_dir_parts(job, dz_tz)
+    assert (day, customer) == ("2026-07-28", "Marie-Dupont")
+
+
+def test_two_jumps_same_day_same_customer_sort_by_time(
+    store: JobStore, dz_tz: Settings
+) -> None:
+    morning = _job(store, job_id="j-am", jump_date="2026-08-14T09:05:00")
+    evening = _job(store, job_id="j-pm", jump_date="2026-08-14T17:40:00")
+    _raw(store, morning, "A.MP4")
+    _raw(store, evening, "B.MP4")
+
+    a = archive.archive_raw_footage(morning, store, dz_tz)
+    b = archive.archive_raw_footage(evening, store, dz_tz)
+    assert a is not None and b is not None and a != b
+    assert a.name == "09-05_Marie-Dupont" and b.name == "17-40_Marie-Dupont"
+    assert sorted([a.name, b.name]) == [a.name, b.name]  # chronological by name
+
+
+def test_a_folder_filed_before_the_prefix_existed_is_reused_not_duplicated(
+    store: JobStore, dz_tz: Settings
+) -> None:
+    """The naming change must not re-file or fork jumps already on disk."""
+    job = _job(store, jump_date="2026-08-14T14:35:00")
+    root = archive.archive_root(dz_tz)
+    assert root is not None
+    legacy = root / "2026-08-14" / "Marc-Tremblay" / "Marie-Dupont"
+    legacy.mkdir(parents=True)
+    (legacy / archive.MANIFEST_FILENAME).write_text(json.dumps({"job_id": job.job_id}))
+
+    _raw(store, job, "GH010001.MP4")
+    placed = archive.archive_raw_footage(job, store, dz_tz)
+
+    assert placed == legacy  # same folder, no 14-35_ sibling
+    assert (legacy / "raw" / "GH010001.MP4").is_file()
+    siblings = sorted(p.name for p in legacy.parent.iterdir())
+    assert siblings == ["Marie-Dupont"]
+    assert archive.find_jump_dir(job, root) == legacy
+
+
+def test_a_bad_timezone_name_falls_back_to_utc_without_breaking(
+    store: JobStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("ARCHIVE_ROOT", str(tmp_path / "raw-storage"))
+    monkeypatch.setenv("CAMERA_CLOCK_TZ", "Mars/Olympus_Mons")
+    get_settings.cache_clear()
+    job = _job(store, jump_date="2026-08-14T21:30:00")
+    day, _i, _c = archive.jump_dir_parts(job, get_settings())
+    assert day == "2026-08-14"  # the naive stamp is used as-is under UTC

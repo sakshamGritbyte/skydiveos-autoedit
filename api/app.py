@@ -345,14 +345,22 @@ def _build_scanner(settings: Settings) -> CameraScanner:
     """The discovery scanner for the configured mode.
 
     ``static`` → a fixed list (no-hardware simulation); ``usb`` → mDNS detection of a
-    USB-connected GoPro (the kiosk path); anything else → the real BLE scan.
+    USB-connected GoPro (the kiosk path); ``sdcard`` → physically inserted SD cards
+    (mount-root polling); anything else → the real BLE scan.
     """
-    from ingest.scanner import BleCameraScanner, StaticCameraScanner, UsbCameraScanner
+    from ingest.scanner import (
+        BleCameraScanner,
+        SdCardScanner,
+        StaticCameraScanner,
+        UsbCameraScanner,
+    )
 
     if settings.camera_scanner == "static":
         return StaticCameraScanner(list(settings.discovery_fake_cameras))
     if settings.camera_scanner == "usb":
         return UsbCameraScanner()
+    if settings.camera_scanner == "sdcard":
+        return SdCardScanner(roots=settings.sdcard_mount_roots)
     return BleCameraScanner()
 
 
@@ -398,6 +406,24 @@ def _build_pull(settings: Settings) -> Callable[..., Awaitable[Any]] | None:
             )
 
         return _usb_pull
+
+    if settings.camera_scanner == "sdcard":
+        async def _sdcard_pull(camera_id: str, *, emitter: EventEmitter | None = None) -> object:
+            from ingest.pull import pull_camera
+            from ingest.sdcard import SdCardCamera, mount_for
+
+            # Re-resolve the mount at pull time — the card may have been re-inserted
+            # (or yanked) between the scan and this pull; a gone card raises the same
+            # CameraError a camera wandering out of BLE range would.
+            mount = mount_for(camera_id, settings.sdcard_mount_roots)
+            return await pull_camera(
+                camera_id,
+                camera=SdCardCamera(mount),
+                emitter=emitter,
+                **_cleanup_kwargs(settings),
+            )
+
+        return _sdcard_pull
 
     if settings.camera_scanner != "static":
         return None
@@ -520,6 +546,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 matcher_role_resolver,
                 s3_notify_uploader,
             )
+            from ingest.qr import qr_identity_resolver
 
             if not settings.skydiveos_api_base:
                 raise RuntimeError(
@@ -567,11 +594,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 ),
                 pull=_build_pull(settings),
                 interval=settings.discovery_interval,
+                # In sdcard mode the QR identity resolver subsumes role resolution
+                # (it fills the load-derived role per clip), so the plain role
+                # resolver stays off — wiring both would resolve every clip twice.
                 role_resolver=(
                     matcher_role_resolver(matcher, clock_tz=settings.camera_clock_tz)
-                    if matcher is not None
+                    if matcher is not None and settings.camera_scanner != "sdcard"
                     else None
                 ),
+                identity_resolver=(
+                    qr_identity_resolver(
+                        matcher,
+                        clock_tz=settings.camera_clock_tz,
+                        max_clip_seconds=settings.sdcard_qr_max_clip_seconds,
+                        scan_seconds=settings.sdcard_qr_scan_seconds,
+                    )
+                    if settings.camera_scanner == "sdcard"
+                    else None
+                ),
+                # A physically inserted card is an operator action; the QR + load
+                # match is the real gate, so unregistered cards are welcome.
+                require_registered=(settings.camera_scanner != "sdcard"),
             )
             await service.start()
             app.state.discovery = service

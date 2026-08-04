@@ -62,7 +62,10 @@ class Settings:
     #: Seconds between BLE discovery sweeps (``DISCOVERY_INTERVAL_SECONDS``).
     discovery_interval: float
     #: Which scanner discovery uses (``CAMERA_SCANNER``): ``"ble"`` (real hardware,
-    #: default) or ``"static"`` — a no-hardware simulation mode that scans a fixed
+    #: default), ``"usb"`` (wired kiosk), ``"sdcard"`` (physically inserted card:
+    #: polls the mount roots for volumes with ``DCIM/``; instructor identity from the
+    #: filmed QR session marker — see :mod:`ingest.sdcard` / :mod:`ingest.qr`) or
+    #: ``"static"`` — a no-hardware simulation mode that scans a fixed
     #: list and stages a sample file instead of pulling a camera (see :mod:`api.app`).
     camera_scanner: str
     #: Delete already-delivered footage off the SD card on the next pull
@@ -194,6 +197,17 @@ class Settings:
     #: once and later archive passes are free; turn it off on a box where even that
     #: one pass is too much I/O.
     archive_hashes: bool = True
+    #: Mount roots the ``sdcard`` scanner polls for inserted cards
+    #: (``SDCARD_MOUNT_ROOTS``, colon-separated). Defaults cover Linux desktop,
+    #: systemd/udisks and macOS.
+    sdcard_mount_roots: tuple[str, ...] = ("/media", "/run/media", "/Volumes")
+    #: Only clips shorter than this are probed for a QR session marker
+    #: (``SDCARD_QR_MAX_CLIP_SECONDS``) — a deliberate marker clip is seconds long,
+    #: and the gate keeps 20-minute jumps out of the decoder.
+    sdcard_qr_max_clip_seconds: float = 60.0
+    #: How much of a candidate clip's head is sampled for the QR
+    #: (``SDCARD_QR_SCAN_SECONDS``).
+    sdcard_qr_scan_seconds: float = 8.0
 
 
 def _flag(name: str, *, default: bool = False) -> bool:
@@ -272,4 +286,12 @@ def get_settings() -> Settings:
         ),
         archive_hashes=_flag("ARCHIVE_HASHES", default=True),
         gallery_rate_limit_per_min=int(os.environ.get("GALLERY_RATE_LIMIT_PER_MIN") or 300),
+        sdcard_mount_roots=tuple(
+            p.strip()
+            for p in (os.environ.get("SDCARD_MOUNT_ROOTS") or "").split(":")
+            if p.strip()
+        )
+        or ("/media", "/run/media", "/Volumes"),
+        sdcard_qr_max_clip_seconds=float(os.environ.get("SDCARD_QR_MAX_CLIP_SECONDS") or 60.0),
+        sdcard_qr_scan_seconds=float(os.environ.get("SDCARD_QR_SCAN_SECONDS") or 8.0),
     )

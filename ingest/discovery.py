@@ -342,6 +342,16 @@ class CameraDiscoveryService:
             await self._sleep_interruptibly(self._interval)
 
     async def _scan_once(self) -> None:
+        # A pull owns the radios for its whole duration (BLE control + the camera's WiFi
+        # AP for the download), and the SDK re-scans BLE inside it. Scanning on top of
+        # that makes BlueZ reject one of the two with "Operation already in progress" —
+        # which can kill the *pull's* scan, not just ours. Nothing is lost by waiting:
+        # pulls are serialised by ``_pull_lock`` anyway, so a second camera found now
+        # would only queue behind the one in flight. It is picked up next tick.
+        if self._inflight:
+            logger.debug("skipping scan: pull in flight for %s", sorted(self._inflight))
+            return
+
         discovered = await self._scanner.scan()
         if not discovered:
             return

@@ -63,9 +63,10 @@ def _matcher():  # noqa: ANN202 - a thin CLI helper
     )
 
 
-#: Outcome of one simulated clip: OK (deliverable), SKIP (nothing was bought — not a
-#: fault), or FAIL (the booking wants media but the chain can't deliver it).
-OK, SKIP, FAIL = "OK  ", "SKIP", "FAIL"
+#: Outcome of one simulated clip: OK (deliverable), PREV (nothing was bought — the
+#: footage still becomes a watermarked preview job behind the paywall), or FAIL (the
+#: booking wants media but the chain can't deliver it).
+OK, PREV, FAIL = "OK  ", "PREV", "FAIL"
 
 
 def _resolve(matcher, serial: str, captured_utc: dt.datetime) -> tuple[str, str]:
@@ -76,9 +77,14 @@ def _resolve(matcher, serial: str, captured_utc: dt.datetime) -> tuple[str, str]
         r = matcher.resolve(serial, captured_utc)
     except FootageMatchError as e:
         return FAIL, f"{type(e).__name__}: {e}"
-    # A jumper who bought no media is a correct outcome, not a broken one.
-    if (r.media_package or "none").strip().lower() in ("", "none"):
-        return SKIP, f"role={r.role} — booking buys no media (mediaPackage='none')"
+    # A jumper who bought no media is now Path B ("we filmed it anyway"): the clip
+    # still becomes a job, editing the role-default package, delivered as a
+    # watermarked preview behind the unlock paywall.
+    if r.entitlement == "preview_only":
+        return PREV, (
+            f"role={r.role} pkg={r.package} — no media purchased; speculative capture "
+            f"→ watermarked preview + paywall"
+        )
     if r.package is None:
         return FAIL, (
             f"role={r.role} customer={r.customer_name!r} — add-on could not be mapped "
@@ -228,10 +234,10 @@ def _replay_day(matcher, settings, day: str) -> int:
                 verdict, detail = _resolve(matcher, serial, captured_utc)
                 print(f"    {label:<8} {serial:<18} {verdict} {detail}")
                 ok += verdict == OK
-                skipped += verdict == SKIP
+                skipped += verdict == PREV
                 failed += verdict == FAIL
         print()
-    print(f"deliverable {ok}, no-media {skipped}, FAILED {failed}")
+    print(f"deliverable {ok}, preview-only {skipped}, FAILED {failed}")
     return 0 if failed == 0 else 1
 
 

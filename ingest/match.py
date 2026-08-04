@@ -127,8 +127,14 @@ class MatchResult(BaseModel):
     media_package: str | None = None
     video_type: str | None = None
     #: Auto-edit package name (``selfie``/``external``/``video_only``/``photo_only``/
-    #: ``ultimum``) or ``None`` when the booking buys no media / can't be mapped.
+    #: ``ultimum``) or ``None`` when a purchased add-on can't be mapped. A booking
+    #: that buys NO media now still gets a package — the role-default speculative one
+    #: — with ``entitlement="preview_only"`` (design doc Path B: "film it anyway").
     package: str | None = None
+    #: ``"edited_download"`` (media purchased) or ``"preview_only"`` (speculative
+    #: capture — watermarked preview behind the paywall). Plain string equal to
+    #: ``api.jobs.Entitlement`` values; this module never imports ``api``.
+    entitlement: str = "edited_download"
 
 
 def package_for(media_package: str | None, video_type: str | None) -> str | None:
@@ -157,6 +163,38 @@ def package_for(media_package: str | None, video_type: str | None) -> str | None
     if vt == "inside":
         return "selfie"
     return None  # video+photos but no camera side named → caller flags it
+
+
+#: Package a speculative ("film it anyway") capture runs through, by camera role.
+#: The instructor's handcam edits like a selfie booking; a cameraman's footage like
+#: the camera-flyer product. Both always make videos — a preview needs something
+#: watchable behind the paywall.
+SPECULATIVE_PACKAGE_BY_ROLE = {"instructor": "selfie", "external": "external"}
+
+
+def package_and_entitlement_for(
+    media_package: str | None, video_type: str | None, role: str
+) -> tuple[str | None, str]:
+    """Map a jumper's booking to ``(package, entitlement)`` — the Path A/B fork.
+
+    Pure, like :func:`package_for` (which it wraps and leaves untouched):
+
+    * purchase mappable → ``(package, "edited_download")`` — Path A.
+    * no purchase (``mediaPackage`` empty/``none``) → the role-default speculative
+      package + ``"preview_only"`` — Path B, the "we filmed it anyway" job whose
+      gallery is watermarked behind the paywall.
+    * a purchase that can't be mapped (e.g. video+photos with no ``videoType``) →
+      ``(None, "edited_download")`` so the caller still flags it for a human.
+
+    Strings equal ``api.jobs.Package`` / ``api.jobs.Entitlement`` values; no ``api``
+    import (dependency-light, like :mod:`edl.validate`).
+    """
+    mapped = package_for(media_package, video_type)
+    if mapped is not None:
+        return mapped, "edited_download"
+    if (media_package or "").strip().lower() in ("", "none"):
+        return SPECULATIVE_PACKAGE_BY_ROLE.get(role, "selfie"), "preview_only"
+    return None, "edited_download"
 
 
 def _in_window(captured_local: datetime, departure_local: datetime | None) -> bool:
@@ -402,6 +440,9 @@ class FootageMatcher:
                     p for p in (cust.get("firstName"), cust.get("lastName")) if p
                 ) or None
 
+        package, entitlement = package_and_entitlement_for(
+            j.get("mediaPackage"), j.get("videoType"), match.role
+        )
         return MatchResult(
             role=match.role,
             staff_id=str(staff_id),
@@ -415,7 +456,8 @@ class FootageMatcher:
             customer_name=customer_name,
             media_package=j.get("mediaPackage"),
             video_type=j.get("videoType"),
-            package=package_for(j.get("mediaPackage"), j.get("videoType")),
+            package=package,
+            entitlement=entitlement,
         )
 
     def close(self) -> None:

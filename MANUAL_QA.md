@@ -7,6 +7,10 @@ plus poori automation ka step-by-step. Har box tick karte jao. ✅
 > customer ka nahi (jab tak sab pass na ho jaye).
 > **Rule #1 ka reason:** galat edit ya galat email real customer tak nahi jaana chahiye.
 >
+> **Ek hi jump ka stage-by-stage deep pass chahiye** (camera on karne se lekar customer
+> ke gallery me videos + photos tak, 14 gates)? →
+> [`MANUAL_QA_CAMERA_TO_GALLERY.md`](MANUAL_QA_CAMERA_TO_GALLERY.md)
+>
 > **Camera paas nahi hai?** → [`QA_NO_GOPRO.md`](QA_NO_GOPRO.md). Wahan paanchon package
 > ka poora stage-by-stage audit ek command me chalta hai
 > (`python scripts/qa_all_packages.py`), purane jobs ke real masters use karke.

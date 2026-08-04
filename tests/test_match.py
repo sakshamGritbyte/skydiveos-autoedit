@@ -17,6 +17,7 @@ from ingest.match import (
     AmbiguousMatch,
     Candidate,
     NoBookingMatch,
+    package_and_entitlement_for,
     package_for,
     select_match,
 )
@@ -210,3 +211,64 @@ class TestStaffLookupBySerialSuffix:
 
         with pytest.raises(UnknownCamera):
             FootageMatcher._staff_for_camera(self._db("C350431344449"), "4313")
+
+
+# --------------------------------------------------------------------------- #
+# package_and_entitlement_for — the Path A / Path B fork
+# --------------------------------------------------------------------------- #
+
+
+class TestPackageAndEntitlement:
+    """A purchase is Path A; no purchase is now Path B ("we filmed it anyway")."""
+
+    @pytest.mark.parametrize(
+        ("media", "video", "role", "expected"),
+        [
+            # Path A: anything actually bought keeps its mapped package, unlocked.
+            ("video", "inside", "instructor", ("video_only", "edited_download")),
+            ("video-photos", "inside", "instructor", ("selfie", "edited_download")),
+            ("video-photos", "outside", "external", ("external", "edited_download")),
+            ("video-photos", "both", "instructor", ("ultimum", "edited_download")),
+            ("photos", None, "instructor", ("photo_only", "edited_download")),
+            # Path B: nothing bought → the role's default package, preview-only.
+            (None, None, "instructor", ("selfie", "preview_only")),
+            ("", None, "instructor", ("selfie", "preview_only")),
+            ("none", None, "instructor", ("selfie", "preview_only")),
+            ("none", None, "external", ("external", "preview_only")),
+            ("None", "inside", "external", ("external", "preview_only")),
+        ],
+    )
+    def test_mapping(
+        self, media: str | None, video: str | None, role: str, expected: tuple[str | None, str]
+    ) -> None:
+        assert package_and_entitlement_for(media, video, role) == expected
+
+    def test_unmappable_purchase_still_flags_rather_than_previewing(self) -> None:
+        """Video+photos with no camera side named is a data problem, not a Path-B job.
+
+        Silently downgrading it to a watermarked preview would quietly under-deliver
+        media the customer PAID for, so it stays ``None`` for the caller to flag.
+        """
+        assert package_and_entitlement_for("video-photos", None, "instructor") == (
+            None,
+            "edited_download",
+        )
+
+    def test_unknown_role_falls_back_to_selfie(self) -> None:
+        assert package_and_entitlement_for("none", None, "wingsuit") == (
+            "selfie",
+            "preview_only",
+        )
+
+    def test_package_for_contract_is_unchanged(self) -> None:
+        """The older helper still means "unmappable/unbought" — callers rely on it."""
+        assert package_for("none", None) is None
+        assert package_for("video-photos", "inside") == "selfie"
+
+    def test_values_match_the_api_enums(self) -> None:
+        """The strings must equal api.jobs' enum values (this module can't import api)."""
+        from api.jobs import Entitlement, Package
+
+        pkg, ent = package_and_entitlement_for("none", None, "external")
+        assert Package(pkg) is Package.external
+        assert Entitlement(ent) is Entitlement.preview_only

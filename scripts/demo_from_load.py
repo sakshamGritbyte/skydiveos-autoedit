@@ -91,6 +91,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("footage", nargs="*", help="raw GoPro MP4s (or use --dir)")
     p.add_argument("--dir", default=None, help="folder of MP4s (e.g. an SD card's 100GOPRO)")
     p.add_argument("--serial", default=_DEFAULT_SERIAL, help="camera serial (staffs.goproSerial)")
+    p.add_argument(
+        "--staff-id", default=None,
+        help="match by SkydiveOS staffs._id instead of --serial — what the SD-card "
+        "flow's QR session marker supplies (see scripts/make_instructor_qr.py)",
+    )
     p.add_argument("--api", default="http://localhost:8000", help="auto-edit API base URL")
     p.add_argument(
         "--at", default=None,
@@ -119,11 +124,15 @@ def main(argv: list[str] | None = None) -> int:
     matcher = FootageMatcher(clock_tz=settings.camera_clock_tz)
     if not matcher.enabled:
         raise SystemExit("error: MONGO_URL not set — the match needs the shared DB")
+    who = f"staff {args.staff_id}" if args.staff_id else f"camera {args.serial}"
     try:
-        m = matcher.resolve(args.serial, captured_at)
+        if args.staff_id:
+            m = matcher.resolve_for_staff(args.staff_id, captured_at)
+        else:
+            m = matcher.resolve(args.serial, captured_at)
     except FootageMatchError as e:
         raise SystemExit(
-            f"error: no confident match for camera {args.serial} at {captured_at}: "
+            f"error: no confident match for {who} at {captured_at}: "
             f"{type(e).__name__}: {e}\n"
             "  → check today's load has this staff + a media add-on + a customer email "
             "(scripts/check_match.py --day <date>)."

@@ -601,13 +601,14 @@ def _settings(**overrides: object) -> Settings:
 
 
 def test_build_scanner_picks_mode() -> None:
-    from ingest.scanner import UsbCameraScanner
+    from ingest.scanner import SdCardScanner, UsbCameraScanner
 
     static = _build_scanner(_settings(camera_scanner="static", discovery_fake_cameras=("1234",)))
     assert isinstance(static, StaticCameraScanner)
     assert asyncio.run(static.scan()) == ["1234"]
     assert isinstance(_build_scanner(_settings(camera_scanner="ble")), BleCameraScanner)
     assert isinstance(_build_scanner(_settings(camera_scanner="usb")), UsbCameraScanner)
+    assert isinstance(_build_scanner(_settings(camera_scanner="sdcard")), SdCardScanner)
 
 
 def test_build_pull_usb_uses_wired_camera() -> None:
@@ -690,6 +691,8 @@ def test_build_pull_modes(monkeypatch) -> None:
     appmod = sys.modules["api.app"]
 
     assert _build_pull(_settings(camera_scanner="ble")) is None
+    # sdcard mode wires a pull against the mounted card.
+    assert _build_pull(_settings(camera_scanner="sdcard")) is not None
     # An explicit sample → a simulated pull callable.
     assert _build_pull(
         _settings(camera_scanner="static", discovery_sample_mp4="x.mp4")
@@ -937,3 +940,224 @@ def test_registry_db_name_resolves_like_the_url(monkeypatch) -> None:
     monkeypatch.delenv("MONGO_DB")
     assert CameraRegistry(mongo_url=None)._db_name == "skydiveos"
     assert CameraRegistry(mongo_url=None, db_name="explicit")._db_name == "explicit"
+
+
+# --------------------------------------------------------------------------- #
+# QR session flow (identity resolver + registry bypass, CAMERA_SCANNER=sdcard)
+# --------------------------------------------------------------------------- #
+
+
+class _KwargsRecordingUploader:
+    """Records positional AND keyword args — the QR flow passes staff_id/marker."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple, dict]] = []
+
+    def __call__(self, *args: object, **kwargs: object) -> str:
+        self.calls.append((args, kwargs))
+        mp4, camera_id = str(args[0]), args[1]
+        prefix = f"raw/{camera_id}/markers" if kwargs.get("marker") else f"raw/{camera_id}"
+        return f"{prefix}/{Path(mp4).name}"
+
+
+def test_identity_resolver_staff_id_reaches_uploader(tmp_path: Path) -> None:
+    """The QR-resolved staff id (and role) ride the hand-off to SkydiveOS."""
+    from ingest.qr import ClipIdentity
+
+    uploads = _KwargsRecordingUploader()
+    registry = FakeRegistry(
+        [CameraRecord(camera_id="4313", paired_at=1.0, instructor_id="inst-1", role="instructor")]
+    )
+    staged = tmp_path / "4313" / "2026-08-04" / "GX010002.MP4"
+    service = CameraDiscoveryService(
+        scanner=StaticCameraScanner(["4313"]),
+        registry=registry,
+        upload=uploads,
+        pull=_make_pull(staged),
+        interval=0.05,
+        identity_resolver=lambda _c, _m: ClipIdentity("staff-A", role="external"),
+    )
+
+    async def scenario() -> None:
+        await service.start()
+        await _wait_for(lambda: bool(uploads.calls))
+        await service.stop()
+
+    asyncio.run(scenario())
+
+    ((args, kwargs),) = uploads.calls
+    # QR role overrides the registry hint; staff_id goes along as a keyword.
+    assert args == (str(staged), "4313", "inst-1", "external")
+    assert kwargs == {"staff_id": "staff-A"}
+
+
+def test_qr_marker_is_uploaded_as_marker_and_never_notified(tmp_path: Path) -> None:
+    """A session-marker clip: PUT under markers/ (ledger entry) but no hand-off."""
+    from ingest.qr import ClipIdentity
+    from ingest.retention import confirmed
+
+    uploads = _KwargsRecordingUploader()
+    registry = FakeRegistry([CameraRecord(camera_id="4313", paired_at=1.0)])
+    staged = tmp_path / "4313" / "2026-08-04" / "GX010001.MP4"
+    service = CameraDiscoveryService(
+        scanner=StaticCameraScanner(["4313"]),
+        registry=registry,
+        upload=uploads,
+        pull=_make_pull(staged),
+        interval=0.05,
+        identity_resolver=lambda _c, _m: ClipIdentity("staff-A", is_qr_marker=True),
+    )
+
+    async def scenario() -> None:
+        await service.start()
+        await _wait_for(lambda: bool(uploads.calls))
+        await service.stop()
+
+    asyncio.run(scenario())
+
+    ((args, kwargs),) = uploads.calls
+    assert kwargs == {"marker": True}
+    assert args == (str(staged), "4313", None, None)
+    # The marker's S3 key is in the ledger, so the sweep may clear it off the card.
+    ledger = confirmed(staged.parent.parent)
+    assert ledger["GX010001.MP4"].s3_key == "raw/4313/markers/GX010001.MP4"
+
+
+def test_clip_with_no_session_hands_off_without_staff_id(tmp_path: Path) -> None:
+    """No preceding QR marker → the hand-off looks exactly like the pre-QR flow."""
+    from ingest.qr import ClipIdentity
+
+    uploads = _KwargsRecordingUploader()
+    registry = FakeRegistry(
+        [CameraRecord(camera_id="4313", paired_at=1.0, instructor_id="inst-1", role="external")]
+    )
+    staged = tmp_path / "4313" / "2026-08-04" / "GX010003.MP4"
+    service = CameraDiscoveryService(
+        scanner=StaticCameraScanner(["4313"]),
+        registry=registry,
+        upload=uploads,
+        pull=_make_pull(staged),
+        interval=0.05,
+        identity_resolver=lambda _c, _m: ClipIdentity(None),
+    )
+
+    async def scenario() -> None:
+        await service.start()
+        await _wait_for(lambda: bool(uploads.calls))
+        await service.stop()
+
+    asyncio.run(scenario())
+
+    ((args, kwargs),) = uploads.calls
+    assert args == (str(staged), "4313", "inst-1", "external")
+    assert kwargs == {}  # no staff_id keyword — old uploaders keep working
+
+
+def test_unregistered_card_pulled_when_registry_bypassed(tmp_path: Path) -> None:
+    """sdcard mode: an inserted card is an operator action — no registry entry needed."""
+    uploads = _RecordingUploader()
+    service = CameraDiscoveryService(
+        scanner=StaticCameraScanner(["sd-NO-NAME"]),
+        registry=FakeRegistry([]),  # nothing paired
+        upload=uploads,
+        pull=_make_pull(tmp_path / "GX010001.MP4"),
+        interval=0.05,
+        require_registered=False,
+    )
+
+    async def scenario() -> None:
+        await service.start()
+        await _wait_for(lambda: bool(uploads.calls))
+        await service.stop()
+
+    asyncio.run(scenario())
+    assert uploads.calls == [(str(tmp_path / "GX010001.MP4"), "sd-NO-NAME", None, None)]
+
+
+def test_registry_still_filters_when_required(tmp_path: Path) -> None:
+    """Regression: the default (require_registered=True) still drops unknown cameras."""
+    uploads = _RecordingUploader()
+    service = CameraDiscoveryService(
+        scanner=StaticCameraScanner(["9999"]),
+        registry=FakeRegistry([]),
+        upload=uploads,
+        pull=_make_pull(tmp_path / "GX010001.MP4"),
+        interval=0.05,
+    )
+
+    async def scenario() -> None:
+        await service.start()
+        await asyncio.sleep(0.2)
+        await service.stop()
+
+    asyncio.run(scenario())
+    assert uploads.calls == []
+
+
+def test_s3_notify_uploader_includes_staff_id(tmp_path, monkeypatch) -> None:
+    """staff_id rides the notify payload with staff_source=qr; absent when None."""
+    import httpx
+
+    from ingest.discovery import s3_notify_uploader
+
+    mp4 = tmp_path / "GX010001.MP4"
+    mp4.write_bytes(b"video-bytes")
+
+    class _FakeS3:
+        def upload_file(self, filename: str, bucket: str, key: str) -> None:
+            pass
+
+    posted: dict[str, object] = {}
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            pass
+
+    def _fake_post(url, *, json, timeout):  # noqa: ANN001
+        posted.update(json=json)
+        return _Resp()
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    upload = s3_notify_uploader("http://skydiveos.test/", bucket="jumps", s3_client=_FakeS3())
+
+    upload(str(mp4), "4313", None, None, staff_id="665f1c0a2ab79c0012345678")
+    assert posted["json"] == {
+        "s3_key": "raw/4313/GX010001.MP4",
+        "camera_id": "4313",
+        "staff_id": "665f1c0a2ab79c0012345678",
+        "staff_source": "qr",
+    }
+
+    posted.clear()
+    upload(str(mp4), "4313", None, None)
+    assert "staff_id" not in posted["json"] and "staff_source" not in posted["json"]
+
+
+def test_s3_notify_uploader_marker_key_and_no_post(tmp_path, monkeypatch) -> None:
+    """marker=True → PUT under markers/ and return the key WITHOUT notifying."""
+    import httpx
+    import pytest
+
+    from ingest.discovery import s3_notify_uploader
+
+    mp4 = tmp_path / "GX010001.MP4"
+    mp4.write_bytes(b"qr-marker-bytes")
+
+    class _FakeS3:
+        def __init__(self) -> None:
+            self.uploads: list[tuple[str, str, str]] = []
+
+        def upload_file(self, filename: str, bucket: str, key: str) -> None:
+            self.uploads.append((filename, bucket, key))
+
+    s3 = _FakeS3()
+    monkeypatch.setattr(
+        httpx, "post",
+        lambda *a, **k: pytest.fail("a QR marker must never be notified to SkydiveOS"),
+    )
+
+    upload = s3_notify_uploader("http://skydiveos.test/", bucket="jumps", s3_client=s3)
+    key = upload(str(mp4), "4313", None, None, marker=True)
+
+    assert key == "raw/4313/markers/GX010001.MP4"
+    assert s3.uploads == [(str(mp4), "jumps", "raw/4313/markers/GX010001.MP4")]

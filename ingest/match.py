@@ -197,6 +197,26 @@ def package_and_entitlement_for(
     return None, "edited_download"
 
 
+def _staff_id_variants(staff_id: Any) -> list[Any]:
+    """Both representations of a staff id, for Mongo equality matching.
+
+    A QR payload carries the ``staffs._id`` as a *string*, while the loads store
+    raw ObjectIds — a bare equality match on the string finds nothing. Returns
+    the value as given plus, for a 24-hex string, its ObjectId form (``bson``
+    ships with pymongo; imported lazily so the pure half of this module stays
+    dependency-light).
+    """
+    variants: list[Any] = [staff_id]
+    if isinstance(staff_id, str) and re.fullmatch(r"[0-9a-fA-F]{24}", staff_id):
+        try:
+            from bson import ObjectId
+
+            variants.append(ObjectId(staff_id))
+        except (ImportError, ValueError):
+            pass  # no driver / not a valid ObjectId — the string variant stands alone
+    return variants
+
+
 def _in_window(captured_local: datetime, departure_local: datetime | None) -> bool:
     """Whether a capture instant falls in a load's flight window (both DZ-local naive)."""
     if departure_local is None:
@@ -380,10 +400,38 @@ class FootageMatcher:
 
         db = self._database()
         staff = self._staff_for_camera(db, gopro_serial)
-        staff_id = staff["_id"]
         staff_name = " ".join(
             p for p in (staff.get("firstName"), staff.get("lastName")) if p
         ) or None
+        return self.resolve_for_staff(staff["_id"], captured_at, staff_name=staff_name)
+
+    def resolve_for_staff(
+        self,
+        staff_id: Any,
+        captured_at: datetime | str,
+        *,
+        staff_name: str | None = None,
+    ) -> MatchResult:
+        """Resolve one clip to its jump when the staff member is already known.
+
+        The QR session-marker flow (:mod:`ingest.qr`) lands here: the filmed QR
+        supplies *who* (the SkydiveOS ``staffs._id``), and this still decides
+        *which jump and which role* from the loads — a staff member can be the
+        tandem instructor on one jump and the cameraman on the next.
+        ``staff_id`` may be the raw ObjectId or its string form (a QR payload is
+        a string; the loads store ObjectIds) — both are matched.
+        """
+        if not self.enabled:
+            raise RegistryUnavailable("MONGO_URL unset; cannot read the shared DB")
+
+        db = self._database()
+        staff_ids = _staff_id_variants(staff_id)
+        if staff_name is None:
+            staff = db[STAFFS].find_one({"_id": {"$in": staff_ids}})
+            if staff:
+                staff_name = " ".join(
+                    p for p in (staff.get("firstName"), staff.get("lastName")) if p
+                ) or None
 
         captured_local = self._to_local(captured_at)
         captured_day = captured_local.date().isoformat()
@@ -392,8 +440,8 @@ class FootageMatcher:
         cursor = db[LOADS].find(
             {
                 "$or": [
-                    {"jumpers.instructor": staff_id},
-                    {"jumpers.assignedCameraman": staff_id},
+                    {"jumpers.instructor": {"$in": staff_ids}},
+                    {"jumpers.assignedCameraman": {"$in": staff_ids}},
                 ]
             }
         )
@@ -404,9 +452,9 @@ class FootageMatcher:
             biz = self._naive_local(load.get("businessDate"))
             dep = self._naive_local(load.get("departureTime"))
             for idx, jumper in enumerate(load.get("jumpers", [])):
-                if jumper.get("instructor") == staff_id:
+                if jumper.get("instructor") in staff_ids:
                     role = "instructor"
-                elif jumper.get("assignedCameraman") == staff_id:
+                elif jumper.get("assignedCameraman") in staff_ids:
                     role = "external"
                 else:
                     continue

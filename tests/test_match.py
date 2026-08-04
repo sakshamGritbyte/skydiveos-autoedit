@@ -272,3 +272,124 @@ class TestPackageAndEntitlement:
         pkg, ent = package_and_entitlement_for("none", None, "external")
         assert Package(pkg) is Package.external
         assert Entitlement(ent) is Entitlement.preview_only
+
+
+# --------------------------------------------------------------------------- #
+# resolve_for_staff — the QR session flow's entry point
+# --------------------------------------------------------------------------- #
+
+
+class TestResolveForStaff:
+    """The QR supplies WHO (a staffs._id string); the loads still decide WHICH jump.
+
+    Load-bearing detail: a QR payload is a *string* while the loads store raw
+    ObjectIds, so ``_staff_id_variants`` must bridge the two or the QR flow
+    matches nothing against a real DB.
+    """
+
+    class _Coll:
+        def __init__(self, docs):
+            self._docs = docs
+
+        def find(self, _q):
+            # The Mongo query is only a prefilter; the code re-checks per jumper.
+            return list(self._docs)
+
+        def find_one(self, q):
+            wanted = q.get("_id")
+            ids = wanted.get("$in") if isinstance(wanted, dict) else [wanted]
+            return next((d for d in self._docs if d.get("_id") in ids), None)
+
+    def _matcher(self, staff_oid, *, departures=(datetime(2026, 7, 21, 13, 0),)):
+        from ingest.match import FootageMatcher
+
+        loads = [
+            {
+                "_id": f"L{i}",
+                "status": "planned",
+                "loadNumber": i + 1,
+                "businessDate": datetime(2026, 7, 21),
+                "departureTime": dep,
+                "jumpers": [
+                    {
+                        "instructor": staff_oid,
+                        "customer": "c1",
+                        "booking": "b1",
+                        "mediaPackage": "video",
+                        "videoType": "inside",
+                    }
+                ],
+            }
+            for i, dep in enumerate(departures)
+        ]
+        matcher = FootageMatcher("mongodb://unused-in-test")
+        matcher._db = {
+            "staffs": self._Coll([{"_id": staff_oid, "firstName": "Marc", "lastName": "T"}]),
+            "loads": self._Coll(loads),
+            "customers": self._Coll([{"_id": "c1", "email": "c@x.test", "firstName": "Cus"}]),
+        }
+        return matcher
+
+    def test_staff_id_variants_bridges_string_and_objectid(self) -> None:
+        from bson import ObjectId
+
+        from ingest.match import _staff_id_variants
+
+        hex_id = "665f1c0a2ab79c0012345678"
+        variants = _staff_id_variants(hex_id)
+        assert variants[0] == hex_id and ObjectId(hex_id) in variants
+        # Anything else passes through untouched.
+        assert _staff_id_variants("not-hex") == ["not-hex"]
+        oid = ObjectId(hex_id)
+        assert _staff_id_variants(oid) == [oid]
+
+    def test_resolve_for_staff_matches_objectid_loads_from_string_id(self) -> None:
+        """A QR's string staff id finds loads keyed by the raw ObjectId."""
+        from bson import ObjectId
+
+        hex_id = "665f1c0a2ab79c0012345678"
+        matcher = self._matcher(ObjectId(hex_id))
+        r = matcher.resolve_for_staff(hex_id, "2026-07-21T13:05:00")
+        assert r.role == "instructor"
+        assert r.staff_id == hex_id
+        assert r.staff_name == "Marc T"  # looked up when not supplied
+        assert r.customer_email == "c@x.test"
+        assert (r.package, r.entitlement) == ("video_only", "edited_download")
+
+    def test_resolve_delegates_to_resolve_for_staff(self, monkeypatch) -> None:
+        """The serial path is now a thin shim over the staff path — one code path."""
+        matcher = self._matcher("s1")
+        matcher._db["staffs"] = self._SerialStaffs()
+        seen: dict[str, object] = {}
+
+        def _spy(staff_id, captured_at, *, staff_name=None):
+            seen.update(staff_id=staff_id, staff_name=staff_name)
+            return "sentinel"
+
+        monkeypatch.setattr(matcher, "resolve_for_staff", _spy)
+        assert matcher.resolve("4313", "2026-07-21T13:05:00") == "sentinel"
+        assert seen == {"staff_id": "s1", "staff_name": "Greg B"}
+
+    class _SerialStaffs:
+        def find_one(self, q):
+            if q.get("goproSerial") == "4313":
+                return {"_id": "s1", "goproSerial": "4313", "firstName": "Greg", "lastName": "B"}
+            return None
+
+        def find(self, _q):
+            return []
+
+    def test_resolve_for_staff_refuses_ambiguity_like_resolve(self) -> None:
+        """Two jumpers at the same departure instant → refuse, exactly as the serial path."""
+        dep = datetime(2026, 7, 21, 13, 0)
+        matcher = self._matcher("s1", departures=(dep, dep))
+        with pytest.raises(AmbiguousMatch):
+            matcher.resolve_for_staff("s1", "2026-07-21T13:05:00")
+
+    def test_resolve_for_staff_requires_db(self, monkeypatch) -> None:
+        from ingest.match import FootageMatcher, RegistryUnavailable
+
+        # mongo_url=None defers to $MONGO_URL — clear it so the matcher is disabled.
+        monkeypatch.delenv("MONGO_URL", raising=False)
+        with pytest.raises(RegistryUnavailable):
+            FootageMatcher(None).resolve_for_staff("s1", "2026-07-21T13:05:00")

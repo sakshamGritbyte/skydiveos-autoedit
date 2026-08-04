@@ -21,10 +21,13 @@ The loop, end to end:
    dedupes hand-offs across scans). Those events are routed to an in-process queue
    instead of Redis; a second loop drains them and, *after* the pull, uploads the
    MP4 to S3 and POSTs a small JSON
-   ``{s3_key, camera_id, instructor_id?, camera_role?, captured_at?}`` to
-   SkydiveOS (``{SKYDIVEOS}/api/media/raw-upload``). SkydiveOS creates the media record
-   from the key — large videos never stream through the web layer, and discovery
-   never creates a job itself.
+   ``{s3_key, camera_id, instructor_id?, camera_role?, captured_at?, staff_id?,
+   staff_source?}`` to SkydiveOS (``{SKYDIVEOS}/api/media/raw-upload``). SkydiveOS
+   creates the media record from the key — large videos never stream through the web
+   layer, and discovery never creates a job itself. In SD-card mode an
+   ``identity_resolver`` (:func:`ingest.qr.qr_identity_resolver`) supplies
+   ``staff_id`` from the filmed QR session marker; the marker clip itself is uploaded
+   under ``markers/`` (retention bookkeeping only) and never notified.
 
 Nothing in :func:`ingest.pull.pull_camera` is modified; the service only triggers
 it and consumes its events. Start/stop are async (use it from a FastAPI lifespan);
@@ -43,6 +46,7 @@ from pathlib import Path
 from typing import Any
 
 from .events import EventEmitter
+from .qr import ClipIdentity  # light import — cv2 stays lazy inside the decode path
 from .registry import CameraRegistry
 from .retention import record_uploaded
 from .scanner import CameraScanner
@@ -72,12 +76,21 @@ PullFn = Callable[..., Awaitable[Any]]
 #: Returning the object key is what lets the card be cleared later: it is the proof that
 #: S3 holds the footage, recorded via :func:`ingest.retention.record_uploaded` and
 #: required before the next pull may delete that file (returning ``None`` keeps it).
-UploadFn = Callable[[str, str, str | None, str | None], str | None]
+#: Implementations must also accept two keywords from the QR session flow:
+#: ``staff_id`` (the QR-resolved ``staffs._id``, forwarded in the notify payload) and
+#: ``marker=True`` (a QR session-marker clip: PUT under ``{prefix}/{camera_id}/markers/``
+#: purely so the retention rule holds, and do NOT notify SkydiveOS).
+UploadFn = Callable[..., str | None]
 #: Resolves a pulled clip's *authoritative* camera role from the load:
 #: ``(camera_id, mp4_path) -> "instructor" | "external" | None``. ``None`` means "couldn't
 #: resolve — fall back to the registry's static role hint". :func:`matcher_role_resolver`
 #: adapts an :class:`ingest.match.FootageMatcher` to this shape.
 RoleResolver = Callable[[str, str], str | None]
+#: Resolves a pulled clip's *identity* — who filmed it — from the QR session flow:
+#: ``(camera_id, mp4_path) -> ClipIdentity | None`` (:func:`ingest.qr.qr_identity_resolver`
+#: builds one). ``None``/``staff_id=None`` mean "no opinion — behave exactly as without
+#: it"; ``is_qr_marker=True`` means the clip is a session marker, never a job.
+IdentityResolver = Callable[[str, str], "ClipIdentity | None"]
 
 
 def matcher_role_resolver(matcher: Any, *, clock_tz: str | None = None) -> RoleResolver:
@@ -212,8 +225,19 @@ def s3_notify_uploader(
         camera_id: str,
         instructor_id: str | None,
         camera_role: str | None = None,
+        *,
+        staff_id: str | None = None,
+        marker: bool = False,
     ) -> str:
         import httpx
+
+        if marker:
+            # A QR session marker is never a job: PUT it under markers/ purely so the
+            # retention rule ("deletable only once S3 confirmed it") stays literally
+            # true and the sweep can clear it off the card — but never notify.
+            key = f"{key_prefix}/{camera_id}/markers/{Path(mp4_path).name}"
+            _client().upload_file(mp4_path, bucket, key)
+            return key
 
         key = f"{key_prefix}/{camera_id}/{Path(mp4_path).name}"
         _client().upload_file(mp4_path, bucket, key)
@@ -223,6 +247,11 @@ def s3_notify_uploader(
             payload["instructor_id"] = instructor_id
         if camera_role is not None:
             payload["camera_role"] = camera_role
+        if staff_id is not None:
+            # The QR-resolved staffs._id: SkydiveOS matches by staff + capture time
+            # and skips its goproSerial lookup (the card may be from any camera).
+            payload["staff_id"] = staff_id
+            payload["staff_source"] = "qr"
         captured_at = _probe_capture_time(mp4_path, clock_tz=clock_tz)
         if captured_at is not None:
             payload["captured_at"] = captured_at
@@ -276,11 +305,18 @@ class CameraDiscoveryService:
         handoff_retry_delay: float = 10.0,
         handoff_max_attempts: int = 10,
         role_resolver: RoleResolver | None = None,
+        identity_resolver: IdentityResolver | None = None,
+        require_registered: bool = True,
     ) -> None:
         self._scanner = scanner
         self._registry = registry
         self._upload = upload
         self._role_resolver = role_resolver
+        self._identity_resolver = identity_resolver
+        #: SD-card mode sets this False: a physically inserted card is an operator
+        #: action (not a BLE stranger in range), and the QR + load match is the real
+        #: gate — unmatchable footage is flagged downstream, never delivered.
+        self._require_registered = require_registered
         self._pull = pull if pull is not None else _default_pull
         self._interval = interval
         self._install_signal_handlers = install_signal_handlers
@@ -358,7 +394,15 @@ class CameraDiscoveryService:
         # Registry read is a (blocking) Mongo call — keep it off the event loop.
         known = await asyncio.to_thread(self._registry.known_active_ids)
         for camera_id in discovered:
-            if camera_id in known and camera_id not in self._inflight:
+            allowed = camera_id in known
+            if not allowed and not self._require_registered:
+                allowed = True
+                logger.info(
+                    "unregistered camera %s accepted (registry allow-list bypassed; "
+                    "identity comes from the QR session marker / load match)",
+                    camera_id,
+                )
+            if allowed and camera_id not in self._inflight:
                 self._inflight.add(camera_id)
                 asyncio.create_task(
                     self._pull_camera(camera_id), name=f"discovery-pull-{camera_id}"
@@ -456,11 +500,44 @@ class CameraDiscoveryService:
                     )
                 camera_role = resolved
 
+        # The QR session flow (SD-card mode): who filmed the clip comes from the QR
+        # marker at the head of the session, not from which camera the card was in.
+        staff_id: str | None = None
+        if self._identity_resolver is not None:
+            identity = self._identity_resolver(camera_id, mp4)
+            if identity is not None:
+                if identity.is_qr_marker:
+                    # A session marker is never a job: PUT it under markers/ (so the
+                    # retention rule holds and the sweep can clear the card) and stop —
+                    # no SkydiveOS notify, no hand-off.
+                    logger.info(
+                        "QR session marker %s (camera %s) — archiving, no job", mp4, camera_id
+                    )
+                    marker_key = self._upload(mp4, camera_id, None, None, marker=True)
+                    if marker_key:
+                        record_uploaded(Path(event["jump_dir"]).parent, Path(mp4).name, marker_key)
+                    return
+                staff_id = identity.staff_id
+                if identity.role is not None:
+                    if identity.role != camera_role:
+                        logger.info(
+                            "camera %s: QR/load-derived role %s overrides %s",
+                            camera_id, identity.role, camera_role,
+                        )
+                    camera_role = identity.role
+                if staff_id is None:
+                    logger.warning(
+                        "clip %s has no QR session marker; falling back to the "
+                        "serial-based match", mp4,
+                    )
+
         logger.info(
             "uploading %s to S3 + notifying SkydiveOS (camera %s, instructor %s, role %s) ...",
             mp4, camera_id, instructor_id, camera_role,
         )
-        s3_key = self._upload(mp4, camera_id, instructor_id, camera_role)
+        # Keyword only when set, so uploaders predating the QR flow keep working.
+        extra = {"staff_id": staff_id} if staff_id is not None else {}
+        s3_key = self._upload(mp4, camera_id, instructor_id, camera_role, **extra)
         logger.info(
             "handed %s off to SkydiveOS (camera %s, instructor %s, role %s)",
             mp4, camera_id, instructor_id, camera_role,

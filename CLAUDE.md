@@ -340,6 +340,22 @@ Two runtime media roots, with different audiences:
   a name you typed. The workaround when the unattended pull is blocked (macOS Wi-Fi, a
   headless service without Location Services, or SkydiveOS not yet turning the raw-upload
   into a job). Needs `MONGO_URL` + the auto-edit API at `--api` with `AUTO_DELIVER=1`
+- `python scripts/skydiveos_bridge.py [--port 9000] [--api <auto-edit>] [--debounce 20]`
+  — local stand-in for the SkydiveOS raw-upload consumer (and the executable reference
+  for its implementation): receives discovery's notify, matches via `FootageMatcher`
+  (`staff_id` from the QR, else camera serial), debounces a jump's clips into ONE job,
+  creates it over the live API and attaches the footage from S3. Dedupe/flag state in
+  `jobs/_bridge_state.json`; refuse-and-flag returns 200 (a 5xx would make discovery
+  retry forever). `bash scripts/run_sdcard_stack.sh` starts worker + bridge + API with
+  `CAMERA_SCANNER=sdcard AUTO_DELIVER=1` — the one-command "insert card → customer
+  emailed" stack for a single machine
+- `python scripts/make_instructor_qr.py --staff-id <staffs._id> --name "<name>"` (or
+  `--all` from `MONGO_URL`) — print-ready QR PNGs instructors film to claim an SD-card
+  session (payload `skydiveos-staff:<_id>`, H-level correction, captioned via Pillow)
+- `python scripts/check_sdcard.py [--decode] [--root <dir>]` — read-only probe of the
+  SD-card flow: which cards the scanner sees, each card's derived identity (serial vs
+  label fallback), and with `--decode` the QR markers + per-clip session attribution
+  (+ `resolve_for_staff` against `MONGO_URL`). Exit 0/1, like `check_match.py`
 - `python scripts/diagnose_ultimum.py <job_id>` — read-only diagnostic for an Ultimate job: per-camera scene classification, combo clip selection by `(camera, scene)`, video-vs-audio stream-duration sync on scene files + rendered outputs (catches the "video freezes, audio continues" desync), per-camera freefall cuts, and photo count — with findings flagging a camera collapsed to one scene, the cameraman absent from a scene, or any desync
 - `ffmpeg -version` — must be 6.0+ for our speed-ramp filter
 - `uvicorn api.app:app --reload` — serve the /api FastAPI service (OpenAPI docs at `/docs`); SkydiveOS calls it to create jobs, upload footage, review, approve, and stream previews
@@ -360,7 +376,30 @@ Two runtime media roots, with different audiences:
   Controlled by `DELETE_AFTER_TRANSFER` (off by default), `DELETE_AFTER_TRANSFER_MIN_AGE_H`
   (24 h grace), `DELETE_AFTER_TRANSFER_DRY_RUN`. `UploadFn` returns the S3 key (or `None`
   to keep the file) — that return value *is* the delete authorisation
-- `CAMERA_SCANNER` selects the discovery transport: `ble` (default — BLE scan + WiFi pull, wireless), `usb` (mDNS detect + `ingest.camera.WiredGoProCamera` pull — the kiosk path, one camera per scan), or `static` (no-hardware simulation: `StaticCameraScanner` + `ingest.camera.LocalSampleCamera` stage `DISCOVERY_SAMPLE_MP4` through the *real* pull path; needs `DISCOVERY_FAKE_CAMERAS`). USB and WiFi share one HTTP download path (`_SdkGoProCamera`); both need the hardware-only Open GoPro SDK.
+- `CAMERA_SCANNER` selects the discovery transport: `ble` (default — BLE scan + WiFi pull, wireless), `usb` (mDNS detect + `ingest.camera.WiredGoProCamera` pull — the kiosk path, one camera per scan), `sdcard` (physically inserted card — see below), or `static` (no-hardware simulation: `StaticCameraScanner` + `ingest.camera.LocalSampleCamera` stage `DISCOVERY_SAMPLE_MP4` through the *real* pull path; needs `DISCOVERY_FAKE_CAMERAS`). USB and WiFi share one HTTP download path (`_SdkGoProCamera`); both need the hardware-only Open GoPro SDK.
+- **SD-card ingest with QR session markers** (`CAMERA_SCANNER=sdcard`,
+  `ingest/sdcard.py` + `ingest/qr.py`): the card comes out of the GoPro and into the
+  ingest machine's reader; `SdCardScanner` polls `SDCARD_MOUNT_ROOTS` for volumes with
+  `DCIM/` and `SdCardCamera` runs the *real* pull path over the mount (staging,
+  manifests, idempotency, retention sweep all unchanged — `DELETE_AFTER_TRANSFER`
+  frees inserted cards too). Card identity = the camera serial in `MISC/version.txt`
+  (last 4 digits, same id a wireless pull would use → shared staging tree + ledger),
+  else an `sd-<label>` fallback. **Who the footage belongs to comes from the filmed QR
+  session marker**: the instructor records a short clip of their printed QR
+  (`scripts/make_instructor_qr.py`, payload `skydiveos-staff:<staffs._id>` — the
+  SkydiveOS staff id, NOT the registry's `instructor_id`) at the start of each session;
+  every later clip (until the next marker, by capture order) belongs to that staff.
+  `ingest.qr.qr_identity_resolver` is discovery's per-clip `identity_resolver`: decode
+  results cache in `<stem>.qr.json` sidecars (clips > `SDCARD_QR_MAX_CLIP_SECONDS`
+  are never probed), the raw-upload payload gains `staff_id` + `staff_source: "qr"`
+  (SkydiveOS matches by staff + `captured_at`, skipping the `goproSerial` lookup), and
+  locally `FootageMatcher.resolve_for_staff(staff_id, captured_at)` — the extracted
+  staff-keyed half of `resolve` — picks the load/role/customer. The marker clip never
+  becomes a job: it uploads to `raw/<camera_id>/markers/` (so the "deletable only once
+  S3 confirmed" rule holds) and is never notified. sdcard mode bypasses the registry
+  allow-list (an inserted card is an operator action; the QR + load match is the real
+  gate) and a clip with no preceding marker falls back to the serial-based match with
+  a WARNING. Probe cards read-only with `python scripts/check_sdcard.py [--decode]`.
 - `python scripts/check_camera.py --usb` / `--wifi --camera <id>` — hardware smoke test: open a real GoPro and list its media (read-only), using the same Camera classes the pull uses. Verifies the SDK + connectivity before enabling discovery.
 - **The service-token gate is what makes this API safe to expose** (`api.auth`
   `service_token_allows`, enforced as a middleware in `create_app`). Every route
@@ -394,6 +433,8 @@ Two runtime media roots, with different audiences:
   `DISCOVERY_SAMPLE_MP4`, `MONGO_URL`, `MONGO_DB`, `ENFORCE_INSTRUCTOR_AUTH`;
   automatic delivery adds `AUTO_DELIVER`, `SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/
   `SMTP_PASSWORD`/`SMTP_STARTTLS`, `DELIVERY_FROM_EMAIL`, `DELIVERY_LINK_TTL_DAYS`;
+  SD-card ingest adds `SDCARD_MOUNT_ROOTS` (colon-separated),
+  `SDCARD_QR_MAX_CLIP_SECONDS`, `SDCARD_QR_SCAN_SECONDS`;
   the jump archive adds `ARCHIVE_ENABLED` (on by default), `ARCHIVE_ROOT` (defaults to
   `$RAW_STORAGE_ROOT`), `ARCHIVE_LINK_MODE` (`link` | `copy` | `symlink`),
   `ARCHIVE_HASHES` (on by default); the entitlement/paywall adds `PUBLIC_BASE_URL` (the

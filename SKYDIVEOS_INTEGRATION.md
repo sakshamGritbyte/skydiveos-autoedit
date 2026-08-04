@@ -13,7 +13,8 @@ match from footage → booking, and passes the result in when it creates the job
 ```
  GoPro card
    │  auto-discovery (this module): pulls MP4s, uploads to S3,
-   │  POSTs { s3_key, camera_id, instructor_id?, camera_role?, captured_at? } to SkydiveOS
+   │  POSTs { s3_key, camera_id, instructor_id?, camera_role?, captured_at?,
+   │          staff_id?, staff_source? } to SkydiveOS
    ▼
  SkydiveOS                     ← owns loads/bookings/customers/add-ons
    │  1. match footage → the manifested jump → its booking
@@ -39,6 +40,24 @@ real UTC instant, safe to convert to DZ-local and match against the flight windo
 `camera_role` (`instructor`/`external`) also rides along so the two-camera Ultimate
 product routes correctly. `captured_at` is omitted only when the file's tag is
 unreadable — fall back to the load time-window match, and refuse-and-flag on ambiguity.
+
+**`staff_id` (with `staff_source: "qr"`) — the SD-card / QR session flow.** When the
+dropzone ingests by physically inserting the SD card (`CAMERA_SCANNER=sdcard`), the
+instructor films their printed QR code at the start of each recording session
+(`scripts/make_instructor_qr.py`; payload `skydiveos-staff:<staffs._id>`). Every clip in
+that session is then POSTed with `staff_id` = that **`staffs._id`** (a string). When
+present, match footage → jump by **`staff_id` + `captured_at`** — the load whose window
+contains the instant, the jumper whose `instructor`/`assignedCameraman` is that staff —
+and **skip the `staffs.goproSerial` lookup entirely**: the card may come from any
+camera, registered or not, so `camera_id` is only a storage key in this flow. Absent
+`staff_id` → the existing serial match applies unchanged. The QR marker clips
+themselves are never notified; they are parked under `raw/{camera_id}/markers/` in S3
+purely so card-retention bookkeeping holds.
+
+An **executable reference implementation** of this consumer lives at
+`scripts/skydiveos_bridge.py` (used locally until the SkydiveOS backend ships it):
+same match rules, per-jump debounce so one session's clips land in one job,
+dedupe on `s3_key`, refuse-and-flag with a 2xx acknowledgement.
 
 ---
 

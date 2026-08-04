@@ -39,6 +39,10 @@ def pinned_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Itera
     # Deployment opt-ins that must never fire implicitly in a test run.
     monkeypatch.setenv("ENABLE_AUTO_DISCOVERY", "0")
     monkeypatch.setenv("AUTO_DELIVER", "0")
+    # A dev box with the service-token gate configured would 401 every TestClient
+    # request; the tests that assert the gate itself set a token explicitly.
+    for var in ("AUTO_EDIT_API_KEY", "AI_BACKEND_API_KEY", "AUTO_EDIT_SERVICE_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
     # Path B's go-live prerequisite: a locked (preview_only) job can only be delivered
     # as the served /j/{code} gallery, so ``POST /jobs`` refuses to create one without
     # an origin to serve it from. Pin it here so the suite exercises the *deliverable*

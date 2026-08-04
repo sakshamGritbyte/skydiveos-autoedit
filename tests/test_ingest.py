@@ -717,3 +717,340 @@ def test_an_unknown_sdk_shape_is_left_alone(monkeypatch: pytest.MonkeyPatch) -> 
     _bound_camera_ready_wait()
 
     assert Bare.acquire.__name__ == "acquire"
+
+
+# --------------------------------------------------------------------------- #
+# _retry_wifi_ap_wait: a slow WiFi AP must retry, not fail the pull
+#
+# WirelessGoPro._open_wifi() enables the camera's AP, polls StatusId.AP_MODE until it
+# reads True, then joins — inside a retry loop whose `except ConnectFailed` branch
+# re-disables the AP so the next attempt starts clean. Two shipped defects make that
+# recovery unreachable: the AP-ready wait is hardcoded at 5 s (a HERO12 routinely needs
+# longer), and it raises TimeoutError, which the loop does NOT catch — so the remaining
+# retries never run and the AP is left half-enabled, which is exactly what makes the next
+# attempt time out too. Observed as a pull failing identically run after run with AP_MODE
+# polling False forever. These tests pin the correction against a stand-in for the SDK's
+# shape, so they run with or without the hardware SDK installed.
+# --------------------------------------------------------------------------- #
+
+from ingest.camera import _ap_ready_timeout_s, _retry_wifi_ap_wait  # noqa: E402
+
+
+class _StubConnectFailed(Exception):
+    def __init__(self, connection: str, timeout: float, retries: int) -> None:
+        super().__init__(f"{connection} failed after {retries} retries")
+
+
+def _stub_exceptions_module(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Install ``open_gopro.domain.exceptions`` exposing ``ConnectFailed``."""
+    module = _types.ModuleType("open_gopro.domain.exceptions")
+    module.ConnectFailed = _StubConnectFailed  # type: ignore[attr-defined]
+    monkeypatch.setitem(_sys.modules, "open_gopro.domain.exceptions", module)
+
+
+class _Resp:
+    def __init__(self, data: object = None, ok: bool = True) -> None:
+        self.data = data
+        self.ok = ok
+
+
+class _StubWireless:
+    """A stand-in for ``WirelessGoPro`` whose AP needs ``ap_ready_after`` polls.
+
+    Records every ``enable_wifi_ap`` call so a test can assert that the between-attempt
+    reset — the half the uncaught TimeoutError skipped — actually fired.
+    """
+
+    #: The SDK guards ``_open_wifi`` with ``_ensure_opened((BLE,))``, which the patch
+    #: preserves; the real class exposes this, so the stub must too.
+    is_ble_connected = True
+
+    def __init__(self, ap_ready_after: int = 0, wifi_open_fails: int = 0) -> None:
+        self.ap_calls: list[bool] = []
+        self.wifi_opened = 0
+        self._polls = 0
+        self._ap_ready_after = ap_ready_after
+        self._wifi_open_fails = wifi_open_fails
+        outer = self
+
+        class _BleCommand:
+            async def get_wifi_password(self) -> _Resp:
+                return _Resp("pw")
+
+            async def get_wifi_ssid(self) -> _Resp:
+                return _Resp("ssid")
+
+            async def enable_wifi_ap(self, *, enable: bool) -> _Resp:
+                outer.ap_calls.append(enable)
+                if enable:
+                    outer._polls = 0  # a fresh AP-raise restarts the readiness count
+                return _Resp(ok=True)
+
+        class _ApMode:
+            async def get_value(self) -> _Resp:
+                outer._polls += 1
+                return _Resp(outer._polls > outer._ap_ready_after)
+
+        class _BleStatus:
+            ap_mode = _ApMode()
+
+        class _Wifi:
+            async def open(self, ssid: str, password: str, timeout: int, retries: int) -> None:
+                if outer.wifi_opened < outer._wifi_open_fails:
+                    outer.wifi_opened += 1
+                    raise _StubConnectFailed("Wifi", timeout, retries)
+                outer.wifi_opened += 1
+
+        self.ble_command = _BleCommand()
+        self.ble_status = _BleStatus()
+        self._wifi = _Wifi()
+
+    async def _open_wifi(self, timeout: int = 30, retries: int = 5) -> None:
+        """The SDK's shipped body, verbatim — what the patch replaces."""
+        for _retry in range(1, retries):
+            try:
+                assert (await self.ble_command.enable_wifi_ap(enable=True)).ok
+
+                async def _wait_for_camera_wifi_ready() -> None:
+                    while not (await self.ble_status.ap_mode.get_value()).data:
+                        await asyncio.sleep(0.001)
+
+                await asyncio.wait_for(_wait_for_camera_wifi_ready(), 5)
+                await self._wifi.open("ssid", "pw", timeout, 1)
+                break
+            except _StubConnectFailed:
+                assert (await self.ble_command.enable_wifi_ap(enable=False)).ok
+        else:
+            raise _StubConnectFailed("Wifi Connection failed", timeout, retries)
+
+
+def _patched_wireless(
+    monkeypatch: pytest.MonkeyPatch, *, timeout: str = "0.5", **kwargs: Any
+) -> _StubWireless:
+    _stub_exceptions_module(monkeypatch)
+    monkeypatch.setenv("GOPRO_AP_READY_TIMEOUT_S", timeout)
+    cls = type("_Patchable", (_StubWireless,), {})
+    _retry_wifi_ap_wait(cls)
+    return cls(**kwargs)
+
+
+def test_the_unpatched_sdk_body_abandons_the_pull_on_a_slow_ap() -> None:
+    """Reproduce the defect: TimeoutError escapes, so no retry and no AP reset."""
+    cam = _StubWireless(ap_ready_after=10**9)  # an AP that never comes up
+
+    async def go() -> None:
+        with pytest.raises(TimeoutError):
+            await _StubWireless._open_wifi(cam)
+
+    asyncio.run(asyncio.wait_for(go(), 10))
+    assert cam.ap_calls == [True], "the shipped body never ran its enable_wifi_ap(False) reset"
+
+
+def test_a_slow_ap_now_retries_and_resets_between_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The AP reset must fire between attempts — a half-enabled AP poisons the next one."""
+    cam = _patched_wireless(monkeypatch, ap_ready_after=10**9)
+
+    with pytest.raises(_StubConnectFailed):
+        asyncio.run(cam._open_wifi())
+
+    assert False in cam.ap_calls, "the AP was never disabled between attempts"
+    assert cam.ap_calls.count(True) > 1, "the timeout did not lead to a retry"
+
+
+def test_an_ap_slower_than_the_sdks_5s_still_connects(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The whole point: the deadline is ours, so a slow-but-healthy AP connects.
+
+    The AP needs more polls (at the SDK's 200 ms cadence) than the hardcoded 5 s allowed
+    for, and the connection succeeds on the first attempt — no retry, no reset.
+    """
+    cam = _patched_wireless(monkeypatch, timeout="2.0", ap_ready_after=3)
+
+    asyncio.run(cam._open_wifi())
+
+    assert cam.wifi_opened == 1
+    assert cam.ap_calls == [True], "a healthy AP must not be reset"
+
+
+def test_a_connect_failure_still_retries_as_before(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The SDK's own ConnectFailed path must keep working unchanged."""
+    cam = _patched_wireless(monkeypatch, wifi_open_fails=1)
+
+    asyncio.run(cam._open_wifi())
+
+    assert cam.wifi_opened == 2, "expected one failed join then a successful retry"
+    assert False in cam.ap_calls
+
+
+def test_a_failing_ap_reset_does_not_mask_the_connection_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Best-effort recovery: a reset that itself fails must not replace the real error."""
+    cam = _patched_wireless(monkeypatch, ap_ready_after=10**9)
+
+    async def _boom(*, enable: bool) -> _Resp:
+        cam.ap_calls.append(enable)
+        if not enable:
+            raise RuntimeError("BLE went away")
+        return _Resp(ok=True)
+
+    monkeypatch.setattr(cam.ble_command, "enable_wifi_ap", _boom)
+
+    with pytest.raises(_StubConnectFailed):
+        asyncio.run(cam._open_wifi())
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("", 30.0), ("45", 45.0), ("0", 30.0), ("-5", 30.0), ("banana", 30.0)],
+)
+def test_the_ap_deadline_falls_back_rather_than_failing_every_pull(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: float
+) -> None:
+    monkeypatch.setenv("GOPRO_AP_READY_TIMEOUT_S", raw)
+    assert _ap_ready_timeout_s() == expected
+
+
+def test_patching_twice_is_a_no_op(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_load_sdk() runs on every connect; the patch must not stack."""
+    _stub_exceptions_module(monkeypatch)
+    cls = type("_Patchable", (_StubWireless,), {})
+    _retry_wifi_ap_wait(cls)
+    # Compare the class slot, not `cls._open_wifi`: the SDK's guard is a wrapt decorator
+    # that hands back a fresh bound wrapper on every attribute access.
+    first = cls.__dict__["_open_wifi"]
+    _retry_wifi_ap_wait(cls)
+
+    assert cls.__dict__["_open_wifi"] is first
+
+
+def test_an_sdk_without_open_wifi_is_left_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A future SDK shape must not be half-patched."""
+    _stub_exceptions_module(monkeypatch)
+
+    class Bare:
+        pass
+
+    _retry_wifi_ap_wait(Bare)
+
+    assert not hasattr(Bare, "_open_wifi")
+
+
+# --------------------------------------------------------------------------- #
+# SDK correction: a stale NetworkManager profile must not fail the WiFi join.
+#
+# On Linux the SDK joins the camera's AP with `nmcli dev wifi connect`. When a profile
+# for that SSID already exists (left behind by ANY previous pull), NetworkManager
+# updates it instead of creating a fresh one — with an incomplete security section
+# that NM rejects: `Error: 802-11-wireless-security.key-mgmt: property is missing.`
+# So the first pull works and every later one fails until an operator hand-runs
+# `nmcli con delete GP<serial>` (observed repeatedly on a HERO12, profile GP26489362).
+# The SDK's own driver ships the cleanup (`_clean`) but never calls it before connect.
+# These tests pin the correction against a faithful stub of the two nmcli drivers.
+# macOS/Windows are untouched by construction: their drivers are different classes,
+# and driver *detection* — not this patch — decides which one a host instantiates.
+# --------------------------------------------------------------------------- #
+
+from ingest.camera import _forget_stale_nm_profile  # noqa: E402
+
+
+def _stub_nmcli_module(
+    monkeypatch: pytest.MonkeyPatch, *, clean_raises: bool = False
+) -> tuple[Any, Any]:
+    """Install a stub SDK wireless-adapters module with both nmcli driver classes.
+
+    Each stub records the order of profile cleanups vs connects, so a test can assert
+    the cleanup happened first — the whole point of the patch.
+    """
+
+    def _make_controller() -> Any:
+        class StubNmcli:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            def _clean(self, partial: str) -> None:
+                if clean_raises:
+                    raise RuntimeError("nmcli exploded")
+                self.calls.append(("clean", partial))
+
+            async def connect(self, ssid: str, password: str, timeout: float = 15) -> bool:
+                self.calls.append(("connect", ssid))
+                return True
+
+        return StubNmcli
+
+    module = _types.ModuleType("open_gopro.network.wifi.adapters.wireless")
+    # The REAL class names (verified against the installed SDK) — the patch matches on
+    # the Nmcli name prefix + shape, so a stub with made-up names would pass while the
+    # real SDK silently went unpatched.
+    module.NmcliWireless = _make_controller()  # type: ignore[attr-defined]
+    module.Nmcli0990Wireless = _make_controller()  # type: ignore[attr-defined]
+    monkeypatch.setitem(
+        _sys.modules, "open_gopro.network.wifi.adapters.wireless", module
+    )
+    return module.NmcliWireless, module.Nmcli0990Wireless
+
+
+def test_connect_deletes_the_stale_profile_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    legacy, modern = _stub_nmcli_module(monkeypatch)
+    _forget_stale_nm_profile()
+
+    for cls in (legacy, modern):
+        drv = cls()
+        assert asyncio.run(drv.connect("GP26489362", "pw")) is True
+        # The order IS the fix: nmcli must take its create path, so the stale
+        # profile has to be gone before the connect runs.
+        assert drv.calls == [("clean", "GP26489362"), ("connect", "GP26489362")]
+
+
+def test_a_failing_cleanup_never_breaks_the_connect(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cleanup is recovery for the NEXT failure mode; it must not invent a new one."""
+    _legacy, modern = _stub_nmcli_module(monkeypatch, clean_raises=True)
+    _forget_stale_nm_profile()
+
+    drv = modern()
+    assert asyncio.run(drv.connect("GP26489362", "pw")) is True
+    assert drv.calls == [("connect", "GP26489362")]
+
+
+def test_patching_the_nm_cleanup_twice_does_not_stack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_load_sdk() runs on every camera open; the patch must be idempotent."""
+    _legacy, modern = _stub_nmcli_module(monkeypatch)
+
+    _forget_stale_nm_profile()
+    once = modern.connect
+    _forget_stale_nm_profile()
+
+    assert modern.connect is once
+    drv = modern()
+    asyncio.run(drv.connect("GP26489362", "pw"))
+    assert drv.calls.count(("clean", "GP26489362")) == 1, "cleanup ran more than once"
+
+
+def test_an_sdk_without_the_nmcli_drivers_is_left_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """macOS/Windows driver classes (or a renamed SDK) must not be half-patched."""
+    module = _types.ModuleType("open_gopro.network.wifi.adapters.wireless")
+
+    class NetworksetupWireless:  # the macOS driver: not an Nmcli name, no _clean
+        async def connect(self, ssid: str, password: str, timeout: float = 15) -> bool:
+            return True
+
+    class NmcliFutureWireless:  # a future nmcli driver missing the cleanup hook
+        async def connect(self, ssid: str, password: str, timeout: float = 15) -> bool:
+            return True
+
+    module.NetworksetupWireless = NetworksetupWireless  # type: ignore[attr-defined]
+    module.NmcliFutureWireless = NmcliFutureWireless  # type: ignore[attr-defined]
+    monkeypatch.setitem(
+        _sys.modules, "open_gopro.network.wifi.adapters.wireless", module
+    )
+
+    _forget_stale_nm_profile()  # must simply not blow up, and not touch either class
+
+    assert not getattr(NetworksetupWireless.connect, "_patched_by_autoedit", False)
+    assert not getattr(NmcliFutureWireless.connect, "_patched_by_autoedit", False)

@@ -21,6 +21,7 @@ is exercised without hardware.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 import os
 import shutil
@@ -195,6 +196,8 @@ def _load_sdk() -> Any:
     _skip_cohn_wait()
     _skip_redundant_ble_pairing()
     _bound_camera_ready_wait()
+    _retry_wifi_ap_wait(WirelessGoPro)
+    _forget_stale_nm_profile()
     return WirelessGoPro
 
 
@@ -399,6 +402,198 @@ def _bound_camera_ready_wait() -> None:
     _bounded_acquire._patched_by_autoedit = True  # type: ignore[attr-defined]
     _ReadyLock.acquire = _bounded_acquire
     _ReadyLock.__aenter__ = _bounded_aenter
+
+
+#: Default deadline for the camera to raise its WiFi access point, in seconds. The SDK
+#: hardcodes 5, which a HERO12 misses routinely — especially on the first attempt after
+#: a previous session left the AP half-enabled.
+_AP_READY_TIMEOUT_DEFAULT_S = 30.0
+
+
+def _ap_ready_timeout_s() -> float:
+    """How long to wait for the camera's WiFi AP to come up. Never raises.
+
+    Read per call (not at import), same contract as :func:`_ready_timeout_s`, so an
+    operator can raise ``GOPRO_AP_READY_TIMEOUT_S`` without a code change.
+    """
+    raw = os.environ.get("GOPRO_AP_READY_TIMEOUT_S", "").strip()
+    if not raw:
+        return _AP_READY_TIMEOUT_DEFAULT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("ignoring non-numeric GOPRO_AP_READY_TIMEOUT_S=%r", raw)
+        return _AP_READY_TIMEOUT_DEFAULT_S
+    return value if value > 0 else _AP_READY_TIMEOUT_DEFAULT_S
+
+
+def _retry_wifi_ap_wait(wireless_cls: Any) -> None:
+    """Make a slow WiFi access point retry (and reset) instead of failing the pull.
+
+    ``WirelessGoPro._open_wifi()`` asks the camera to raise its AP, polls
+    ``StatusId.AP_MODE`` until it reads True, then joins the AP — all inside a
+    ``for retry in range(1, retries)`` loop whose ``except ConnectFailed`` branch
+    re-disables the AP so the next attempt starts from a known state. That recovery is
+    exactly right, and as shipped it is unreachable for the failure we actually hit:
+
+    * **The AP-ready deadline is hardcoded at 5 s** —
+      ``await asyncio.wait_for(_wait_for_camera_wifi_ready(), 5)``. A HERO12 routinely
+      needs longer, so the wait expires while the camera is still bringing the AP up.
+    * **It raises ``TimeoutError``, which the loop does not catch.** ``ConnectFailed`` is
+      the only handled type, so the timeout propagates straight out of ``_open_wifi``:
+      the remaining retries never run, and — the damaging half — the
+      ``enable_wifi_ap(enable=False)`` reset never fires. The camera is left with its AP
+      half-enabled, which is precisely the state that makes the *next* attempt time out
+      too. Observed as a pull that fails identically run after run, looking like a dead
+      camera, while ``AP_MODE`` polls ``False`` forever in the log.
+
+    So reimplement the method with the deadline read from the environment and
+    ``TimeoutError`` handled alongside ``ConnectFailed``. The retry/reset logic is the
+    SDK's own, kept line-for-line; only the deadline and the caught type change. Same
+    shape as the other corrections here (:func:`_skip_cohn_wait`,
+    :func:`_skip_redundant_ble_pairing`, :func:`_bound_camera_ready_wait`): patch the
+    assumption once at import, leave the rest of the SDK alone, and stay a no-op on an
+    SDK whose shape we don't recognise.
+    """
+    original = getattr(wireless_cls, "_open_wifi", None)
+    if original is None:  # pragma: no cover - unknown SDK shape; leave it alone
+        return
+    if getattr(original, "_patched_by_autoedit", False):
+        return
+    try:
+        from open_gopro.domain.exceptions import ConnectFailed
+    except ImportError:  # pragma: no cover - SDK layout differs across versions
+        return
+
+    async def _open_wifi(self: Any, timeout: int = 30, retries: int = 5) -> None:
+        logger.info("Discovering Wifi AP info and enabling via BLE")
+        password = (await self.ble_command.get_wifi_password()).data
+        ssid = (await self.ble_command.get_wifi_ssid()).data
+        ap_deadline = _ap_ready_timeout_s()
+        for retry in range(1, retries):
+            try:
+                assert (await self.ble_command.enable_wifi_ap(enable=True)).ok
+
+                async def _wait_for_camera_wifi_ready() -> None:
+                    logger.info("waiting for the camera's WiFi AP (up to %gs)", ap_deadline)
+                    while not (await self.ble_status.ap_mode.get_value()).data:
+                        await asyncio.sleep(0.200)
+
+                await asyncio.wait_for(_wait_for_camera_wifi_ready(), ap_deadline)
+                await self._wifi.open(ssid, password, timeout, 1)
+                break
+            except (ConnectFailed, TimeoutError) as e:
+                # The reset below is the point: an AP left half-enabled by this attempt
+                # makes every later attempt time out the same way.
+                logger.warning(
+                    "WiFi connection attempt %d failed (%s); disabling the camera's AP "
+                    "so the next attempt starts clean",
+                    retry,
+                    type(e).__name__,
+                )
+                with _suppress_ap_reset_errors():
+                    assert (await self.ble_command.enable_wifi_ap(enable=False)).ok
+        else:
+            raise ConnectFailed("Wifi Connection failed", timeout, retries)
+
+    # Keep the SDK's "BLE must already be open" guard on the replacement, so the only
+    # differences from the original really are the deadline and the caught type.
+    patched = _open_wifi
+    try:
+        from open_gopro.gopro_base import GoProBase, GoProMessageInterface
+
+        patched = GoProBase._ensure_opened((GoProMessageInterface.BLE,))(_open_wifi)
+    except (ImportError, AttributeError):  # pragma: no cover - unknown SDK shape
+        logger.debug("SDK's _ensure_opened guard unavailable; patching _open_wifi without it")
+
+    patched._patched_by_autoedit = True  # type: ignore[attr-defined]
+    wireless_cls._open_wifi = patched
+
+
+@contextmanager
+def _suppress_ap_reset_errors() -> Iterator[None]:
+    """Let the AP reset fail without masking the connection error that triggered it.
+
+    The reset is best-effort recovery on a link that has just misbehaved; if the BLE
+    command itself fails there is nothing further to do but try the next attempt.
+    """
+    try:
+        yield
+    except Exception as e:  # noqa: BLE001 - recovery must not replace the real failure
+        logger.warning("could not disable the camera's WiFi AP between attempts: %s", e)
+
+
+def _forget_stale_nm_profile() -> None:
+    """Delete a stale NetworkManager profile for the camera's SSID before connecting.
+
+    On Linux the SDK joins the camera's AP with ``nmcli dev wifi connect``. When a
+    profile for that SSID already exists — left behind by any previous pull —
+    NetworkManager *updates* it instead of creating a fresh one, and the update carries
+    an incomplete security section, which NM rejects before ever touching the radio::
+
+        Error: 802-11-wireless-security.key-mgmt: property is missing.
+
+    So the first pull after boot works (create path) and every later one fails
+    (update path) until an operator runs ``nmcli con delete GP<serial>`` by hand —
+    observed repeatedly on a HERO12 (profile ``GP26489362``). The SDK's nmcli driver
+    even ships the cleanup (``_clean(partial)``, which deletes every connection whose
+    name contains the given string); it is just never called before ``connect``. Call
+    it, so ``nmcli`` always takes the create path it gets right.
+
+    Cross-platform by construction: only the two Linux nmcli driver classes are
+    patched, and the SDK's driver *detection* — not this patch — decides which driver
+    a host uses. macOS (``networksetup``) and Windows (``netsh``) never instantiate
+    these classes, keep their own drivers untouched, and have no stored-profile bug of
+    this shape to begin with. Same pattern as the other corrections here: patch once at
+    import, no-op on an SDK whose shape we don't recognise, and never let the cleanup
+    itself break a connect that might have succeeded anyway.
+    """
+    try:
+        # import_module (not `from … import wireless`) so the module is resolved via
+        # sys.modules — the same seam the tests stub, and the canonical instance even
+        # if the parent package caches a different attribute.
+        _sdk_wireless = importlib.import_module("open_gopro.network.wifi.adapters.wireless")
+    except ImportError:  # pragma: no cover - SDK layout differs across versions
+        return
+
+    # Match the nmcli drivers by name prefix + shape rather than exact class names:
+    # the SDK has renamed them before (NmcliWireless / Nmcli0990Wireless today), and a
+    # rename must degrade to "patch skipped", never to patching the wrong driver.
+    controllers: list[Any] = [
+        cls
+        for name in dir(_sdk_wireless)
+        if name.startswith("Nmcli")
+        and isinstance(cls := getattr(_sdk_wireless, name), type)
+        and callable(getattr(cls, "connect", None))
+        and callable(getattr(cls, "_clean", None))
+    ]
+    for controller in controllers:
+        original = controller.connect
+        if getattr(original, "_patched_by_autoedit", False):
+            continue
+
+        async def _connect_with_fresh_profile(
+            self: Any,
+            ssid: str,
+            password: str,
+            timeout: float = 15,
+            *,
+            _original: Any = original,
+        ) -> Any:
+            try:
+                logger.info(
+                    "removing any stale NetworkManager profile for %r before connecting",
+                    ssid,
+                )
+                # _clean shells out to nmcli; keep it off the event loop, which is
+                # also running the BLE keep-alive.
+                await asyncio.to_thread(self._clean, ssid)
+            except Exception as e:  # noqa: BLE001 - cleanup must never break the connect
+                logger.warning("could not clear stale profile(s) for %r: %s", ssid, e)
+            return await _original(self, ssid, password, timeout)
+
+        _connect_with_fresh_profile._patched_by_autoedit = True  # type: ignore[attr-defined]
+        controller.connect = _connect_with_fresh_profile
 
 
 def _load_wired_sdk() -> Any:

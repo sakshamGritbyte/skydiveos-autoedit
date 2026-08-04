@@ -11,6 +11,8 @@ So the scan is an injectable seam, mirroring :class:`ingest.camera.Camera`:
   returns the trailing serial digits of every GoPro it sees (``bleak`` imported
   lazily, so importing this module never drags the BLE stack in).
 * :class:`StaticCameraScanner` — a fixed list, for tests and dry runs.
+* :class:`SdCardScanner` — physically inserted SD cards (volumes with ``DCIM/``
+  under the configured mount roots); pure filesystem, no hardware deps.
 
 A "camera id" here is the same trailing-serial-digit string the rest of /ingest
 uses (the ``target`` passed to the Open GoPro SDK and the ``{camera_id}`` storage
@@ -19,9 +21,12 @@ segment) — e.g. ``"1234"`` for a camera advertising as ``"GoPro 1234"``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
+from pathlib import Path
 
 from .camera import CameraError
 
@@ -128,3 +133,25 @@ class UsbCameraScanner(CameraScanner):
         # Service name looks like "GoPro 1234._gopro-web._tcp.local." → the camera id.
         camera_id = camera_id_from_name(str(response.name).split(".")[0])
         return [camera_id] if camera_id is not None else []
+
+
+class SdCardScanner(CameraScanner):
+    """The card-reader scanner: detects physically inserted GoPro SD cards.
+
+    Each scan polls the configured mount roots for volumes containing ``DCIM/``
+    (:func:`ingest.sdcard.find_cards`) and reports one camera id per card —
+    preferably the serial digits from the card's ``MISC/version.txt``, so an
+    inserted card and a wireless pull of the same GoPro share one identity.
+    Pure filesystem I/O; needs no hardware deps, but runs off the event loop.
+    """
+
+    def __init__(self, *, roots: Sequence[str | Path] | None = None) -> None:
+        from .sdcard import DEFAULT_MOUNT_ROOTS
+
+        self._roots: tuple[str | Path, ...] = tuple(roots) if roots else DEFAULT_MOUNT_ROOTS
+
+    async def scan(self) -> list[str]:
+        from .sdcard import find_cards
+
+        cards = await asyncio.to_thread(find_cards, self._roots)
+        return [card.camera_id for card in cards]

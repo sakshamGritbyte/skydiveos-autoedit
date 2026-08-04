@@ -27,3 +27,4 @@ __pycache__/
 # Real GoPro footage staged in templates for local testing — never commit
 templates/*.mp4
 templates/*.MP4
+qr-codes/

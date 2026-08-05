@@ -361,6 +361,23 @@ Two runtime media roots, with different audiences:
 - `uvicorn api.app:app --reload` — serve the /api FastAPI service (OpenAPI docs at `/docs`); SkydiveOS calls it to create jobs, upload footage, review, approve, and stream previews
 - `celery -A api.celery_app.celery_app worker -l info` — run the worker that executes the async pipeline tasks /api enqueues (set `CELERY_TASK_ALWAYS_EAGER=1` to run tasks inline without a worker, for a single-process demo). **Never leave eager on when a worker is running**: the upload endpoint then runs the whole segment→score→render inline in the API process, so for the ~15 min of an edit `GET /jobs`, `/docs`, the review UI and the discovery loop all block (verified: `GET /jobs` times out, discovery stops scanning). Eager also skips `ultimum_watchdog_job`
 - Camera auto-discovery (`api.app` lifespan → `ingest.discovery.CameraDiscoveryService`): when `ENABLE_AUTO_DISCOVERY=1`, the API BLE-scans every `DISCOVERY_INTERVAL_SECONDS` (default 30) for *paired* cameras (the allow-list in the MongoDB `cameras` collection), runs the existing `pull_camera` for each unseen one, **uploads each pulled MP4 to S3** (`S3_BUCKET`, key `raw/{camera_id}/{file}`) then **POSTs JSON** `{s3_key, camera_id, instructor_id?, camera_role?, captured_at?}` to `{SKYDIVEOS_API_BASE}/api/media/raw-upload` (`captured_at` = a TRUE-UTC ISO-8601 instant from the MP4's `creation_time` via ffprobe, best-effort, so SkydiveOS can match footage→booking by camera + capture time; `camera_role` routes the two Ultimate angles). GoPro writes the camera's LOCAL wall-clock into `creation_time` mislabelled as UTC, so `CAMERA_CLOCK_TZ` (the dropzone's IANA zone, e.g. `America/Toronto`) is used to convert it to real UTC — set it or the match skews by the UTC offset (`ingest.discovery._to_true_utc`). SkydiveOS creates the media/job from the key (`POST /jobs` for the booking metadata, then `POST /jobs/{id}/upload` with an `s3_key` form field → `api.tasks.ingest_s3_job` downloads that S3 object into the job's `raw/` staging — per-`camera_role` for `ultimum` — and hands off to the same pipeline dispatch a byte upload uses, so big files never stream through the web layer). An `ultimum` ingest that has only one camera so far arms `api.tasks.ultimum_watchdog_job` (countdown `ULTIMUM_SECOND_CAMERA_TIMEOUT_S`, default 1h; skipped in eager mode): if the second camera never arrives the job is failed with an actionable error instead of hanging in `queued` — the guard against a missing second camera or a booking mis-mapped to the two-camera package. Discovery does **not** create jobs itself (needs `SKYDIVEOS_API_BASE` + `S3_BUCKET` set). Off by default — pulls stay operator/SkydiveOS-triggered until opted in. Manage the registry via `GET /cameras`, `DELETE /cameras/{id}` (soft-deactivate, admin), `POST /cameras/{id}/assign` (register/assign owning instructor, admin). The BLE scan needs the hardware-only `bleak`/Open GoPro SDK; the registry needs `pymongo[srv]` + `MONGO_URL`.
+- **A multi-clip jump renders ONCE** (`api.tasks.raw_clips_settled_job`). SkydiveOS
+  notifies once *per clip*, so one jump filmed as several files (a GoPro chapters a 4 GB
+  master; an instructor stops/starts recording) arrives as several
+  `POST /jobs/{id}/upload` calls. Dispatching per call started a render per clip:
+  concurrent renders sharing a job dir, each cutting whatever subset had landed, and with
+  `AUTO_DELIVER` the first to finish emailed the customer a **partial edit**. So the
+  `s3_key` path stamps `Job.last_raw_clip_at` and arms a settle check that re-schedules
+  itself (`RAW_CLIP_SETTLE_POLL_SECONDS`) until the job has been quiet for
+  `RAW_CLIP_SETTLE_SECONDS` (default 180 — it must exceed the gap between a jump's
+  notifications, which is really the previous clip's S3 upload time; `0` restores
+  dispatch-immediately). Re-scheduling rather than cancelling is the same trick
+  `ultimum_watchdog_job` uses. `Job.processing_dispatched` then makes dispatch
+  **exactly-once** — every dispatch goes through `_dispatch_processing` (including the
+  ultimum both-roles-present branch, where a re-notified clip would otherwise re-render)
+  — and is cleared only when footage is re-attached to a `failed`/`rejected` job, which
+  is a genuine retry. `POST /jobs/{id}/upload` also accepts **repeated `s3_key` fields**
+  so a caller that already knows the whole clip set attaches it in one call.
 - **Card retention** (`ingest/retention.py`): a dropzone card holds ~30 Ultimate jumps, so
   at 4–5 jumps/day it fills within a week — and a full card *silently stops recording*
   mid-day. So a pull can clear the card, under one rule: **a file is deletable only once
@@ -434,7 +451,8 @@ Two runtime media roots, with different audiences:
   automatic delivery adds `AUTO_DELIVER`, `SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/
   `SMTP_PASSWORD`/`SMTP_STARTTLS`, `DELIVERY_FROM_EMAIL`, `DELIVERY_LINK_TTL_DAYS`;
   SD-card ingest adds `SDCARD_MOUNT_ROOTS` (colon-separated),
-  `SDCARD_QR_MAX_CLIP_SECONDS`, `SDCARD_QR_SCAN_SECONDS`;
+  `SDCARD_QR_MAX_CLIP_SECONDS`, `SDCARD_QR_SCAN_SECONDS`,
+  `RAW_CLIP_SETTLE_SECONDS`/`RAW_CLIP_SETTLE_POLL_SECONDS` (the multi-clip settle window);
   the jump archive adds `ARCHIVE_ENABLED` (on by default), `ARCHIVE_ROOT` (defaults to
   `$RAW_STORAGE_ROOT`), `ARCHIVE_LINK_MODE` (`link` | `copy` | `symlink`),
   `ARCHIVE_HASHES` (on by default); the entitlement/paywall adds `PUBLIC_BASE_URL` (the

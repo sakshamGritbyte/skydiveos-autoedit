@@ -267,6 +267,18 @@ class Job(BaseModel):
     #: attributable to a real capture; kept for audit/reconciliation only.
     payment_reference: str | None = None
 
+    #: Epoch seconds when the most recent raw clip landed via the ``s3_key`` ingest
+    #: path. SkydiveOS notifies once PER CLIP, so a jump filmed as several files
+    #: (GoPro chapters a 4 GB master; an instructor stops/starts recording) arrives as
+    #: several ``POST /jobs/{id}/upload`` calls. ``raw_clips_settled_job`` waits for
+    #: this stamp to go quiet before dispatching, so the pipeline sees the WHOLE jump.
+    last_raw_clip_at: float | None = None
+    #: Set once processing has been dispatched for this job, so two settle checks (or a
+    #: settle check racing a late clip) can never enqueue a second render of the same
+    #: job — concurrent renders share a job dir and, with AUTO_DELIVER on, whichever
+    #: finishes first emails the customer a PARTIAL edit.
+    processing_dispatched: bool = False
+
     # Annotations from the review gate.
     reject_reason: str | None = None
     error: str | None = None  # populated when status == failed

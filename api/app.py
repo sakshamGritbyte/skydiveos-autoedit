@@ -835,8 +835,13 @@ def create_app() -> FastAPI:
             Form(description="Camera source for the Ultimate package: instructor | external"),
         ] = None,
         s3_key: Annotated[
-            str | None,
-            Form(description="Key of a raw master already in S3 (auto-discovery path)"),
+            list[str] | None,
+            Form(
+                description=(
+                    "Key of a raw master already in S3 (auto-discovery path). Repeat the "
+                    "field to attach several clips of ONE jump in a single call."
+                )
+            ),
         ] = None,
     ) -> UploadResponse:
         """Attach the raw footage to a job, then enqueue the right pipeline.
@@ -935,13 +940,18 @@ def create_app() -> FastAPI:
             )
 
         if s3_key:
-            # Auto-discovery already staged the master in S3; source the job straight
+            # Auto-discovery already staged the master(s) in S3; source the job straight
             # from the key instead of streaming multi-GB bytes back through the web
             # layer. The worker downloads it and hands off to the same pipeline dispatch.
-            if not s3_key.lower().endswith(".mp4"):
+            # Several keys may be given for one jump (a chaptered master, or an
+            # instructor who stopped and restarted recording); each is ingested
+            # separately and the settle window in `ingest_s3_job` dispatches once they
+            # have all landed, so the pipeline never cuts a partial jump.
+            bad = [k for k in s3_key if not k.lower().endswith(".mp4")]
+            if bad:
                 raise HTTPException(
                     status_code=422,
-                    detail=f"s3_key must point to an .mp4 master (got {s3_key!r})",
+                    detail=f"s3_key must point to an .mp4 master (got {bad!r})",
                 )
             if job.package.is_ultimum:
                 from .selfie import CAMERA_ROLES
@@ -955,9 +965,26 @@ def create_app() -> FastAPI:
                         ),
                     )
             store.write_booking(job_id, _booking_sidecar(job))
-            store.update(job_id, status=JobStatus.queued, error=None)
-            queue.enqueue_s3_ingest(job_id, s3_key, camera_role)
-            detail = f"S3 ingest of {s3_key} enqueued"
+            # Re-attaching footage to a job that FAILED (or was rejected) is a genuine
+            # retry, so clear the dispatch-once guard or the settle check would refuse
+            # to enqueue the re-run. A job merely `queued` keeps its guard: a clip that
+            # lands between dispatch and the task starting is picked up anyway (the
+            # pipeline globs `raw/` when it runs), and clearing it there would let a
+            # second render start. `processing` already 409s above.
+            retrying = job.status in (JobStatus.failed, JobStatus.rejected)
+            store.update(
+                job_id,
+                status=JobStatus.queued,
+                error=None,
+                **({"processing_dispatched": False} if retrying else {}),
+            )
+            for key in s3_key:
+                queue.enqueue_s3_ingest(job_id, key, camera_role)
+            detail = (
+                f"S3 ingest of {s3_key[0]} enqueued"
+                if len(s3_key) == 1
+                else f"S3 ingest of {len(s3_key)} clips enqueued"
+            )
             if job.package.is_ultimum:
                 detail += f" for {camera_role}"
             return UploadResponse(

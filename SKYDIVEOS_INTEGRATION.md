@@ -123,6 +123,33 @@ For the two-camera **`ultimum`** package, send one call per camera with a `camer
 form field (`instructor` / `external`); processing auto-starts once *both* roles have
 downloaded. The `s3_key` must end in `.mp4`; needs `S3_BUCKET` set on the worker.
 
+**Several clips for one jump — just send them.** A jump is often filmed as more than one
+file (a GoPro chapters a 4 GB master; an instructor stops and restarts recording), and
+because discovery notifies you once per clip you will attach them one at a time. That is
+fine and needs no coordination on your side: **you do not have to batch, debounce, or
+signal "that was the last clip"**. The auto-edit worker waits for a job's clips to stop
+arriving (`RAW_CLIP_SETTLE_SECONDS`, default 3 min) and then renders **once**, over the
+whole jump. Dispatch is guarded exactly-once, so a retried or duplicate notification can
+never start a second render.
+
+Two consequences worth knowing:
+* Editing starts a few minutes after the last clip lands, not instantly — expected, and
+  small next to the render itself.
+* If you *do* already know a jump's full clip set, you can attach it in one call by
+  **repeating the field** (`s3_key=…GH010001.MP4&s3_key=…GH010002.MP4`). Same result.
+
+**Do not** re-attach an `s3_key` you have already attached (you dedupe on `s3Key`, so
+this is covered) — the guard makes it harmless, but it wastes an S3 download.
+
+**A 4xx from your `raw-upload` endpoint is not retried.** The ingest side retries a failed
+hand-off with exponential backoff *only* for network-shaped failures (connection refused,
+5xx, 429) — the case that ladder exists for is a WiFi-only host whose radio is joined to a
+camera's AP. A 4xx means you received the payload and rejected it, so re-sending the
+identical body to the identical endpoint gets the identical answer: it is logged once and
+dropped. This is deliberate given your documented 404 for a `staff_id` with no staff
+record. The footage is never lost either way: the S3 key is recorded in the retention
+ledger only on a successful hand-off, so the file stays on the card and stays undeletable.
+
 **(b) Direct byte upload** — for when you have the bytes in hand:
 ```http
 POST /jobs/{job_id}/upload      # multipart/form-data

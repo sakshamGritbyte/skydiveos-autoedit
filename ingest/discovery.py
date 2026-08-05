@@ -63,6 +63,24 @@ _HANDOFF_ATTEMPTS_KEY = "_handoff_attempts"
 #: Ceiling on the exponential backoff between hand-off retries, in seconds.
 _HANDOFF_MAX_DELAY = 300.0
 
+
+def _is_permanent_handoff_error(error: Exception) -> bool:
+    """True when re-sending this notification cannot succeed (an HTTP 4xx).
+
+    The retry ladder exists for a hand-off that lost the *network* (the radio is joined
+    to a camera's AP, S3 is unreachable). A 4xx is the opposite: SkydiveOS received the
+    payload and rejected it, so every retry gets the same answer. 429 is excluded — it
+    means "later", which is exactly what a retry does. Duck-typed on ``response.status``
+    /``status_code`` so it holds for httpx, requests and botocore alike, without
+    importing any of them here.
+    """
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    if status is None:
+        status = getattr(getattr(error, "response", None), "status", None)
+    if not isinstance(status, int):
+        return False
+    return 400 <= status < 500 and status != 429
+
 #: S3 key prefix for pulled raw masters: ``{prefix}/{camera_id}/{filename}``.
 S3_KEY_PREFIX = "raw"
 
@@ -444,6 +462,22 @@ class CameraDiscoveryService:
         """
         attempt = int(event.get(_HANDOFF_ATTEMPTS_KEY, 0)) + 1
         mp4 = event.get("files", {}).get("mp4", "<unknown>")
+        if _is_permanent_handoff_error(error):
+            # A 4xx is SkydiveOS rejecting the notification itself, not the network
+            # being down: retrying re-sends the identical payload to the identical
+            # endpoint and gets the identical answer. (Their consumer answers 404 for a
+            # staff_id with no staff record — a malformed marker, see
+            # SKYDIVEOS_INTEGRATION.md.) So report it once and stop, instead of burning
+            # the whole backoff ladder. The footage is safe either way: the S3 key is
+            # only recorded in the retention ledger on success, so the file stays on
+            # the card and stays undeletable.
+            logger.error(
+                "hand-off REJECTED by SkydiveOS for %s: %r. Not retrying (a 4xx is "
+                "permanent). The file stays staged and on the card; fix the "
+                "notification's cause, then re-pull.",
+                mp4, error,
+            )
+            return
         if attempt >= self._handoff_max_attempts:
             logger.exception(
                 "hand-off to SkydiveOS failed %d times, giving up on %s: %r. The file "

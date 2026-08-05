@@ -132,6 +132,17 @@ class Settings:
     #: Stops a mis-mapped package or a never-arriving second camera from stranding the
     #: job in ``queued`` forever. See :func:`api.tasks.ultimum_watchdog_job`.
     ultimum_second_camera_timeout_s: float = 3600.0
+    #: Seconds of quiet (no new clip for the job) before the ``s3_key`` ingest path
+    #: dispatches processing (``RAW_CLIP_SETTLE_SECONDS``, default 3 min). SkydiveOS
+    #: notifies once per clip, so a multi-file jump would otherwise dispatch a render
+    #: per clip — concurrent renders of one job, and with AUTO_DELIVER a partial edit
+    #: emailed to the customer. Must exceed the gap between a jump's notifications,
+    #: which is really the S3 upload time of the previous clip: raise it on a slow
+    #: uplink. ``0`` restores the old dispatch-immediately behaviour.
+    raw_clip_settle_seconds: float = 180.0
+    #: How often :func:`api.tasks.raw_clips_settled_job` re-checks while clips are still
+    #: arriving. Keeps the re-schedule loop cheap without delaying a settled jump.
+    raw_clip_settle_poll_seconds: float = 30.0
     #: Shared secret sent on the status callback to SkydiveOS's receiver
     #: (``AUTO_EDIT_CALLBACK_TOKEN``); SkydiveOS optionally verifies it inbound. Sent as
     #: the ``X-Auto-Edit-Token`` header when set; ``None`` → no token header (open).
@@ -264,6 +275,15 @@ def get_settings() -> Settings:
         ),
         ultimum_second_camera_timeout_s=float(
             os.environ.get("ULTIMUM_SECOND_CAMERA_TIMEOUT_S") or 3600.0
+        ),
+        # 0 is meaningful (dispatch immediately), so don't fall back on falsiness.
+        raw_clip_settle_seconds=float(
+            os.environ.get("RAW_CLIP_SETTLE_SECONDS") or 180.0
+            if os.environ.get("RAW_CLIP_SETTLE_SECONDS") != "0"
+            else 0.0
+        ),
+        raw_clip_settle_poll_seconds=float(
+            os.environ.get("RAW_CLIP_SETTLE_POLL_SECONDS") or 30.0
         ),
         auto_edit_callback_token=os.environ.get("AUTO_EDIT_CALLBACK_TOKEN") or None,
         camera_clock_tz=os.environ.get("CAMERA_CLOCK_TZ") or None,

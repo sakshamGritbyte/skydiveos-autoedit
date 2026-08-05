@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
@@ -399,7 +400,10 @@ def ingest_s3_job(job_id: str, s3_key: str, camera_role: str | None = None) -> s
 
         if store.camera_roles_present(job_id, CAMERA_ROLES):
             store.update(job_id, status=JobStatus.queued, error=None)
-            process_selfie_package.delay(job_id)
+            # Through the guard, not a bare .delay(): a re-notified clip arriving after
+            # both roles are already on disk would otherwise start a second render of
+            # the same job (both roles are still "present", so this branch runs again).
+            _dispatch_processing(store, job_id)
         else:
             # Only one camera so far. Arm a watchdog so a never-arriving second camera
             # (or a package mis-mapped to ultimum) fails the job instead of stranding it
@@ -412,11 +416,85 @@ def ingest_s3_job(job_id: str, s3_key: str, camera_role: str | None = None) -> s
         return job_id
 
     # Single-camera packages cut from a single source master; point at the downloaded MP4.
-    store.update(job_id, source_path=str(dest), status=JobStatus.queued, error=None)
+    store.update(
+        job_id,
+        source_path=str(dest),
+        status=JobStatus.queued,
+        error=None,
+        last_raw_clip_at=time.time(),
+    )
+
+    # One jump can arrive as SEVERAL clips: SkydiveOS notifies once per clip (a GoPro
+    # chapters a 4 GB master; an instructor stops/starts recording), and each
+    # notification is its own `POST /jobs/{id}/upload`. Dispatching here would then
+    # start one render PER CLIP on the same job — concurrent renders sharing a job dir,
+    # each cutting whatever subset had landed, and with AUTO_DELIVER on the first to
+    # finish emails the customer a partial edit. So wait for the clips to go quiet
+    # (same shape as the ultimum watchdog: re-schedule rather than cancel), and let
+    # exactly one settle check dispatch.
+    settle = get_settings().raw_clip_settle_seconds
+    if settle <= 0:
+        _dispatch_processing(store, job_id)  # opt-out: dispatch immediately
+    else:
+        raw_clips_settled_job.apply_async((job_id,), countdown=settle)
+    return job_id
+
+
+def _dispatch_processing(store: JobStore, job_id: str) -> bool:
+    """Enqueue the pipeline for ``job_id`` exactly once. True if this call dispatched.
+
+    The guard is what makes the multi-clip ``s3_key`` path safe: a late clip re-arming
+    the settle check, two settle checks overlapping, or a duplicate notification must
+    never produce a second render of the same job.
+    """
+    job = store.load(job_id)
+    if job.processing_dispatched:
+        logger.info("job %s already dispatched — not enqueuing a second render", job_id)
+        return False
+    store.update(job_id, processing_dispatched=True)
     if job.package.uses_scene_pipeline:
         process_selfie_package.delay(job_id)
     else:
         process_job.delay(job_id)
+    return True
+
+
+@celery_app.task(name="api.raw_clips_settled_job")
+def raw_clips_settled_job(job_id: str) -> str:
+    """Dispatch processing once a job's raw clips have stopped arriving.
+
+    Armed (with a countdown) by every ``s3_key`` ingest. If another clip landed since,
+    this re-schedules itself instead of dispatching — so the pipeline always sees the
+    WHOLE jump. Re-scheduling (rather than cancelling the previous countdown, which
+    Celery can't do reliably) is the same trick :func:`ultimum_watchdog_job` uses.
+
+    A no-op once the job has been dispatched, has moved past ``queued``, or was failed
+    /rejected in the meantime.
+    """
+    _ensure_repo_on_path()
+
+    settings = get_settings()
+    store = _store()
+    job = store.load(job_id)
+
+    if job.processing_dispatched or job.status != JobStatus.queued:
+        return job_id  # already underway, or no longer waiting to be processed
+
+    quiet_for = time.time() - (job.last_raw_clip_at or 0.0)
+    if quiet_for < settings.raw_clip_settle_seconds:
+        # Still arriving — check again shortly. Poll interval rather than the full
+        # settle window so a jump that just went quiet isn't delayed by a whole window.
+        raw_clips_settled_job.apply_async(
+            (job_id,), countdown=settings.raw_clip_settle_poll_seconds
+        )
+        return job_id
+
+    n_clips = len(list(store.raw_dir(job_id).glob("*"))) if store.raw_dir(job_id).exists() else 0
+    logger.info(
+        "job %s: raw clips settled (quiet %.0fs, %d file(s) staged) — dispatching",
+        job_id, quiet_for, n_clips,
+    )
+    _dispatch_processing(store, job_id)
     return job_id
 
 

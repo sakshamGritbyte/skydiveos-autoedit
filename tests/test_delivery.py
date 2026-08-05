@@ -587,6 +587,11 @@ def test_s3_ingest_downloads_and_dispatches_scene_pipeline(
     monkeypatch.setattr(tasks, "_download_s3", fake_download)
     enq: list[str] = []
     monkeypatch.setattr(tasks.process_selfie_package, "delay", enq.append)
+    # settle_seconds=0 opts out of the multi-clip settle window: dispatch immediately.
+    monkeypatch.setattr(
+        tasks, "get_settings",
+        lambda: _settings(jobs_root=str(tmp_path), raw_clip_settle_seconds=0.0),
+    )
 
     tasks.ingest_s3_job(job_id="j1", s3_key="raw/1234/GH010001.MP4")
 
@@ -595,6 +600,121 @@ def test_s3_ingest_downloads_and_dispatches_scene_pipeline(
     assert job.status == JobStatus.queued
     assert job.source_path and job.source_path.endswith("raw/GH010001.MP4")
     assert enq == ["j1"]  # scene pipeline enqueued
+    assert job.processing_dispatched is True
+
+
+# --------------------------------------------------------------------------- #
+# Multi-clip jumps: one jump arrives as several s3_key notifications, and must
+# produce exactly ONE render — of the whole jump, never a partial one.
+# --------------------------------------------------------------------------- #
+
+
+def _s3_ingest_harness(
+    tasks: Any, store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **cfg: Any
+) -> tuple[list[str], list[tuple[tuple[Any, ...], dict[str, Any]]]]:
+    """Wire ingest_s3_job with a fake download; return (dispatched, settle-arm calls)."""
+    def fake_download(s3_key: str, dest: Path, settings: object) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"video")
+
+    monkeypatch.setattr(tasks, "_download_s3", fake_download)
+    monkeypatch.setattr(
+        tasks, "get_settings", lambda: _settings(jobs_root=str(tmp_path), **cfg)
+    )
+    enq: list[str] = []
+    monkeypatch.setattr(tasks.process_selfie_package, "delay", enq.append)
+    armed: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    monkeypatch.setattr(
+        tasks.raw_clips_settled_job, "apply_async",
+        lambda *a, **k: armed.append((a, k)),
+    )
+    return enq, armed
+
+
+def test_multi_clip_jump_renders_once_not_once_per_clip(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three clips of one jump → three ingests, ONE render, and it sees all three.
+
+    Without the settle window each notification dispatched its own render: concurrent
+    renders sharing a job dir, each cutting whatever subset had landed, and with
+    AUTO_DELIVER the first to finish emails the customer a PARTIAL edit.
+    """
+    from api import tasks
+    from api.jobs import Job, Package
+
+    store.create(Job(job_id="j1", package=Package.selfie))
+    enq, armed = _s3_ingest_harness(tasks, store, tmp_path, monkeypatch)
+
+    for name in ("GH010001.MP4", "GH010002.MP4", "GH010003.MP4"):
+        tasks.ingest_s3_job(job_id="j1", s3_key=f"raw/1234/{name}")
+
+    # Nothing rendered yet — each clip only (re)armed the settle check.
+    assert enq == []
+    assert len(armed) == 3
+    assert store.load("j1").processing_dispatched is False
+
+    # The settle check fires once the clips have gone quiet → exactly one render.
+    monkeypatch.setattr(tasks.time, "time", lambda: store.load("j1").last_raw_clip_at + 999)
+    tasks.raw_clips_settled_job("j1")
+    assert enq == ["j1"]
+    assert {p.name for p in store.raw_dir("j1").glob("*.MP4")} == {
+        "GH010001.MP4", "GH010002.MP4", "GH010003.MP4"
+    }  # the whole jump, not a partial cut
+
+
+def test_settle_check_reschedules_while_clips_still_arriving(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A settle check that fires mid-card re-arms instead of cutting a partial jump."""
+    from api import tasks
+    from api.jobs import Job, Package
+
+    store.create(Job(job_id="j1", package=Package.selfie))
+    enq, armed = _s3_ingest_harness(tasks, store, tmp_path, monkeypatch)
+    tasks.ingest_s3_job(job_id="j1", s3_key="raw/1234/GH010001.MP4")
+    armed.clear()
+
+    # Only 5s of quiet against a 180s window → not settled.
+    monkeypatch.setattr(tasks.time, "time", lambda: store.load("j1").last_raw_clip_at + 5)
+    tasks.raw_clips_settled_job("j1")
+
+    assert enq == []                      # no render
+    assert len(armed) == 1                # checked again later
+    assert armed[0][1]["countdown"] == 30.0  # the poll interval, not a whole window
+
+
+def test_settle_check_dispatches_only_once(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two overlapping settle checks (or a duplicate notification) → one render."""
+    from api import tasks
+    from api.jobs import Job, Package
+
+    store.create(Job(job_id="j1", package=Package.selfie))
+    enq, _ = _s3_ingest_harness(tasks, store, tmp_path, monkeypatch)
+    tasks.ingest_s3_job(job_id="j1", s3_key="raw/1234/GH010001.MP4")
+
+    monkeypatch.setattr(tasks.time, "time", lambda: store.load("j1").last_raw_clip_at + 999)
+    tasks.raw_clips_settled_job("j1")
+    tasks.raw_clips_settled_job("j1")  # a second check must not re-render
+
+    assert enq == ["j1"]
+
+
+def test_settle_check_is_noop_once_the_job_moved_on(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale settle check must not re-render a job that is already past queued."""
+    from api import tasks
+    from api.jobs import Job, Package
+    from api.jobs import JobStatus as JS
+
+    store.create(Job(job_id="j1", package=Package.selfie, status=JS.delivered))
+    enq, _ = _s3_ingest_harness(tasks, store, tmp_path, monkeypatch)
+
+    tasks.raw_clips_settled_job("j1")
+    assert enq == []
 
 
 def test_s3_ingest_ultimum_waits_for_both_cameras(

@@ -1161,3 +1161,95 @@ def test_s3_notify_uploader_marker_key_and_no_post(tmp_path, monkeypatch) -> Non
 
     assert key == "raw/4313/markers/GX010001.MP4"
     assert s3.uploads == [(str(mp4), "jumps", "raw/4313/markers/GX010001.MP4")]
+
+
+# --------------------------------------------------------------------------- #
+# A rejected hand-off (HTTP 4xx) is permanent — retrying re-sends the identical
+# payload to the identical endpoint. Only network-shaped failures get the ladder.
+# --------------------------------------------------------------------------- #
+
+
+def _status_error(status: int) -> Exception:
+    err = RuntimeError(f"HTTP {status}")
+    err.response = type("R", (), {"status_code": status})()  # type: ignore[attr-defined]
+    return err
+
+
+def test_permanent_handoff_error_classification() -> None:
+    """4xx is permanent; 429, 5xx and plain network errors keep their retry ladder."""
+    from ingest.discovery import _is_permanent_handoff_error
+
+    assert _is_permanent_handoff_error(_status_error(404)) is True   # unknown staff_id
+    assert _is_permanent_handoff_error(_status_error(400)) is True
+    assert _is_permanent_handoff_error(_status_error(422)) is True
+    assert _is_permanent_handoff_error(_status_error(429)) is False  # "later" == retry
+    assert _is_permanent_handoff_error(_status_error(500)) is False
+    assert _is_permanent_handoff_error(_status_error(503)) is False
+    assert _is_permanent_handoff_error(ConnectionError("no internet")) is False
+    # botocore/requests style: .response.status
+    err = RuntimeError("boom")
+    err.response = type("R", (), {"status": 404})()  # type: ignore[attr-defined]
+    assert _is_permanent_handoff_error(err) is True
+
+
+def test_rejected_handoff_is_not_retried(tmp_path: Path) -> None:
+    """SkydiveOS answering 404 costs ONE attempt, not the whole backoff ladder."""
+
+    class _Uploader:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        def __call__(self, *args: object, **kwargs: object) -> None:
+            self.attempts += 1
+            raise _status_error(404)
+
+    uploads = _Uploader()
+    service = CameraDiscoveryService(
+        scanner=StaticCameraScanner(["1234"]),
+        registry=FakeRegistry([CameraRecord(camera_id="1234", paired_at=1.0)]),
+        upload=uploads,
+        pull=_make_pull(tmp_path / "GX010001.MP4"),
+        interval=0.05,
+        handoff_retry_delay=0.01,
+        handoff_max_attempts=5,
+    )
+
+    async def scenario() -> None:
+        await service.start()
+        await _wait_for(lambda: uploads.attempts >= 1)
+        await asyncio.sleep(0.2)  # any (wrongly) scheduled retry would fire in here
+        await service.stop()
+
+    asyncio.run(scenario())
+    assert uploads.attempts == 1
+
+
+def test_server_error_handoff_still_retries(tmp_path: Path) -> None:
+    """Regression guard: a 5xx must keep the retry ladder (SkydiveOS restarting)."""
+
+    class _Uploader:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        def __call__(self, *args: object, **kwargs: object) -> None:
+            self.attempts += 1
+            raise _status_error(503)
+
+    uploads = _Uploader()
+    service = CameraDiscoveryService(
+        scanner=StaticCameraScanner(["1234"]),
+        registry=FakeRegistry([CameraRecord(camera_id="1234", paired_at=1.0)]),
+        upload=uploads,
+        pull=_make_pull(tmp_path / "GX010001.MP4"),
+        interval=0.05,
+        handoff_retry_delay=0.01,
+        handoff_max_attempts=4,
+    )
+
+    async def scenario() -> None:
+        await service.start()
+        await _wait_for(lambda: uploads.attempts >= 3)
+        await service.stop()
+
+    asyncio.run(scenario())
+    assert uploads.attempts >= 3

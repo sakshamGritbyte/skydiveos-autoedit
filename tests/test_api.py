@@ -622,6 +622,43 @@ def test_upload_s3_key_enqueues_ingest(client: TestClient, queue: FakeQueue) -> 
     assert booking["package"] == "selfie"
 
 
+def test_upload_accepts_several_s3_keys_for_one_jump(
+    client: TestClient, queue: FakeQueue
+) -> None:
+    """One jump filmed as several clips can be attached in a SINGLE call.
+
+    A caller that already knows the whole clip set (a GoPro chapters a 4 GB master)
+    then needs no settle window — each key is ingested and the pipeline dispatches
+    once they have all landed.
+    """
+    job_id = _create(client)
+    resp = client.post(
+        f"/jobs/{job_id}/upload",
+        data={"s3_key": ["raw/1234/GH010001.MP4", "raw/1234/GH010002.MP4"]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["source"] == "s3"
+    assert "2 clips" in resp.json()["detail"]
+    assert queue.calls == [
+        ("s3_ingest", (job_id, "raw/1234/GH010001.MP4", None)),
+        ("s3_ingest", (job_id, "raw/1234/GH010002.MP4", None)),
+    ]
+
+
+def test_upload_rejects_batch_with_a_non_mp4_key(
+    client: TestClient, queue: FakeQueue
+) -> None:
+    """One bad key fails the whole call — no half-attached jump."""
+    job_id = _create(client)
+    resp = client.post(
+        f"/jobs/{job_id}/upload",
+        data={"s3_key": ["raw/1234/GH010001.MP4", "raw/1234/notes.txt"]},
+    )
+    assert resp.status_code == 422
+    assert "notes.txt" in resp.json()["detail"]
+    assert queue.calls == []
+
+
 def test_upload_s3_key_non_mp4_is_422(client: TestClient, queue: FakeQueue) -> None:
     job_id = _create(client)
     resp = client.post(f"/jobs/{job_id}/upload", data={"s3_key": "raw/1234/notes.txt"})

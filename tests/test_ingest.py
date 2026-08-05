@@ -1054,3 +1054,40 @@ def test_an_sdk_without_the_nmcli_drivers_is_left_alone(
 
     assert not getattr(NetworksetupWireless.connect, "_patched_by_autoedit", False)
     assert not getattr(NmcliFutureWireless.connect, "_patched_by_autoedit", False)
+
+
+def test_one_unreadable_clip_does_not_abandon_the_card(tmp_path: Path) -> None:
+    """A corrupt clip costs that clip only — the rest of the card still stages.
+
+    Observed on a real season-old card: an OSError EIO mid-copy on one file aborted
+    the whole pull, so the clips beside it (including a QR session marker) were never
+    staged and every later scan hit the same wall.
+    """
+    class _FlakyCamera(FakeCamera):
+        async def download_mp4(self, media: RemoteMedia, dest: Path) -> Path:
+            if media.filename == "GX010002.MP4":
+                dest.write_bytes(b"partial")  # a truncated copy, like a real failure
+                raise OSError(5, "Input/output error")
+            return await super().download_mp4(media, dest)
+
+    cam = _FlakyCamera(
+        [
+            _media("GX010001.MP4"),
+            _media("GX010002.MP4"),
+            _media("GX010003.MP4"),
+        ]
+    )
+    events: list[dict[str, object]] = []
+
+    class _Capture:
+        def emit(self, event: dict[str, object]) -> None:
+            events.append(event)
+
+    # The failure is still surfaced (a lost master is never swallowed) ...
+    with pytest.raises(CameraError, match="GX010002.MP4"):
+        asyncio.run(pull_camera("1234", camera=cam, root=tmp_path, emitter=_Capture()))
+
+    # ... but only after both readable clips were staged, manifested and emitted.
+    staged = {p.name for p in tmp_path.rglob("GX01000*.MP4")}
+    assert staged == {"GX010001.MP4", "GX010003.MP4"}  # no partial GX010002 left behind
+    assert {e["job_id"] for e in events} == {"1234-GX010001", "1234-GX010003"}

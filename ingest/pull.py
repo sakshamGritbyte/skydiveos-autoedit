@@ -232,13 +232,40 @@ async def pull_camera(
                 )
                 videos = [m for m in videos if m.filename not in set(freed)]
 
+        # A failed master is NOT cosmetic (unlike the LRV/thumbnail above), so it is
+        # never swallowed — but it must cost only ITS clip. A card that has been in and
+        # out of cameras for a season accumulates unreadable files (bad sectors surface
+        # as OSError EIO mid-copy; a reader can drop out). Observed on a real card: one
+        # corrupt clip aborted the whole pull, so the QR session marker and the jump
+        # beside it were never staged, and every later scan hit the same wall. So we
+        # stage every readable clip — each one manifested and emitted as it lands — and
+        # raise afterwards with the tally, which keeps the CLI non-zero and discovery
+        # logging the problem instead of quietly under-ingesting a card.
+        failures: list[tuple[str, Exception]] = []
         for media in videos:
             if since is not None and (media.created_epoch or 0.0) < since:
                 logger.debug("skip %s (older than --since)", media.filename)
                 continue
-            results.append(
-                await _pull_one(cam, camera_id, media, resolved_root, sink, repull, now)
-            )
+            try:
+                results.append(
+                    await _pull_one(cam, camera_id, media, resolved_root, sink, repull, now)
+                )
+            except Exception as e:  # noqa: BLE001 - tallied and re-raised below
+                logger.error("download failed for %s: %r — skipping this clip", media.filename, e)
+                failures.append((media.filename, e))
+                # No manifest was written, so a later pull retries this clip; drop the
+                # partial file so it can never look like a complete staging.
+                destination(
+                    resolved_root, camera_id, media.created_epoch, media.filename
+                ).unlink(missing_ok=True)
+
+    if failures:
+        detail = ", ".join(f"{name}: {err!r}" for name, err in failures)
+        raise CameraError(
+            f"camera {camera_id}: {len(failures)} of {len(videos)} clip(s) failed to "
+            f"download ({detail}). The readable clips were staged; check the card for "
+            f"corruption."
+        )
     return results
 
 

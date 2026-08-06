@@ -8,13 +8,14 @@ ran, and the issues we hit and how we fixed them.
 
 ## 1. Architecture
 
-Everything runs on **one EC2 VM** using Docker Compose. Three containers:
+Everything runs on **one EC2 VM** using Docker Compose. Four containers:
 
 | Container | What it does |
 |-----------|--------------|
 | **api** | FastAPI service (`uvicorn`). Creates jobs, receives footage uploads, serves review/approve endpoints. Enqueues the heavy work onto Redis. |
 | **worker** | Celery worker. Runs the actual pipeline — classify → score (MediaPipe) → compose → render (FFmpeg). |
 | **redis** | Message broker + result backend between the API and the worker. |
+| **bridge** | The SkydiveOS raw-upload consumer (`scripts/skydiveos_bridge.py`, port 9000), until the SkydiveOS backend implements the `staff_id` contract. The dropzone's ingest machine POSTs one notification per pulled clip; the bridge matches it to a load/jumper, debounces the jump's clips, and creates ONE job on **api**. Only needed for the SD-card / camera-pull flow — `docker compose stop bridge` leaves the rest untouched. |
 
 The API and worker **share a Docker volume** (`/data/jobs`) so the worker can read the
 footage the API uploaded, and both use the **same Redis**.
@@ -22,10 +23,15 @@ footage the API uploaded, and both use the **same Redis**.
 ```
                  ┌──────────────── one EC2 VM ────────────────┐
   client ──HTTP──►  api (FastAPI)  ──enqueue──►  redis        │
-                 │       │                          │         │
-                 │       └── shared /data/jobs ◄── worker (Celery: FFmpeg + MediaPipe)
-                 └────────────────────────────────────────────┘
+                 │       ▲                          │         │
+  ingest ──:9000──► bridge         shared /data/jobs ◄── worker (Celery: FFmpeg + MediaPipe)
+  machine        └────────────────────────────────────────────┘
 ```
+
+The **bridge** is a client of **api**, not a peer: it POSTs `/jobs` + the footage over
+the same HTTP API SkydiveOS uses. It runs on this box (rather than on the ingest
+machine) because it fetches the masters back out of S3 to attach them — an in-AWS
+transfer here, but two extra crossings of the dropzone's uplink there.
 
 **Important: the pipeline is CPU-bound.** Video is encoded with software `libx264` and
 faces are scored with MediaPipe on the **CPU** (no GPU/NVENC). This is why the instance
@@ -119,8 +125,16 @@ the instance stopped otherwise, can be well under $50/month.
 |------|------|--------|---------|
 | SSH | 22 | **My IP** (preferred) or 0.0.0.0/0 | shell access |
 | Custom TCP | 8000 | 0.0.0.0/0 | the API (direct, for now) |
+| Custom TCP | 9000 | **the ingest machine's IP `/32`, nothing wider** | the bridge's raw-upload notify |
 | HTTP | 80 | 0.0.0.0/0 | for Caddy/SSL later |
 | HTTPS | 443 | 0.0.0.0/0 | for Caddy/SSL later |
+
+> **9000 has no application-level auth.** Discovery's notify carries no token (the
+> service-token gate covers `api`, not the bridge), so this security-group rule *is*
+> the gate — one `/32`, or put the bridge behind the same TLS proxy that fronts 8000
+> and publish it as `127.0.0.1:9000:9000` instead. Skip the rule entirely until the
+> ingest machine is actually configured. The 8000 row above predates the 2026-08-03
+> access incident — see `deploy/PROXY_LOCKDOWN.md` for how that port should be closed.
 
 ### 5.3 SSH in and install Docker
 
@@ -190,10 +204,38 @@ docker compose up -d --build      # first build ~3–5 min (downloads MediaPipe/
 ### 5.7 Verify
 
 ```bash
-docker compose ps                          # all three should be "Up"
+docker compose ps                          # all four should be "Up"
 docker compose logs api    | tail -20      # "Uvicorn running on http://0.0.0.0:8000"
 docker compose logs worker | tail -20      # "celery@... ready"
 curl http://localhost:8000/docs            # API is up
+```
+
+With `AUTO_EDIT_API_KEY` set, `/docs` answers **401** without a token — that is the
+gate working, not a failure. Confirm with the token:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer $(grep ^AUTO_EDIT_API_KEY .env | cut -d= -f2-)" \
+  http://localhost:8000/docs               # 200
+```
+
+If the **bridge** is in use, smoke-test it too — a green `/healthz` alone does not
+prove the notify endpoint works (it once 422'd every notification while healthz
+stayed green):
+
+```bash
+curl -s localhost:9000/healthz; echo
+# {"ok":true,"pending_jumps":0,"handled":0,"flagged":0}
+
+curl -s -XPOST localhost:9000/api/media/raw-upload \
+     -H 'Content-Type: application/json' -d '{}'; echo
+# {"status":"ignored","reason":"no s3_key"}   <- a 422 here means every clip would be rejected
+
+docker compose exec bridge python scripts/check_match.py --readiness   # DB, TZ, staff serials
+
+# and confirm 9000 is NOT reachable from the internet until the /32 rule is added:
+curl -s --max-time 5 http://$(curl -s --max-time 3 ifconfig.me):9000/healthz \
+  || echo "closed from outside - correct"
 ```
 
 From a browser: **`http://<EC2_PUBLIC_IP>:8000/docs`** (the Swagger UI).

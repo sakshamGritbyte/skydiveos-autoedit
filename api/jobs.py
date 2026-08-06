@@ -275,6 +275,11 @@ class Job(BaseModel):
     #: with an ``item``; never touches ``entitlement`` or ``status``.
     addons: dict[str, str] = Field(default_factory=dict)
 
+    #: The S3 key each staged raw clip was downloaded from (filename → key), recorded
+    #: by ``ingest_s3_job``. This is the disk-retention authority: the pruner
+    #: (``scripts/prune_jobs.py``) deletes a local master only after confirming
+    #: exactly this key in S3 — no key derivation, no camera_id guessing.
+    raw_s3_keys: dict[str, str] = Field(default_factory=dict)
     #: Epoch seconds when the most recent raw clip landed via the ``s3_key`` ingest
     #: path. SkydiveOS notifies once PER CLIP, so a jump filmed as several files
     #: (GoPro chapters a 4 GB master; an instructor stops/starts recording) arrives as

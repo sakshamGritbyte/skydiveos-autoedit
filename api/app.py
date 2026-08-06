@@ -49,7 +49,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi import Path as PathParam
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
 from edl.schema import EditDecisionList
 from ingest.registry import CameraRegistry
@@ -1318,6 +1318,28 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="unknown gallery link")
         return job
 
+    def _presigned_delivery_url(job_id: str, filename: str, settings: Settings) -> str | None:
+        """A short-lived presigned URL for ``deliveries/{job_id}/{filename}``, or None.
+
+        The disk-retention fallback for pruned renders (see ``scripts/prune_jobs.py``):
+        minted per request with a small TTL — this is a *serving* URL behind the
+        gallery's own auth (the short code), not a stored delivery link. Returns None
+        when S3 isn't configured or errors — the caller 404s exactly as before.
+        """
+        if not settings.s3_bucket:
+            return None
+        try:
+            from .delivery import _default_s3_client  # noqa: PLC0415 - lazy boto3
+
+            return _default_s3_client(settings).generate_presigned_url(
+                "get_object",
+                Params={"Bucket": settings.s3_bucket, "Key": f"deliveries/{job_id}/{filename}"},
+                ExpiresIn=6 * 3600,
+            )
+        except Exception:  # noqa: BLE001 - fallback must never 500 the gallery
+            logger.warning("presigned fallback failed for %s/%s", job_id, filename, exc_info=True)
+            return None
+
     def _gallery_raw_clips(store: JobStore, job: Job) -> list[tuple[str, str]]:
         """The purchased raw-footage section: ``(label, relpath)`` per camera master.
 
@@ -1484,7 +1506,9 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/j/{token}/media/{name}", include_in_schema=False, response_class=FileResponse)
-    def public_media(token: str, name: str, store: StoreDep) -> FileResponse:
+    def public_media(
+        token: str, name: str, store: StoreDep, settings: SettingsDep
+    ) -> FileResponse:
         """Stream one deliverable to the customer (range-enabled).
 
         The **entitlement**, never the ``name``, selects the file: a locked
@@ -1499,9 +1523,19 @@ def create_app() -> FastAPI:
             path = preview_path(job_dir, name)
         else:
             path = job_dir / f"{name}.mp4"
-        if not path.exists() or not _served_under(path, job_dir):
-            raise HTTPException(status_code=404, detail="video not found")
-        return FileResponse(path, media_type="video/mp4", filename=f"{name}.mp4")
+        if path.exists() and _served_under(path, job_dir):
+            return FileResponse(path, media_type="video/mp4", filename=f"{name}.mp4")
+        # Disk-retention fallback (scripts/prune_jobs.py): a pruned clean master is
+        # still in S3 under deliveries/, so the never-expiring gallery link keeps
+        # working — redirect to a short-lived presigned URL minted per request.
+        # NEVER for a locked job: its watermarked previews are local-only by design,
+        # and a presigned master URL is the paywall bypass. The pruner refuses to
+        # remove a locked job's previews for the same reason.
+        if job.entitlement is not Entitlement.preview_only:
+            url = _presigned_delivery_url(job.job_id, f"{name}.mp4", settings)
+            if url:
+                return RedirectResponse(url, status_code=302)  # type: ignore[return-value]
+        raise HTTPException(status_code=404, detail="video not found")
 
     @app.get("/j/{token}/photos/{filename}", include_in_schema=False, response_class=FileResponse)
     def public_photo(token: str, filename: str, store: StoreDep) -> FileResponse:

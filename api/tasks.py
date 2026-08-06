@@ -282,7 +282,13 @@ def deliver_job(job_id: str) -> str:
     rather than pretending it was delivered.
     """
     store = _store()
-    job = store.load(job_id)
+    try:
+        job = store.load(job_id)
+    except FileNotFoundError:
+        # Deleted while this delivery sat in the queue (operator cleanup) — there
+        # is nothing to send, and crashing would just retry into the same wall.
+        logger.warning("delivery for unknown job %s — dropping", job_id)
+        return job_id
     if job.status != JobStatus.approved:
         raise RuntimeError(f"refusing to deliver job {job_id} in status {job.status}")
 
@@ -389,6 +395,11 @@ def ingest_s3_job(job_id: str, s3_key: str, camera_role: str | None = None) -> s
         logger.exception("S3 ingest failed for job %s (key %s)", job_id, s3_key)
         store.update(job_id, status=JobStatus.failed, error=f"S3 ingest failed: {e}")
         raise
+
+    # Record where this master lives in S3 — the disk-retention authority: the
+    # pruner deletes the local copy only after re-confirming exactly this key.
+    job = store.load(job_id)
+    store.update(job_id, raw_s3_keys={**job.raw_s3_keys, filename: s3_key})
 
     # File the freshly-downloaded master under the jump in the browsable archive before
     # any editing runs, so the raw footage is preserved even if the edit later fails.
@@ -497,7 +508,13 @@ def raw_clips_settled_job(job_id: str) -> str:
     if job.processing_dispatched or job.status != JobStatus.queued:
         return job_id  # already underway, or no longer waiting to be processed
 
-    quiet_for = time.time() - (job.last_raw_clip_at or 0.0)
+    # A missing stamp must read as "not settled", never as "quiet forever": the
+    # stamp can be absent when this check races the ingest's own update (two
+    # writers on job.json — observed on a lagging machine, where it dispatched a
+    # 1-clip render of an 8-clip jump). updated_at moves on every write, so it is
+    # a safe lower bound for "something happened recently".
+    stamp = job.last_raw_clip_at or job.updated_at or time.time()
+    quiet_for = time.time() - stamp
     if quiet_for < settings.raw_clip_settle_seconds:
         # Still arriving — check again shortly. Poll interval rather than the full
         # settle window so a jump that just went quiet isn't delayed by a whole window.

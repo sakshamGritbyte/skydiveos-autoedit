@@ -315,6 +315,22 @@ Two runtime media roots, with different audiences:
   `/deliverables` + `/photos` endpoints. Prints a stage matrix, writes
   `qa-report.{json,md}`, exits non-zero if any stage failed. Runbook:
   [`QA_NO_GOPRO.md`](QA_NO_GOPRO.md)
+- `python scripts/prune_jobs.py [--dry-run]` — the EC2-side disk-retention sweep (cron
+  it daily in production). Card-retention philosophy applied to the server: a local
+  file is deleted **only when a size-matched HeadObject confirms its S3 copy**, per
+  file, never failing anything. Tiers, each age-gated from the job's last update:
+  delivered jobs' `raw/` masters (`--raw-days`, default 2 — S3 `raw/{camera}/{name}`
+  is the authority); delivered jobs' renders (`--renders-days`, default 7 —
+  `deliveries/{job_id}/` is the authority, and `GET /j/{code}/media/{name}` then
+  302-redirects to a per-request presigned copy so the never-expiring gallery link
+  keeps working); date-named jump-archive and `_camera-staging` day folders
+  (`--archive-days`/`--staging-days`, default 7 — the archive's long-term home is the
+  dropzone Mac via `sync-archive.sh`). A still-locked (`preview_only`) job's
+  watermarked previews are NEVER pruned (they are the paywall product and exist only
+  locally — and the gallery's S3 fallback deliberately refuses to redirect a locked
+  job, since a presigned master URL is the paywall bypass); photos are never pruned
+  (the grid serves stills locally). Pair with an S3 lifecycle rule (`raw/…` → Glacier
+  after 30–60 d) and a disk alarm
 - `python scripts/restamp_footage.py --at <local-time> --out-dir <dir> <masters…>` —
   write re-stamped COPIES of GoPro masters so an old card can be demoed against a load
   manifested for today (prefer manifesting the load for the footage's real date — then

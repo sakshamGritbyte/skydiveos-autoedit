@@ -39,6 +39,11 @@ def pinned_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Itera
     # Deployment opt-ins that must never fire implicitly in a test run.
     monkeypatch.setenv("ENABLE_AUTO_DISCOVERY", "0")
     monkeypatch.setenv("AUTO_DELIVER", "0")
+    # Never let a test publish Celery tasks into the dev box's REAL Redis: a task
+    # queued here outlives pytest and a later live worker will consume it (observed:
+    # test-job settle checks crashing the dropzone worker). Dead port → a test that
+    # reaches an unmocked .apply_async fails loudly instead of polluting the broker.
+    monkeypatch.setenv("REDIS_URL", "redis://127.0.0.1:1/0")
     # A dev box with the service-token gate configured would 401 every TestClient
     # request; the tests that assert the gate itself set a token explicitly.
     for var in ("AUTO_EDIT_API_KEY", "AI_BACKEND_API_KEY", "AUTO_EDIT_SERVICE_TOKEN"):

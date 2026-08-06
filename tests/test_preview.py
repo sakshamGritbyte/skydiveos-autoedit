@@ -76,6 +76,51 @@ def test_watermark_is_a_full_frame_rgba_png(tmp_path: Path) -> None:
     assert 0 in alphas and max(alphas) > 0
 
 
+def _marked_pixels(png: Path) -> int:
+    from PIL import Image
+
+    with Image.open(png) as img:
+        return sum(1 for px in img.convert("RGBA").getdata() if px[3] > 0)
+
+
+def test_watermark_logo_adds_coverage_over_text_only(tmp_path: Path) -> None:
+    logo = Path(__file__).resolve().parent.parent / "templates" / "logo.png"
+    text_only = render_watermark(
+        tmp_path / "plain.png", width=PREVIEW_W, height=PREVIEW_H, brand="Ultimate DZ"
+    )
+    with_logo = render_watermark(
+        tmp_path / "logo.png",
+        width=PREVIEW_W,
+        height=PREVIEW_H,
+        brand="Ultimate DZ",
+        logo_path=logo,
+    )
+    # The logo layers (centre + tiles) must obscure strictly more of the frame.
+    assert _marked_pixels(with_logo) > _marked_pixels(text_only)
+
+
+def test_watermark_survives_a_missing_or_corrupt_logo(tmp_path: Path) -> None:
+    # A branding asset must never fail a preview render.
+    out = render_watermark(
+        tmp_path / "wm.png",
+        width=PREVIEW_W,
+        height=PREVIEW_H,
+        brand="Ultimate DZ",
+        logo_path=tmp_path / "nope.png",
+    )
+    assert out.exists()
+    corrupt = tmp_path / "bad.png"
+    corrupt.write_bytes(b"not a png")
+    out2 = render_watermark(
+        tmp_path / "wm2.png",
+        width=PREVIEW_W,
+        height=PREVIEW_H,
+        brand="Ultimate DZ",
+        logo_path=corrupt,
+    )
+    assert out2.exists()
+
+
 # --------------------------------------------------------------------------- #
 # The transcode command
 # --------------------------------------------------------------------------- #

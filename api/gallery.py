@@ -95,6 +95,9 @@ def render_gallery_html(
     primary_download_note: str | None = None,
     upsells: Sequence[UpsellTile] = (),
     poll_token: str | None = None,
+    photos_unlocked: bool | None = None,
+    raw_videos: list[tuple[str, str]] | None = None,
+    purchased_addons: Sequence[str] = (),
 ) -> str:
     """Render the customer gallery page as one self-contained HTML string.
 
@@ -118,15 +121,23 @@ def render_gallery_html(
       yours to keep" line). Ignored while ``locked``, whose primary action is the
       unlock CTA.
     * ``upsells`` — the "Add to your day" tiles, rendered in *both* states.
-    * ``poll_token`` — the gallery short code. When given *and* ``locked``, the page
-      polls ``/j/{code}/state`` and reloads itself the moment the paywall lifts, so
-      paying in another tab flips this page without a manual refresh. Omit it (the
-      legacy S3 page) and no script is emitted.
+    * ``poll_token`` — the gallery short code. When given, the page polls
+      ``/j/{code}/state`` and reloads itself the moment the paywall lifts **or an
+      add-on purchase lands**, so paying in another tab flips this page without a
+      manual refresh. Omit it (the legacy S3 page) and no script is emitted.
+    * ``photos_unlocked`` — decouples the photo grid from the paywall: a locked job
+      that bought the ``photos`` add-on shows the grid while the videos stay
+      watermarked. ``None`` (legacy callers) keeps the old rule: photos follow the lock.
+    * ``raw_videos`` — the purchased Raw Footage section: ``(label, url)`` per camera
+      master, rendered under the Video tab with download links. Empty/None → no section.
     """
     e = html.escape
     brand_e = e(brand)
     title = e(customer_name)
     accent = _ACCENT_LOCKED if locked else _ACCENT_UNLOCKED
+    if photos_unlocked is None:
+        photos_unlocked = not locked
+    raw_videos = raw_videos or []
 
     # Hero meta: date · product · instructor · location, skipping whatever is unknown.
     meta_bits = [
@@ -169,12 +180,13 @@ def render_gallery_html(
 
     dl_btn = (
         f'<a class="btn" href="{e(download_all_url)}" download>Download all photos (.zip)</a>'
-        if download_all_url and not locked else ""
+        if download_all_url and photos_unlocked else ""
     )
-    n_photos = photo_count_teaser if locked else len(photos)
+    n_photos = len(photos) if photos_unlocked else photo_count_teaser
     photo_body = (
-        f'<p class="teaser">{n_photos} photos included — unlock to see them all.</p>'
-        if locked else f'<div class="pgrid">{photo_tiles}</div>'
+        f'<div class="pgrid">{photo_tiles}</div>'
+        if photos_unlocked
+        else f'<p class="teaser">{n_photos} photos included — unlock to see them all.</p>'
     )
     # The section appears when this jump HAS stills — locked or not, so the two states
     # keep one layout (Frame 03). A package that shot none (video_only) gets no Photos
@@ -240,16 +252,26 @@ def render_gallery_html(
     # flips to 1080p, CTA becomes Download". The page is rendered server-side per
     # request, so a reload IS that re-render: it asks for the state fresh and comes
     # back unlocked. This poll only removes the need for the customer to do it by
-    # hand after paying in another tab. Locked pages only — an unlocked page has
-    # nothing to wait for — and it reads a boolean, never the media.
+    # hand after paying in another tab. It compares the whole purchase signature
+    # (lock state + purchased add-on keys), so a raw/photos purchase re-renders an
+    # already-unlocked page too — and it reads state, never the media.
+    # Must reproduce /j/{code}/state's shape exactly (lock + sorted addon keys) or a
+    # stale-looking signature would reload the page in a loop.
+    init_sig = ("locked" if locked else "open") + "|" + ",".join(sorted(purchased_addons))
     flip_js = (
-        "<script>(function(){var n=0;var t=setInterval(function(){"
+        "<script>(function(){var n=0;"
+        f"var init='{{sig}}';"
+        "var t=setInterval(function(){"
         f"if(++n>{_FLIP_POLL_LIMIT}){{clearInterval(t);return;}}"
         f"fetch('/j/{{token}}/state',{{cache:'no-store'}}).then(function(r){{return r.json();}})"
-        ".then(function(s){if(s&&s.locked===false){clearInterval(t);location.reload();}})"
+        ".then(function(s){if(!s)return;"
+        "var sig=(s.locked?'locked':'open')+'|'+((s.addons||[]).join(','));"
+        "if(sig!==init){clearInterval(t);location.reload();}})"
         "['catch'](function(){});"
         f"}},{_FLIP_POLL_MS});}})();</script>"
-    ).replace("{token}", html.escape(poll_token or "", quote=True)) if (locked and poll_token) else ""
+    ).replace("{token}", html.escape(poll_token or "", quote=True)).replace(
+        "{sig}", html.escape(init_sig, quote=True)
+    ) if poll_token else ""
 
     if tabbed:
         eyebrow = "We filmed it anyway" if locked else "Your jump is ready"
@@ -269,10 +291,29 @@ def render_gallery_html(
     else:
         eyebrow_html = tab_nav = tab_js = ""
 
+    # The purchased Raw Footage section: camera masters, always downloadable (the
+    # customer bought exactly these bytes), badged as-filmed so they aren't mistaken
+    # for the edit. Lives in the Video tab — one layout, one place for moving pictures.
+    raw_cards = "".join(
+        f"""
+        <div class="vcard"><div class="pbadge ok">RAW · AS FILMED</div>
+          <video controls preload="metadata" playsinline src="{e(url)}"></video>
+          <div class="vlabel">{e(label)}<span>Camera master</span>
+          <a class="vdl" href="{e(url)}" download>Download</a></div>
+        </div>"""
+        for label, url in raw_videos
+    )
+    raw_section = (
+        f"""
+      <h2>Raw Footage <span>({len(raw_videos)})</span></h2>
+      <div class="vgrid">{raw_cards}</div>"""
+        if raw_videos else ""
+    )
+
     panel_cls = ' class="tab-panel"' if tabbed else ""
     videos_section = f"""<section id="tab-video"{panel_cls}>
       <h2>Videos <span>({len(videos)})</span></h2>
-      <div class="vgrid">{"".join(video_cards)}</div>
+      <div class="vgrid">{"".join(video_cards)}</div>{raw_section}
     </section>"""
     if tabbed and photos_section:
         photos_section = photos_section.replace(

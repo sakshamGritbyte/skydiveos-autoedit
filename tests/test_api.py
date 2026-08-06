@@ -1016,18 +1016,24 @@ def test_job_response_carries_the_derived_media_state(client: TestClient) -> Non
 
 
 def test_gallery_state_endpoint_reports_only_the_lock(client: TestClient) -> None:
-    """C-4: what the locked page polls to flip itself. One boolean, no PII."""
+    """C-4: what the page polls to flip itself. Lock + addon keys, no PII."""
     job_id = _create(client, entitlement="preview_only", customer_name="Sophie Lavoie")
     _rendered(client, job_id, locked=True)
     token = _token(client, job_id)
 
     resp = client.get(f"/j/{token}/state")
     assert resp.status_code == 200
-    assert resp.json() == {"locked": True}
+    assert resp.json() == {"locked": True, "addons": []}
     assert "Sophie" not in resp.text and token not in resp.text
 
     client.post(f"/jobs/{job_id}/unlock", json=_PAYMENT_BODY)
-    assert client.get(f"/j/{token}/state").json() == {"locked": False}
+    assert client.get(f"/j/{token}/state").json() == {"locked": False, "addons": []}
+
+    # An add-on purchase shows up as its key only — never the payment reference.
+    client.post(f"/jobs/{job_id}/unlock", json={**_PAYMENT_BODY, "item": "raw"})
+    state = client.get(f"/j/{token}/state")
+    assert state.json() == {"locked": False, "addons": ["raw"]}
+    assert _PAYMENT_BODY["payment_reference"] not in state.text
 
 
 def test_gallery_state_needs_no_service_token(
@@ -1055,16 +1061,94 @@ def test_unknown_gallery_code_state_is_404(client: TestClient) -> None:
     assert client.get("/j/deadbeef123/state").status_code == 404
 
 
-def test_locked_gallery_page_carries_the_flip_poll(client: TestClient) -> None:
+def test_addon_purchase_records_audits_and_is_idempotent(client: TestClient) -> None:
+    """`POST /unlock` with an item records the add-on without touching the paywall."""
+    job_id = _create(client, entitlement="preview_only")
+    _rendered(client, job_id, locked=True)
+
+    resp = client.post(f"/jobs/{job_id}/unlock", json={**_PAYMENT_BODY, "item": "raw"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["addons"] == {"raw": _PAYMENT_BODY["payment_reference"]}
+    assert body["entitlement"] == "preview_only"  # the paywall is a separate purchase
+
+    # Idempotent: a webhook retry keeps the ORIGINAL payment reference.
+    again = client.post(
+        f"/jobs/{job_id}/unlock", json={"payment_reference": "retry_txn", "item": "raw"}
+    )
+    assert again.json()["addons"] == {"raw": _PAYMENT_BODY["payment_reference"]}
+
+    # Unknown items fail loudly — mirrors SkydiveOS's no-price-no-sale rule.
+    assert client.post(
+        f"/jobs/{job_id}/unlock", json={**_PAYMENT_BODY, "item": "rebook"}
+    ).status_code == 400
+
+
+def test_raw_addon_gates_the_masters_and_grows_the_gallery(client: TestClient) -> None:
+    """The purchase — never the URL — opens the raw section (same rule as the paywall)."""
+    job_id = _create(client, customer_name="Sophie Lavoie")
+    _rendered(client, job_id, locked=False)
+    store = JobStore(client.jobs_root)
+    raw_dir = store.dir(job_id) / "raw"
+    (raw_dir / "instructor").mkdir(parents=True)
+    (raw_dir / "GX010052.MP4").write_bytes(b"MASTER-A")
+    (raw_dir / "instructor" / "GX020001.MP4").write_bytes(b"MASTER-B")
+    token = _token(client, job_id)
+
+    # Unreachable at any URL before the purchase; no section on the page.
+    assert client.get(f"/j/{token}/raw/GX010052.MP4").status_code == 404
+    assert "Raw Footage <span>" not in client.get(f"/j/{token}").text
+
+    client.post(f"/jobs/{job_id}/unlock", json={**_PAYMENT_BODY, "item": "raw"})
+
+    assert client.get(f"/j/{token}/raw/GX010052.MP4").content == b"MASTER-A"
+    assert client.get(f"/j/{token}/raw/instructor/GX020001.MP4").content == b"MASTER-B"
+    # Traversal and non-master files stay out of reach.
+    assert client.get(f"/j/{token}/raw/../job.json").status_code in (400, 404)
+    page = client.get(f"/j/{token}").text
+    assert "Raw Footage <span>(2)</span>" in page and "RAW · AS FILMED" in page
+    # The fulfilled tile leaves the upsell row (its blurb disappears with it).
+    assert "Every unedited minute" not in page
+
+
+def test_photos_addon_opens_the_grid_while_the_video_stays_locked(client: TestClient) -> None:
+    """Buying the photo pack must not unlock the edit — and vice versa."""
+    job_id = _create(client, entitlement="preview_only")
+    _rendered(client, job_id, locked=True)
+    store = JobStore(client.jobs_root)
+    photos_dir = store.dir(job_id) / "photos"
+    photos_dir.mkdir(parents=True)
+    (photos_dir / "photo_001.jpg").write_bytes(b"JPEG")
+    (photos_dir / "index.json").write_text('[{"filename": "photo_001.jpg"}]')
+    token = _token(client, job_id)
+
+    assert client.get(f"/j/{token}/photos/photo_001.jpg").status_code == 404
+    assert "unlock to see them all" in client.get(f"/j/{token}").text
+
+    client.post(f"/jobs/{job_id}/unlock", json={**_PAYMENT_BODY, "item": "photos"})
+
+    assert client.get(f"/j/{token}/photos/photo_001.jpg").content == b"JPEG"
+    page = client.get(f"/j/{token}").text
+    assert "pgrid" in page and "unlock to see them all" not in page
+    # The video half of the page is still Path B: watermarked preview + unlock CTA.
+    assert "720P PREVIEW" in page and "Unlock full video" in page
+    resp = client.get(f"/j/{token}/media/full_video")
+    assert resp.content == b"WATERMARKED"  # the clean master stays unreachable
+
+
+def test_gallery_page_carries_the_flip_poll_in_both_states(client: TestClient) -> None:
     job_id = _create(client, entitlement="preview_only")
     _rendered(client, job_id, locked=True)
     token = _token(client, job_id)
     page = client.get(f"/j/{token}").text
     assert f"/j/{token}/state" in page and "location.reload()" in page
+    assert "'locked|'" in page  # baseline signature: still behind the paywall
 
     client.post(f"/jobs/{job_id}/unlock", json=_PAYMENT_BODY)
-    # Once unlocked there is nothing to wait for, so the script is gone.
-    assert "location.reload()" not in client.get(f"/j/{token}").text
+    # The unlocked page still polls — an add-on purchase (raw/photos) must flip
+    # it in place too — with the signature updated so it doesn't reload-loop.
+    unlocked = client.get(f"/j/{token}").text
+    assert "location.reload()" in unlocked and "'open|'" in unlocked
 
 
 def test_gallery_ignores_any_source_tag(client: TestClient) -> None:

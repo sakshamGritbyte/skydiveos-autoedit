@@ -227,6 +227,12 @@ def _served_under(path: Path, root: Path) -> bool:
         return False
 
 
+#: Gallery upsell items ``POST /jobs/{id}/unlock`` can record besides the paywall
+#: ``unlock`` itself. Must stay in step with SkydiveOS's priced item keys — and, like
+#: SkydiveOS's ``NON_PURCHASABLE_ITEMS``, ``rebook`` is a promo and deliberately absent.
+PURCHASABLE_ADDONS = frozenset({"raw", "photos"})
+
+
 def _is_audio(file: UploadFile) -> bool:
     """Whether an uploaded file is an accepted audio track (by extension or MIME)."""
     suffix = Path(file.filename or "").suffix.lower()
@@ -1076,21 +1082,43 @@ def create_app() -> FastAPI:
 
         (``JobStore`` is single-writer by design; this one-field update's lost-update
         window against a running worker is microseconds, and a retry heals it.)
+
+        ``item`` extends the same seam to the gallery's purchasable add-on tiles:
+        ``raw`` / ``photos`` record the purchase in ``Job.addons`` (item → payment
+        reference, same audit rule) and never touch ``entitlement`` — the customer's
+        existing ``/j/{code}`` page grows the purchased section on its next request.
+        An unknown item is rejected, mirroring SkydiveOS's fail-loud pricing rule.
         """
         job = _load_or_404(store, job_id)
-        if job.entitlement is Entitlement.edited_download:
-            return JobResponse.from_job(job)  # already unlocked — idempotent
-        updated = store.update(
-            job_id,
-            entitlement=Entitlement.edited_download,
-            paid_at=time.time(),
-            payment_reference=body.payment_reference,
-        )
+        item = body.item.strip().lower() or "unlock"
+        if item == "unlock":
+            if job.entitlement is Entitlement.edited_download:
+                return JobResponse.from_job(job)  # already unlocked — idempotent
+            updated = store.update(
+                job_id,
+                entitlement=Entitlement.edited_download,
+                paid_at=time.time(),
+                payment_reference=body.payment_reference,
+            )
+            logger.info(
+                "job %s unlocked (preview_only -> edited_download) payment=%s by=%s",
+                job_id,
+                body.payment_reference,
+                principal.instructor_id or "service",
+            )
+            return JobResponse.from_job(updated)
+        if item not in PURCHASABLE_ADDONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown purchasable item {item!r} (one of: unlock, "
+                + ", ".join(sorted(PURCHASABLE_ADDONS)) + ")",
+            )
+        if item in job.addons:
+            return JobResponse.from_job(job)  # already purchased — idempotent
+        updated = store.update(job_id, addons={**job.addons, item: body.payment_reference})
         logger.info(
-            "job %s unlocked (preview_only -> edited_download) payment=%s by=%s",
-            job_id,
-            body.payment_reference,
-            principal.instructor_id or "service",
+            "job %s add-on %r purchased payment=%s by=%s",
+            job_id, item, body.payment_reference, principal.instructor_id or "service",
         )
         return JobResponse.from_job(updated)
 
@@ -1290,6 +1318,27 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="unknown gallery link")
         return job
 
+    def _gallery_raw_clips(store: JobStore, job: Job) -> list[tuple[str, str]]:
+        """The purchased raw-footage section: ``(label, relpath)`` per camera master.
+
+        Lists the job's staged masters (``raw/*.MP4``, or ``raw/<role>/*.MP4`` for the
+        two-camera Ultimate), sorted for a stable page. Relpaths are what
+        ``/j/{token}/raw/{path}`` serves — nothing outside ``raw/`` is ever listed.
+        """
+        raw_dir = store.dir(job.job_id) / "raw"
+        if not raw_dir.is_dir():
+            return []
+        clips: list[tuple[str, str]] = []
+        for p in sorted(raw_dir.rglob("*")):
+            if not p.is_file() or p.suffix.lower() not in (".mp4", ".lrv"):
+                continue
+            if p.suffix.lower() == ".lrv":
+                continue  # proxies are pipeline internals, not a customer product
+            rel = p.relative_to(raw_dir)
+            label = p.stem if len(rel.parts) == 1 else f"{rel.parts[0]} · {p.stem}"
+            clips.append((label, str(rel)))
+        return clips
+
     def _gallery_videos(store: JobStore, job: Job) -> list[str]:
         """The video deliverable names this job's gallery can stream, in order."""
         names = [n for n in (job.outputs or {}) if n != "photos"]
@@ -1341,6 +1390,14 @@ def create_app() -> FastAPI:
         """
         job = _job_by_token(store, token)
         locked = job.entitlement is Entitlement.preview_only
+        # Purchased add-ons unlock their own section independently of the paywall:
+        # a photos purchase opens the grid on a still-locked page, and a raw purchase
+        # adds the camera-master players to either state.
+        photos_purchased = "photos" in job.addons
+        raw_clips = (
+            [(label, f"/j/{token}/raw/{rel}") for label, rel in _gallery_raw_clips(store, job)]
+            if "raw" in job.addons else []
+        )
         video_names = _gallery_videos(store, job)
         photo_names = _gallery_photo_names(store, job)
         if not video_names and not photo_names:
@@ -1369,7 +1426,12 @@ def create_app() -> FastAPI:
             jump_date=job.jump_date,
             location=settings.delivery_location,
             videos=[(n, f"/j/{token}/media/{n}") for n in video_names],
-            photos=[] if locked else [f"/j/{token}/photos/{n}" for n in photo_names],
+            photos=(
+                [f"/j/{token}/photos/{n}" for n in photo_names]
+                if (not locked or photos_purchased) else []
+            ),
+            photos_unlocked=not locked or photos_purchased,
+            raw_videos=raw_clips,
             download_all_url=None,
             locked=locked,
             unlock_url=unlock_url,
@@ -1381,20 +1443,26 @@ def create_app() -> FastAPI:
             product_label=job.package.display_label,
             primary_download_url=dl_url,
             primary_download_note=dl_note,
-            # Entitlement-independent: the same row on the locked and unlocked page.
-            upsells=link_tiles(
-                settings.upsell_tiles,
-                template=settings.checkout_url_template,
-                job_id=job.job_id,
-                booking_id=job.booking_id,
-            ),
-            # Lets a locked page flip itself the moment /unlock lands (Frame 03).
+            # Entitlement-independent: the same row on the locked and unlocked page —
+            # minus tiles already purchased, which have become fulfilled sections.
+            upsells=[
+                t for t in link_tiles(
+                    settings.upsell_tiles,
+                    template=settings.checkout_url_template,
+                    job_id=job.job_id,
+                    booking_id=job.booking_id,
+                )
+                if t.key not in job.addons
+            ],
+            purchased_addons=sorted(job.addons),
+            # Lets an open page flip itself the moment /unlock (or an add-on
+            # purchase) lands (Frame 03).
             poll_token=token,
         )
         return HTMLResponse(html_page)
 
     @app.get("/j/{token}/state", include_in_schema=False)
-    def public_gallery_state(token: str, store: StoreDep) -> dict[str, bool]:
+    def public_gallery_state(token: str, store: StoreDep) -> dict[str, bool | list[str]]:
         """Whether this jump is still behind the paywall — one boolean, nothing else.
 
         Frame 03 says the page "re-renders in place" when payment lands. The page is
@@ -1408,7 +1476,12 @@ def create_app() -> FastAPI:
         loaded.
         """
         job = _job_by_token(store, token)
-        return {"locked": job.entitlement is Entitlement.preview_only}
+        return {
+            "locked": job.entitlement is Entitlement.preview_only,
+            # Purchased add-on keys (sorted, names only — no references), so an open
+            # page can also notice a raw/photos purchase and re-render in place.
+            "addons": sorted(job.addons),
+        }
 
     @app.get("/j/{token}/media/{name}", include_in_schema=False, response_class=FileResponse)
     def public_media(token: str, name: str, store: StoreDep) -> FileResponse:
@@ -1432,9 +1505,9 @@ def create_app() -> FastAPI:
 
     @app.get("/j/{token}/photos/{filename}", include_in_schema=False, response_class=FileResponse)
     def public_photo(token: str, filename: str, store: StoreDep) -> FileResponse:
-        """Serve one full-res still to the customer — unlocked jobs only."""
+        """Serve one full-res still — unlocked jobs, or a locked job that bought photos."""
         job = _job_by_token(store, token)
-        if job.entitlement is Entitlement.preview_only:
+        if job.entitlement is Entitlement.preview_only and "photos" not in job.addons:
             raise HTTPException(status_code=404, detail="photos unlock with the full video")
         if not _is_safe_segment(filename):
             raise HTTPException(status_code=400, detail="invalid photo filename")
@@ -1443,6 +1516,28 @@ def create_app() -> FastAPI:
         if not path.exists() or not _served_under(path, photos_dir):
             raise HTTPException(status_code=404, detail="photo not found")
         return FileResponse(path, media_type="image/jpeg", filename=filename)
+
+    @app.get("/j/{token}/raw/{name:path}", include_in_schema=False, response_class=FileResponse)
+    def public_raw(token: str, name: str, store: StoreDep) -> FileResponse:
+        """Stream one camera master to a customer who bought the ``raw`` add-on.
+
+        Same rule as the paywall: the **purchase**, never the URL, opens the files —
+        without ``raw`` in ``Job.addons`` every path here 404s. ``name`` is the
+        relpath under the job's ``raw/`` dir (one optional role subdir for Ultimate),
+        each segment traversal-checked, and the resolved file must live under
+        ``raw/`` (defence in depth, like every other public media route).
+        """
+        job = _job_by_token(store, token)
+        if "raw" not in job.addons:
+            raise HTTPException(status_code=404, detail="raw footage is a paid add-on")
+        parts = name.split("/")
+        if len(parts) > 2 or not all(_is_safe_segment(p) for p in parts):
+            raise HTTPException(status_code=400, detail="invalid raw clip path")
+        raw_dir = store.dir(job.job_id) / "raw"
+        path = raw_dir.joinpath(*parts)
+        if not path.is_file() or path.suffix.lower() != ".mp4" or not _served_under(path, raw_dir):
+            raise HTTPException(status_code=404, detail="raw clip not found")
+        return FileResponse(path, media_type="video/mp4", filename=path.name)
 
     # ----------------------------------------------------------------------- #
     # Per-deliverable music: upload a backing track per video deliverable BEFORE

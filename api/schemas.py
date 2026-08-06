@@ -85,6 +85,9 @@ class JobResponse(BaseModel):
     entitlement: Entitlement
     #: Epoch seconds when the paywall unlock was captured (``None`` = never).
     paid_at: float | None
+    #: Purchased gallery add-ons: item key → captured payment reference. SkydiveOS
+    #: reads this to reconcile add-on sales; fulfilment is the gallery's own.
+    addons: dict[str, str]
     reject_reason: str | None
     error: str | None
     #: Rendered deliverables, present (non-null) only once status == ready.
@@ -113,6 +116,7 @@ class JobResponse(BaseModel):
             instructor_name=job.instructor_name,
             entitlement=job.entitlement,
             paid_at=job.paid_at,
+            addons=job.addons,
             reject_reason=job.reject_reason,
             error=job.error,
             outputs=job.outputs,
@@ -296,6 +300,18 @@ class UnlockRequest(BaseModel):
     #: Optional amount captured, for the audit trail (display/reconciliation only —
     #: this service never prices anything).
     amount: float | None = Field(default=None, ge=0.0, examples=[39.0])
+    #: Which gallery item was purchased. ``unlock`` (default — the paywall flip) or a
+    #: purchasable add-on tile key (``raw`` / ``photos``). Fulfilment is gallery-side:
+    #: the customer's existing ``/j/{code}`` page grows the purchased section on its
+    #: next request. Unknown items are rejected — mirrors SkydiveOS's fail-loud
+    #: pricing rule, so a typo'd tile key can't silently succeed-and-deliver-nothing.
+    item: str = Field(
+        default="unlock",
+        min_length=1,
+        max_length=40,
+        description="Purchased gallery item: 'unlock' (paywall), 'raw', or 'photos'",
+        examples=["unlock", "raw", "photos"],
+    )
 
 
 class RejectRequest(BaseModel):

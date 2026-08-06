@@ -11,6 +11,7 @@ delivery the moment a render finishes.
 from __future__ import annotations
 
 import smtplib
+import time
 from dataclasses import replace
 from email.message import EmailMessage
 from pathlib import Path
@@ -735,14 +736,58 @@ def test_s3_ingest_ultimum_waits_for_both_cameras(
     monkeypatch.setattr(tasks, "_download_s3", fake_download)
     enq: list[str] = []
     monkeypatch.setattr(tasks.process_selfie_package, "delay", enq.append)
+    settled: list[str] = []
+    monkeypatch.setattr(
+        tasks.raw_clips_settled_job,
+        "apply_async",
+        lambda args, countdown: settled.append(args[0]),
+    )
 
     # First camera → downloaded, but processing NOT enqueued (waiting for the other).
     tasks.ingest_s3_job(job_id="j1", s3_key="raw/A/GH010001.MP4", camera_role="instructor")
-    assert enq == []
+    assert enq == [] and settled == []
 
-    # Second camera → both present, processing enqueued exactly once.
+    # Second camera → both present, but each camera's jump arrives as SEVERAL
+    # per-clip notifications: dispatching here would render a partial multi-cam
+    # edit. Eligibility arms the settle window instead — never a direct dispatch.
     tasks.ingest_s3_job(job_id="j1", s3_key="raw/B/GH010001.MP4", camera_role="external")
+    assert enq == [] and settled == ["j1"]
+
+    # Still-arriving clips keep re-arming; the settle check dispatches once quiet.
+    store.update("j1", last_raw_clip_at=time.time() - 9999)
+    tasks.raw_clips_settled_job(job_id="j1")
     assert enq == ["j1"]
+
+    # And a second settled check (a re-notified clip's) must not double-render.
+    tasks.raw_clips_settled_job(job_id="j1")
+    assert enq == ["j1"]
+
+
+def test_settle_check_never_dispatches_a_one_camera_ultimum(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Quiet but missing the second camera → wait (the watchdog owns the timeout)."""
+    from api import tasks
+    from api.jobs import Job, Package
+
+    store.create(Job(job_id="j2", package=Package.ultimum))
+    monkeypatch.setattr(tasks, "get_settings", lambda: _settings(jobs_root=str(tmp_path)))
+
+    def fake_download(s3_key: str, dest: Path, settings: object) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"video")
+
+    monkeypatch.setattr(tasks, "_download_s3", fake_download)
+    enq: list[str] = []
+    monkeypatch.setattr(tasks.process_selfie_package, "delay", enq.append)
+    monkeypatch.setattr(
+        tasks.raw_clips_settled_job, "apply_async", lambda args, countdown: None
+    )
+
+    tasks.ingest_s3_job(job_id="j2", s3_key="raw/A/GH010001.MP4", camera_role="instructor")
+    store.update("j2", last_raw_clip_at=time.time() - 9999)  # long quiet, one camera
+    tasks.raw_clips_settled_job(job_id="j2")
+    assert enq == []  # a one-camera "Ultimate" must never render
 
 
 def test_s3_ingest_ultimum_without_role_fails(

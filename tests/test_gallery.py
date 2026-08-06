@@ -318,7 +318,9 @@ def test_locked_page_flips_itself_when_payment_lands() -> None:
     html = _state_2_locked()
     assert "/j/tok/state" in html
     assert "location.reload()" in html
-    assert "s.locked===false" in html
+    # The poll compares the full purchase signature (lock + addon keys), so an
+    # add-on purchase re-renders the page exactly like the paywall unlock does.
+    assert "s.locked?'locked':'open'" in html and "s.addons" in html
 
 
 def test_unlocked_page_does_not_poll() -> None:

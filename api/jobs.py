@@ -266,6 +266,14 @@ class Job(BaseModel):
     #: Required on ``POST /jobs/{id}/unlock`` so giving away the product is always
     #: attributable to a real capture; kept for audit/reconciliation only.
     payment_reference: str | None = None
+    #: Post-jump add-on purchases from the gallery's upsell row: item key
+    #: (``raw`` / ``photos``) → the captured payment reference, same audit rule as
+    #: ``payment_reference``. Fulfilment is entirely gallery-side — the same
+    #: ``/j/{code}`` page grows the purchased section on its next request (raw
+    #: footage players, or the photo grid for a still-locked job), so nothing is
+    #: re-rendered, re-delivered or re-emailed. Set only by ``POST /jobs/{id}/unlock``
+    #: with an ``item``; never touches ``entitlement`` or ``status``.
+    addons: dict[str, str] = Field(default_factory=dict)
 
     #: Epoch seconds when the most recent raw clip landed via the ``s3_key`` ingest
     #: path. SkydiveOS notifies once PER CLIP, so a jump filmed as several files

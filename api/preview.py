@@ -122,6 +122,13 @@ def render_job_previews(
     if not sources:
         raise PreviewError(f"job {job.job_id} has no rendered video to preview")
 
+    # The dropzone logo makes the mark unmistakably branded; a missing asset just
+    # means a text-only watermark, never a failed preview.
+    logo = Path(settings.watermark_logo) if settings.watermark_logo else None
+    if logo is not None and not logo.is_file():
+        logger.warning("watermark logo %s not found; rendering text-only watermark", logo)
+        logo = None
+
     rendered: dict[str, str] = {}
     with tempfile.TemporaryDirectory(prefix="watermark-") as tmp:
         png = render_watermark(
@@ -129,6 +136,7 @@ def render_job_previews(
             width=PREVIEW_W,
             height=PREVIEW_H,
             brand=settings.delivery_brand_name,
+            logo_path=logo,
         )
         for name, src in sources.items():
             out = preview_path(job_dir, name)

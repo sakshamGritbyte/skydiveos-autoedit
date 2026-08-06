@@ -398,12 +398,22 @@ def ingest_s3_job(job_id: str, s3_key: str, camera_role: str | None = None) -> s
     if job.package.is_ultimum:
         from .selfie import CAMERA_ROLES
 
+        # Stamp every clip: each camera's jump arrives as SEVERAL per-clip
+        # notifications, so "both roles present" alone is NOT dispatchable — the
+        # first external clip landing next to the instructor's set would render a
+        # partial multi-cam edit (observed live: 2 of 8 cameraman clips made the
+        # cut). Both-roles-present only makes the job ELIGIBLE; the settle window
+        # decides WHEN, exactly like the single-camera path below.
+        store.update(job_id, status=JobStatus.queued, error=None, last_raw_clip_at=time.time())
         if store.camera_roles_present(job_id, CAMERA_ROLES):
-            store.update(job_id, status=JobStatus.queued, error=None)
-            # Through the guard, not a bare .delay(): a re-notified clip arriving after
-            # both roles are already on disk would otherwise start a second render of
-            # the same job (both roles are still "present", so this branch runs again).
-            _dispatch_processing(store, job_id)
+            settle = get_settings().raw_clip_settle_seconds
+            if settle <= 0:
+                # Opt-out: dispatch immediately — through the guard, not a bare
+                # .delay(): a re-notified clip arriving after both roles are on disk
+                # would otherwise start a second render of the same job.
+                _dispatch_processing(store, job_id)
+            else:
+                raw_clips_settled_job.apply_async((job_id,), countdown=settle)
         else:
             # Only one camera so far. Arm a watchdog so a never-arriving second camera
             # (or a package mis-mapped to ultimum) fails the job instead of stranding it
@@ -475,7 +485,14 @@ def raw_clips_settled_job(job_id: str) -> str:
 
     settings = get_settings()
     store = _store()
-    job = store.load(job_id)
+    try:
+        job = store.load(job_id)
+    except FileNotFoundError:
+        # The job was deleted while this check sat in the queue (an operator
+        # cleanup, or a stale task from another environment sharing the broker).
+        # A missing job has nothing to dispatch — don't crash-loop the worker.
+        logger.warning("settle check for unknown job %s — dropping", job_id)
+        return job_id
 
     if job.processing_dispatched or job.status != JobStatus.queued:
         return job_id  # already underway, or no longer waiting to be processed
@@ -488,6 +505,16 @@ def raw_clips_settled_job(job_id: str) -> str:
             (job_id,), countdown=settings.raw_clip_settle_poll_seconds
         )
         return job_id
+
+    if job.package.is_ultimum:
+        from .selfie import CAMERA_ROLES
+
+        if not store.camera_roles_present(job_id, CAMERA_ROLES):
+            # Quiet, but the second camera hasn't arrived: not dispatchable. Its own
+            # ingest will arm a fresh settle check when it lands; the ultimum
+            # watchdog owns the never-arrives case. Dispatching here would render a
+            # one-camera "Ultimate".
+            return job_id
 
     n_clips = len(list(store.raw_dir(job_id).glob("*"))) if store.raw_dir(job_id).exists() else 0
     logger.info(
@@ -519,7 +546,12 @@ def ultimum_watchdog_job(job_id: str) -> str:
     from .selfie import CAMERA_ROLES
 
     store = _store()
-    job = store.load(job_id)
+    try:
+        job = store.load(job_id)
+    except FileNotFoundError:
+        # Deleted while the countdown ran (operator cleanup) — nothing to fail.
+        logger.warning("ultimum watchdog for unknown job %s — dropping", job_id)
+        return job_id
     if job.status != JobStatus.queued or store.camera_roles_present(job_id, CAMERA_ROLES):
         return job_id  # second camera arrived / job progressed — nothing to do
 

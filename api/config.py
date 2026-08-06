@@ -179,6 +179,11 @@ class Settings:
     #: Price string shown on the locked gallery's unlock CTA
     #: (``PREVIEW_PRICE_DISPLAY``, display only — billing lives in SkydiveOS).
     preview_price_display: str = "$39"
+    #: Dropzone logo PNG (transparent background) stamped across the Path-B preview
+    #: watermark — tiled between the brand rows plus one large centre mark
+    #: (``WATERMARK_LOGO``). Missing/unreadable → text-only watermark; a branding
+    #: asset must never fail a preview render.
+    watermark_logo: str = "templates/logo.png"
     #: Checkout URL for the locked gallery's CTA (``CHECKOUT_URL_TEMPLATE``, with
     #: ``{job_id}`` / ``{booking_id}`` placeholders — and ``{item}`` for an upsell
     #: tile). ``None`` → the CTA renders as text ("ask at the desk") until SkydiveOS
@@ -294,6 +299,7 @@ def get_settings() -> Settings:
         archive_link_mode=(os.environ.get("ARCHIVE_LINK_MODE") or "link").strip().lower(),
         public_base_url=(os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/") or None,
         preview_price_display=os.environ.get("PREVIEW_PRICE_DISPLAY") or "$39",
+        watermark_logo=os.environ.get("WATERMARK_LOGO") or "templates/logo.png",
         checkout_url_template=os.environ.get("CHECKOUT_URL_TEMPLATE") or None,
         upsell_tiles=parse_tiles(os.environ.get("UPSELL_TILES")),
         # Accept the SkydiveOS-side spellings too, so one secret can be pasted into

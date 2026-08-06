@@ -30,7 +30,10 @@ Run::
 
     python scripts/skydiveos_bridge.py [--port 9000] [--api http://localhost:8000]
 
-and point discovery at it: ``SKYDIVEOS_API_BASE=http://localhost:9000``.
+and point discovery at it: ``SKYDIVEOS_API_BASE=http://localhost:9000``. It binds
+localhost by default; when the notifier is a *different* machine (the dropzone Mac
+POSTing to this box) pass ``--host 0.0.0.0`` and restrict access at the firewall —
+the notify carries no auth header, so the network is the only gate on this port.
 Needs ``MONGO_URL`` (the match) and ``S3_BUCKET`` (to fetch the clips back).
 """
 
@@ -274,6 +277,12 @@ def create_app(bridge: Bridge) -> Any:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--port", type=int, default=9000)
+    parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="bind address (default 127.0.0.1 — same-machine only). Use 0.0.0.0 when "
+             "the bridge runs in a container or the notifier is another host; the "
+             "notify carries no auth header, so restrict access at the firewall/proxy",
+    )
     parser.add_argument("--api", default="http://localhost:8000", help="auto-edit API base")
     parser.add_argument(
         "--debounce", type=float, default=20.0,
@@ -286,10 +295,10 @@ def main(argv: list[str] | None = None) -> int:
 
     bridge = Bridge(args.api, debounce_s=args.debounce)
     logger.info(
-        "bridge on :%d → auto-edit at %s  (point discovery at SKYDIVEOS_API_BASE="
-        "http://localhost:%d)", args.port, args.api, args.port,
+        "bridge on %s:%d → auto-edit at %s  (point discovery at SKYDIVEOS_API_BASE="
+        "http://<this-host>:%d)", args.host, args.port, args.api, args.port,
     )
-    uvicorn.run(create_app(bridge), host="127.0.0.1", port=args.port, log_level="warning")
+    uvicorn.run(create_app(bridge), host=args.host, port=args.port, log_level="warning")
     return 0
 
 

@@ -43,5 +43,31 @@ services:
     depends_on: [redis]
     restart: unless-stopped
 
+  # The SkydiveOS raw-upload consumer, until the SkydiveOS backend implements the
+  # staff_id contract (SKYDIVEOS_INTEGRATION.md). The dropzone's ingest machine POSTs
+  # {s3_key, camera_id, captured_at, staff_id} here; the bridge matches the clip to a
+  # load/jumper (MONGO_URL), debounces a jump's clips, then creates ONE job on `api`.
+  #
+  # It runs HERE and not on the ingest machine on purpose: it fetches the masters back
+  # out of S3 to attach them, which belongs on the same box as the API (S3 -> EC2)
+  # rather than crossing the dropzone's uplink twice.
+  #
+  # SECURITY: discovery's notify carries no auth header, so this port's only gate is
+  # the network. Publish it to the ingest machine's IP alone (security group), or put
+  # it behind the same TLS proxy that fronts 8000 and change the publish below to
+  # "127.0.0.1:9000:9000". Stopping this service leaves api/worker untouched.
+  bridge:
+    build: .
+    command: python scripts/skydiveos_bridge.py --host 0.0.0.0 --port 9000 --api http://api:8000
+    env_file: .env
+    environment:
+      JOBS_ROOT: /data/jobs
+    volumes:
+      - jobs:/data/jobs                  # _bridge_state.json: dedupe/flags survive a restart
+    ports:
+      - "9000:9000"
+    depends_on: [api]
+    restart: unless-stopped
+
 volumes:
   jobs:

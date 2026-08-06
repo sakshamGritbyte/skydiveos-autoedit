@@ -254,13 +254,18 @@ class Bridge:
 
 
 def create_app(bridge: Bridge) -> Any:
-    from fastapi import FastAPI, Request
+    from fastapi import FastAPI
 
     app = FastAPI(title="SkydiveOS raw-upload bridge (local stand-in)")
 
+    # The notify body is taken as a plain dict, NOT via a `Request` parameter: this
+    # module is `from __future__ import annotations`, so FastAPI resolves annotations
+    # as strings against the MODULE globals — and a `Request` imported inside this
+    # function isn't there. It silently degraded to "required query param `request`",
+    # so every notify 422'd. `dict` is a builtin, so it always resolves.
     @app.post("/api/media/raw-upload")
-    async def raw_upload(request: Request) -> dict[str, Any]:
-        return await bridge.raw_upload(dict(await request.json()))
+    async def raw_upload(notice: dict[str, Any]) -> dict[str, Any]:
+        return await bridge.raw_upload(notice)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:

@@ -530,6 +530,9 @@ def test_status_callback_hits_skydiveos_route_with_links_and_token(
         # The design doc's state vocabulary, derived from status + entitlement.
         "media_state": "DELIVERED",
         "delivery_links": {"final": "https://s3.test/final.mp4"},
+        # Identity so SkydiveOS can link a job it did not create; this fixture knows
+        # only the model's default name, so that is all that rides along.
+        "customer_name": "Valued Skydiver",
     }
     assert posted["headers"]["X-Auto-Edit-Token"] == "sekret"
 
@@ -1047,3 +1050,81 @@ def test_status_callback_omits_gallery_url_without_a_public_base(
     assert isinstance(payload, dict)
     assert "gallery_url" not in payload
     assert payload["entitlement"] == "edited_download"
+
+
+def test_status_callback_carries_the_booking_and_customer_identity(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SkydiveOS needs these to LINK a job it did not create.
+
+    Its callback receiver upserts a media record for an unknown ``job_id`` — that is
+    what makes the paywall sellable for jobs the bridge creates. Without the identity
+    the adopted row is booking-less: reporting is blind, the offer page has no name,
+    and its own matcher could later open a second job for the same booking with
+    nothing to correlate the two.
+    """
+    import httpx
+
+    from api import tasks
+    from api.jobs import Job, JobStatus
+
+    store.create(
+        Job(
+            job_id="j-linked",
+            status=JobStatus.delivered,
+            booking_id="6a69f7bd9e401eac4dd90f5c",
+            customer_name="Saksham Saxena",
+            customer_email="jumper@example.test",
+        )
+    )
+    monkeypatch.setattr(
+        tasks, "get_settings",
+        lambda: _settings(jobs_root=str(tmp_path), skydiveos_api_base="http://skydiveos.test"),
+    )
+    posted: dict[str, object] = {}
+
+    def _fake_post(url, *, json, headers, timeout):  # noqa: ANN001
+        posted.update(json=json)
+        class _R:
+            def raise_for_status(self) -> None: ...
+        return _R()
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    tasks._notify_skydiveos(store.load("j-linked"))
+
+    body = posted["json"]
+    assert body["booking_id"] == "6a69f7bd9e401eac4dd90f5c"  # type: ignore[index]
+    assert body["customer_email"] == "jumper@example.test"  # type: ignore[index]
+    assert body["customer_name"] == "Saksham Saxena"  # type: ignore[index]
+
+
+def test_status_callback_omits_identity_it_does_not_know(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gap-fill only: an unknown field is absent, never an empty string or null."""
+    import httpx
+
+    from api import tasks
+    from api.jobs import Job, JobStatus
+
+    store.create(Job(job_id="j-bare", status=JobStatus.ready))
+    monkeypatch.setattr(
+        tasks, "get_settings",
+        lambda: _settings(jobs_root=str(tmp_path), skydiveos_api_base="http://skydiveos.test"),
+    )
+    posted: dict[str, object] = {}
+
+    def _fake_post(url, *, json, headers, timeout):  # noqa: ANN001
+        posted.update(json=json)
+        class _R:
+            def raise_for_status(self) -> None: ...
+        return _R()
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    tasks._notify_skydiveos(store.load("j-bare"))
+
+    body = posted["json"]
+    assert "booking_id" not in body  # type: ignore[operator]
+    assert "customer_email" not in body  # type: ignore[operator]
+    # customer_name has a model default, so it IS known and forwarded.
+    assert body["customer_name"] == "Valued Skydiver"  # type: ignore[index]

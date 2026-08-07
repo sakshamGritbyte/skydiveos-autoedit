@@ -107,6 +107,18 @@ def _notify_skydiveos(job: Job) -> None:
         # On `delivered`, forward the presigned customer links so the web layer can
         # show/send them too (its booking record knows channels we don't, e.g. WhatsApp).
         payload["delivery_links"] = job.delivery_links
+    # Identity, so SkydiveOS can LINK a job it did not create. Its receiver upserts a
+    # media record for an unknown job_id (that is what makes the paywall sellable for
+    # jobs the bridge creates) — but without these it is booking-less, so reporting is
+    # blind and its own footage-matcher could later open a second job for the same
+    # booking with nothing to correlate them. All three are gap-fill: absent when we
+    # don't know them, and the receiver never lets them move a link it matched itself.
+    if job.booking_id:
+        payload["booking_id"] = job.booking_id
+    if job.customer_email:
+        payload["customer_email"] = job.customer_email
+    if job.customer_name:
+        payload["customer_name"] = job.customer_name
     headers: dict[str, str] = {}
     if settings.auto_edit_callback_token:
         headers["X-Auto-Edit-Token"] = settings.auto_edit_callback_token

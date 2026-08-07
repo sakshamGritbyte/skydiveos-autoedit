@@ -25,6 +25,9 @@ class _StubBridge:
     """Enough of ``Bridge`` for the routes: records what the handler passed on."""
 
     def __init__(self) -> None:
+        from api.config import get_settings
+
+        self.settings: Any = get_settings()
         self.pending: dict[str, Any] = {}
         self.state: dict[str, dict[str, Any]] = {"handled": {}, "flagged": {}}
         self.seen: list[dict[str, Any]] = []
@@ -80,3 +83,56 @@ def test_healthz_reports_the_bridge_counters() -> None:
         "handled": 1,
         "flagged": 0,
     }
+
+
+def test_notify_requires_the_service_token_when_one_is_configured(
+    monkeypatch: Any,
+) -> None:
+    """With AUTO_EDIT_API_KEY set, an unauthenticated notify is refused.
+
+    The bridge is reachable from the public internet and one accepted notification
+    creates a job, renders it and emails a customer — so the security group must not
+    be its only gate (a dropzone's IP changes; a console mistake opens 0.0.0.0/0).
+    """
+    from api.config import get_settings
+
+    monkeypatch.setenv("AUTO_EDIT_API_KEY", "s3cr3t")
+    get_settings.cache_clear()
+    try:
+        stub = _StubBridge()
+        stub.settings = get_settings()
+        client = TestClient(create_app(stub), raise_server_exceptions=False)
+
+        assert client.post("/api/media/raw-upload", json={"s3_key": "k"}).status_code == 401
+        assert client.post(
+            "/api/media/raw-upload", json={"s3_key": "k"},
+            headers={"Authorization": "Bearer wrong"},
+        ).status_code == 401
+        assert stub.seen == []  # nothing reached the matcher
+
+        ok = client.post(
+            "/api/media/raw-upload", json={"s3_key": "k"},
+            headers={"Authorization": "Bearer s3cr3t"},
+        )
+        assert ok.status_code == 200, ok.text
+        assert stub.seen == [{"s3_key": "k"}]
+
+        # /healthz stays open: it is how an operator checks the bridge is alive.
+        assert client.get("/healthz").status_code == 200
+    finally:
+        get_settings.cache_clear()
+
+
+def test_the_gate_is_off_until_a_key_is_configured(monkeypatch: Any) -> None:
+    """No AUTO_EDIT_API_KEY -> unchanged behaviour, same opt-in as the API's gate."""
+    from api.config import get_settings
+
+    monkeypatch.delenv("AUTO_EDIT_API_KEY", raising=False)
+    get_settings.cache_clear()
+    try:
+        stub = _StubBridge()
+        stub.settings = get_settings()
+        client = TestClient(create_app(stub))
+        assert client.post("/api/media/raw-upload", json={"s3_key": "k"}).status_code == 200
+    finally:
+        get_settings.cache_clear()

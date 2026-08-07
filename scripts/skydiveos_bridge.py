@@ -21,7 +21,12 @@ Behaviour:
   ignored (discovery retries on our non-2xx, so failures raise and retry instead).
 * **Debounce** — clips are grouped per matched jump ``(load_id, jumper_index)``;
   the job is created once no new clip has arrived for that jump for
-  ``--debounce`` seconds, so a session's clips land in ONE job.
+  ``--debounce`` seconds, so a session's clips land in ONE job. The default is
+  deliberately long (15 min): the gap between two notifications is really the
+  *S3 upload time of the next clip*, and at 20 s a card pulled over a dropzone
+  uplink split one jump into four jobs — four renders, four "your video is
+  ready" emails to the same customer (observed 2026-08-06). Waiting is cheap;
+  a partial edit delivered to a customer is not.
 * **Refuse-and-flag** — an unmatchable clip (no load fits, ambiguous, unmappable
   purchase) is logged + recorded and acknowledged with 200: mis-delivery is worse
   than a human follow-up, and a 5xx would make discovery retry forever.
@@ -32,9 +37,11 @@ Run::
 
 and point discovery at it: ``SKYDIVEOS_API_BASE=http://localhost:9000``. It binds
 localhost by default; when the notifier is a *different* machine (the dropzone Mac
-POSTing to this box) pass ``--host 0.0.0.0`` and restrict access at the firewall —
-the notify carries no auth header, so the network is the only gate on this port.
-Needs ``MONGO_URL`` (the match) and ``S3_BUCKET`` (to fetch the clips back).
+POSTing to this box) pass ``--host 0.0.0.0``. ``/api/*`` then requires the same
+``Authorization: Bearer $AUTO_EDIT_API_KEY`` the auto-edit API does (discovery sends
+it automatically) — one accepted notify creates a job and emails a customer, so the
+firewall must not be its only gate. Needs ``MONGO_URL`` (the match) and ``S3_BUCKET``
+(to fetch the clips back).
 """
 
 from __future__ import annotations
@@ -69,7 +76,7 @@ class PendingJump:
 
 
 class Bridge:
-    def __init__(self, api: str, *, debounce_s: float = 20.0) -> None:
+    def __init__(self, api: str, *, debounce_s: float = 900.0) -> None:
         from api.config import get_settings
         from ingest.match import FootageMatcher
 
@@ -254,9 +261,27 @@ class Bridge:
 
 
 def create_app(bridge: Bridge) -> Any:
-    from fastapi import FastAPI
+    from fastapi import FastAPI, Request
+    from fastapi.responses import JSONResponse
+
+    from api.auth import service_token_allows
 
     app = FastAPI(title="SkydiveOS raw-upload bridge (local stand-in)")
+
+    # This endpoint is reachable from the public internet (the dropzone's ingest
+    # machine POSTs to it), and ONE accepted notification is enough to create a job,
+    # render it and email a customer. A security-group /32 was the only gate, which
+    # (a) breaks whenever the dropzone's IP changes and (b) is one console mistake
+    # away from 0.0.0.0/0. So the same service token that protects the auto-edit API
+    # protects this too — off until AUTO_EDIT_API_KEY is set, same opt-in as the gate.
+    @app.middleware("http")
+    async def _service_token_gate(request: Request, call_next: Any) -> Any:
+        if request.url.path.startswith("/api/") and not service_token_allows(
+            request.url.path, request.method, request.headers.get("authorization"),
+            bridge.settings,
+        ):
+            return JSONResponse({"detail": "service token required"}, status_code=401)
+        return await call_next(request)
 
     # The notify body is taken as a plain dict, NOT via a `Request` parameter: this
     # module is `from __future__ import annotations`, so FastAPI resolves annotations
@@ -290,8 +315,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--api", default="http://localhost:8000", help="auto-edit API base")
     parser.add_argument(
-        "--debounce", type=float, default=20.0,
-        help="seconds a jump waits for more clips before its job is created (default 20)",
+        "--debounce", type=float, default=900.0,
+        help="seconds a jump waits for more clips before its job is created (default 900)",
     )
     args = parser.parse_args(argv)
 

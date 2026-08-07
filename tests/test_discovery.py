@@ -415,8 +415,8 @@ def test_s3_notify_uploader_puts_to_s3_then_notifies(tmp_path, monkeypatch) -> N
         def raise_for_status(self) -> None:
             posted["raised"] = False
 
-    def _fake_post(url, *, json, timeout):  # noqa: ANN001
-        posted.update(url=url, json=json)
+    def _fake_post(url, *, json, timeout, headers=None):  # noqa: ANN001
+        posted.update(url=url, json=json, headers=headers or {})
         return _Resp()
 
     monkeypatch.setattr(httpx, "post", _fake_post)
@@ -459,7 +459,7 @@ def test_s3_notify_uploader_includes_capture_time(tmp_path, monkeypatch) -> None
         def raise_for_status(self) -> None:
             pass
 
-    def _fake_post(url, *, json, timeout):  # noqa: ANN001
+    def _fake_post(url, *, json, timeout, headers=None):  # noqa: ANN001
         posted.update(json=json)
         return _Resp()
 
@@ -1113,7 +1113,7 @@ def test_s3_notify_uploader_includes_staff_id(tmp_path, monkeypatch) -> None:
         def raise_for_status(self) -> None:
             pass
 
-    def _fake_post(url, *, json, timeout):  # noqa: ANN001
+    def _fake_post(url, *, json, timeout, headers=None):  # noqa: ANN001
         posted.update(json=json)
         return _Resp()
 
@@ -1253,3 +1253,52 @@ def test_server_error_handoff_still_retries(tmp_path: Path) -> None:
 
     asyncio.run(scenario())
     assert uploads.attempts >= 3
+
+
+def test_the_notify_carries_the_service_token(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    """The raw-upload notify is authenticated with the same token the API uses.
+
+    The consumer is internet-facing and one accepted notification creates a job and
+    emails a customer, so a security-group rule must not be its only gate. Unset key
+    → no header, i.e. the same opt-in as the API's own gate.
+    """
+    import httpx
+
+    from api.config import get_settings
+    from ingest.discovery import s3_notify_uploader
+
+    mp4 = tmp_path / "GX010001.MP4"
+    mp4.write_bytes(b"x")
+    class _FakeS3Client:
+        def upload_file(self, *a: object, **kw: object) -> None:
+            return None
+
+    posted: dict[str, object] = {}
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            return None
+
+    def _fake_post(url, *, json, timeout, headers=None):  # noqa: ANN001
+        posted["headers"] = headers or {}
+        return _Resp()
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+
+    monkeypatch.setenv("AUTO_EDIT_API_KEY", "s3cr3t")
+    get_settings.cache_clear()
+    try:
+        s3_notify_uploader(
+            "http://skydiveos.test/", bucket="jumps", s3_client=_FakeS3Client()
+        )(str(mp4), "1234", None)
+        assert posted["headers"].get("Authorization") == "Bearer s3cr3t"  # type: ignore[union-attr]
+
+        monkeypatch.delenv("AUTO_EDIT_API_KEY", raising=False)
+        get_settings.cache_clear()
+        posted.clear()
+        s3_notify_uploader(
+            "http://skydiveos.test/", bucket="jumps", s3_client=_FakeS3Client()
+        )(str(mp4), "1234", None)
+        assert "Authorization" not in posted["headers"]
+    finally:
+        get_settings.cache_clear()

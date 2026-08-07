@@ -273,7 +273,21 @@ def s3_notify_uploader(
         captured_at = _probe_capture_time(mp4_path, clock_tz=clock_tz)
         if captured_at is not None:
             payload["captured_at"] = captured_at
-        resp = httpx.post(f"{skydiveos_url.rstrip('/')}{path}", json=payload, timeout=timeout)
+        # The consumer is internet-facing (the ingest machine POSTs to it across the
+        # public network), and this notify is enough on its own to create a job and
+        # email a customer — so it carries the same service token every other call to
+        # our own API does. Empty when AUTO_EDIT_API_KEY is unset, exactly like the
+        # gate itself: opt-in, and never a new failure mode for an existing deployment.
+        from api.auth import (
+            service_auth_headers,  # noqa: PLC0415 - lazy: keeps /ingest import-light
+        )
+
+        resp = httpx.post(
+            f"{skydiveos_url.rstrip('/')}{path}",
+            json=payload,
+            timeout=timeout,
+            headers=service_auth_headers(),
+        )
         resp.raise_for_status()
         # Both S3 and SkydiveOS accepted it — the key is now proof the footage is safe.
         return key

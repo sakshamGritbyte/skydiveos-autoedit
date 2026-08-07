@@ -52,10 +52,11 @@ services:
   # out of S3 to attach them, which belongs on the same box as the API (S3 -> EC2)
   # rather than crossing the dropzone's uplink twice.
   #
-  # SECURITY: discovery's notify carries no auth header, so this port's only gate is
-  # the network. Publish it to the ingest machine's IP alone (security group), or put
-  # it behind the same TLS proxy that fronts 8000 and change the publish below to
-  # "127.0.0.1:9000:9000". Stopping this service leaves api/worker untouched.
+  # SECURITY: /api/* here requires the same Authorization: Bearer $AUTO_EDIT_API_KEY
+  # the auto-edit API does (discovery sends it) — one accepted notify creates a job and
+  # emails a customer, and a security-group /32 both breaks when the dropzone's IP
+  # changes and is one console mistake from 0.0.0.0/0. Narrow the source anyway;
+  # defence in depth. Stopping this service leaves api/worker untouched.
   bridge:
     build: .
     command: python scripts/skydiveos_bridge.py --host 0.0.0.0 --port 9000 --api http://api:8000

@@ -61,6 +61,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_INTERVAL = 30.0
 #: SkydiveOS path the S3-key notification is POSTed to (it creates the media record).
 RAW_UPLOAD_PATH = "/api/media/raw-upload"
+#: SkydiveOS path the card-ingest snapshot is PUSHED to (see :func:`publish_card_status`).
+CARD_STATUS_PATH = "/api/media/ingest-cards/status"
+#: Seconds between snapshot pushes while any card is tracked.
+CARD_STATUS_INTERVAL = 2.0
 #: Event key counting failed hand-off attempts (see ``_schedule_handoff_retry``).
 _HANDOFF_ATTEMPTS_KEY = "_handoff_attempts"
 
@@ -430,6 +434,78 @@ def s3_notify_uploader(
         return key
 
     return _upload
+
+
+async def publish_card_status(
+    registry: Any,
+    skydiveos_url: str,
+    *,
+    path: str = CARD_STATUS_PATH,
+    interval: float = CARD_STATUS_INTERVAL,
+    timeout: float = 5.0,
+) -> None:
+    """PUSH the card-ingest snapshot to SkydiveOS while any card is tracked.
+
+    **Why a push.** The registry is in-memory and per-process, so ``GET /ingest/cards``
+    only answers on the machine running discovery — the dropzone box with the card
+    reader. Production deliberately splits the pipeline: that box has the reader, the
+    cloud instance does the rendering with ``ENABLE_AUTO_DISCOVERY=0``, and SkydiveOS has
+    a single auto-edit base URL pointing at the cloud. So a *pull* from SkydiveOS reaches
+    the box that can never have a registry and reads an empty list forever, while the
+    dropzone box sits behind NAT and cannot be dialled in to. Every other thing this box
+    originates — the raw-upload notify, the hand-off — is outbound for the same reason;
+    this is that pattern applied to the status snapshot.
+
+    Runs as a task for the life of the API. Three rules it must not break:
+
+    * **It never raises into anything.** Discovery and the pull are the product; a status
+      banner is cosmetic (the same rule the registry's own hooks and the jump archive
+      follow). Cancellation is the one exception that propagates, so shutdown is clean.
+    * **It goes quiet when idle, but pushes ONE final empty snapshot on the way there.**
+      Without that the consumer's cache holds the last non-empty snapshot until its TTL
+      expires and a removed card's row lingers on screen — reading "safe to remove" for a
+      card that is already out, or worse, still reading "copying".
+    * **A failing push is logged on the transition, not every tick.** At this cadence a
+      per-attempt warning buries the log it is supposed to help read.
+
+    The consumer is expected to hold the snapshot behind a short TTL and degrade to empty
+    when it goes stale: if this box dies mid-pull, a TTL-less cache would freeze
+    "DO NOT REMOVE THE CARD" on the operator's screen indefinitely.
+    """
+    import httpx  # noqa: PLC0415 - lazy, like the uploader's
+
+    from api.auth import service_auth_headers  # noqa: PLC0415 - keeps /ingest light
+
+    url = f"{skydiveos_url.rstrip('/')}{path}"
+    logger.info("publishing card-ingest status to %s every %gs", url, interval)
+    failing = False
+    published_nonempty = False
+    while True:
+        try:
+            cards = registry.snapshot()
+            # An empty registry is the resting state (no card in the reader, which is
+            # most of the day). Push nothing — except the single transition to empty,
+            # so removal reaches the screen at once instead of waiting out a TTL.
+            if cards or published_nonempty:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(
+                        url, json={"cards": cards}, headers=service_auth_headers()
+                    )
+                    resp.raise_for_status()
+                published_nonempty = bool(cards)
+                if failing:
+                    logger.info("card-ingest status push recovered")
+                    failing = False
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - a status banner must not cost a pull
+            if not failing:
+                logger.warning(
+                    "card-ingest status push to %s failing (%r); will keep trying "
+                    "quietly — the pull itself is unaffected", url, e,
+                )
+                failing = True
+        await asyncio.sleep(interval)
 
 
 class _QueueEventEmitter(EventEmitter):

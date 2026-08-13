@@ -37,12 +37,13 @@ Run locally with ``uvicorn api.app:app --reload`` (and a Celery worker — see
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from html import escape as html_escape
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
@@ -710,6 +711,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             from ingest.discovery import (
                 CameraDiscoveryService,
                 matcher_role_resolver,
+                publish_card_status,
                 s3_notify_uploader,
             )
             from ingest.qr import qr_identity_resolver
@@ -794,6 +796,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await service.start()
             app.state.discovery = service
             app.state.footage_matcher = matcher
+            if card_status is not None:
+                # The registry is in-memory and per-process, so `GET /ingest/cards`
+                # answers only HERE — the box with the reader. Production runs the
+                # renderer on another host with discovery off, and SkydiveOS has one
+                # auto-edit base URL pointing there, so a pull would read an empty list
+                # forever while this box sits behind dropzone NAT. Push it out instead,
+                # the same direction as every other hand-off this box originates.
+                app.state.card_status_publisher = asyncio.create_task(
+                    publish_card_status(card_status, settings.skydiveos_api_base)
+                )
         except Exception:
             # A discovery misconfig must not take the whole API down — log and serve.
             logger.exception("camera auto-discovery failed to start; API running without it")
@@ -809,6 +821,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        publisher = getattr(app.state, "card_status_publisher", None)
+        if publisher is not None:
+            publisher.cancel()
+            with suppress(asyncio.CancelledError):
+                await publisher
         if service is not None:
             await service.stop()
         matcher = getattr(app.state, "footage_matcher", None)

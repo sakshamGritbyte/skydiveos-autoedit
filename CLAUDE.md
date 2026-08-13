@@ -613,6 +613,31 @@ Two runtime media roots, with different audiences:
   (same never-fail rule as archiving), nothing in the pipeline reads the registry,
   and the SkydiveOS front end polls it via its backend proxy (the service token
   stays server-side). Empty list when sdcard ingest is off.
+  **The registry is per-process, so production reaches it by PUSH, not pull**
+  (`ingest.discovery.publish_card_status`, wired as a lifespan task beside the registry).
+  Production splits the pipeline on purpose: the dropzone box has the reader, the cloud
+  instance renders with `ENABLE_AUTO_DISCOVERY=0`, and SkydiveOS holds ONE auto-edit base
+  URL pointing at the cloud — so a pull from SkydiveOS reaches the box that can never have
+  a registry and reads `[]` forever, while the dropzone box sits behind NAT and cannot be
+  dialled in to. So the snapshot is POSTed to `{SKYDIVEOS_API_BASE}/api/media/ingest-cards/status`
+  every 2 s **while any card is tracked**, outbound like every other hand-off that box
+  originates. Three rules: it **never raises** (the pull is the product, the banner is
+  cosmetic); it pushes **one final empty snapshot** on the transition to idle, or the
+  consumer's cache keeps a removed card's row on screen until its TTL expires, still
+  reading "copying"; and a failing push **warns on the transition, not every tick**. The
+  consumer must hold it behind a short TTL and degrade to empty when stale — a TTL-less
+  cache would freeze "DO NOT REMOVE THE CARD" on the operator's screen if the ingest box
+  died mid-pull. The push carries the service token, and that is load-bearing rather than
+  hygienic: a spoofed `safe_to_remove` during a retention sweep (the one moment the card is
+  being *written* to) invites a yank that corrupts it.
+- `python scripts/watch_cards.py [--api http://host:8000] [--once]` — the operator display
+  for the person standing at the card reader: polls that box's own `GET /ingest/cards` and
+  goes loud (bell + banner) on `safe_to_remove`, with a progress bar while copying. Needs
+  no SkydiveOS at all — it reads the registry's own host, which is the only place the
+  answer has ever existed, so it works before the push publisher is deployed on both sides
+  and keeps working if the SkydiveOS banner is down. `--once` prints one snapshot and exits
+  non-zero only when the endpoint is unreachable (an empty list is the resting state, not
+  an error), so it doubles as a health check
 - `python scripts/check_camera.py --usb` / `--wifi --camera <id>` — hardware smoke test: open a real GoPro and list its media (read-only), using the same Camera classes the pull uses. Verifies the SDK + connectivity before enabling discovery.
 - **The service-token gate is what makes this API safe to expose** (`api.auth`
   `service_token_allows`, enforced as a middleware in `create_app`). Every route

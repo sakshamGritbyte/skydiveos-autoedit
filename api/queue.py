@@ -26,12 +26,30 @@ class JobQueue(Protocol):
         """Queue the multi-clip selfie-package scene pipeline for a job."""
         ...
 
+    def enqueue_media_ref_processing(self, job_id: str, role: str) -> None:
+        """Queue ONE media product's render on a mixed job, from ONE camera's footage.
+
+        A jumper holding two products (a paid handcam edit plus a speculative
+        camera-flyer one) renders each independently onto the same job, so the paid edit
+        ships without waiting on the spec card.
+        """
+        ...
+
     def enqueue_rerender(self, job_id: str) -> None:
         """Queue a re-render of an already-tweaked job's persisted EDL."""
         ...
 
     def enqueue_delivery(self, job_id: str) -> None:
         """Queue delivery of an approved job to the customer."""
+        ...
+
+    def enqueue_load_fan_out(self, job_id: str) -> None:
+        """Queue the fan-out of an approved load master to its load's customers.
+
+        The load-master counterpart of :meth:`enqueue_delivery`: a spec flight has no
+        customer of its own, so what an approval releases is one gallery offer per jumper
+        on the manifest.
+        """
         ...
 
     def enqueue_pull(self, job_id: str, camera_id: str) -> None:
@@ -62,6 +80,11 @@ class CeleryJobQueue:
 
         process_selfie_package.delay(job_id)
 
+    def enqueue_media_ref_processing(self, job_id: str, role: str) -> None:
+        from .tasks import process_media_ref_job
+
+        process_media_ref_job.delay(job_id, role)
+
     def enqueue_rerender(self, job_id: str) -> None:
         from .tasks import rerender_job
 
@@ -71,6 +94,11 @@ class CeleryJobQueue:
         from .tasks import deliver_job
 
         deliver_job.delay(job_id)
+
+    def enqueue_load_fan_out(self, job_id: str) -> None:
+        from .tasks import fan_out_load_job
+
+        fan_out_load_job.delay(job_id)
 
     def enqueue_pull(self, job_id: str, camera_id: str) -> None:
         from .tasks import pull_camera_job

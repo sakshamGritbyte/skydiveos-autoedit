@@ -142,7 +142,15 @@ async def _sweep_card(
     a reason to abandon footage that is sitting on it right now.
     """
     by_name = {m.filename: m for m in videos}
-    candidates = deletable(camera_dir(root, camera_id), by_name, min_age_s=min_age_s, now=now())
+    # Sizes, not just names: a ledger record only authorises deleting the *physical file*
+    # it confirmed, so a reused GoPro filename (formatted/replaced card) keeps its footage
+    # instead of being deleted on a stale record's word (ingest.retention).
+    candidates = deletable(
+        camera_dir(root, camera_id),
+        {name: m.size for name, m in by_name.items()},
+        min_age_s=min_age_s,
+        now=now(),
+    )
     if not candidates:
         return []
     deleted: list[str] = []

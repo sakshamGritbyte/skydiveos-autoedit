@@ -27,7 +27,10 @@ The loop, end to end:
    layer, and discovery never creates a job itself. In SD-card mode an
    ``identity_resolver`` (:func:`ingest.qr.qr_identity_resolver`) supplies
    ``staff_id`` from the filmed QR session marker; the marker clip itself is uploaded
-   under ``markers/`` (retention bookkeeping only) and never notified.
+   under ``markers/`` (retention bookkeeping only) and never notified. Because the
+   marker may be filmed at the *end* of a session (attribution is card-level, see
+   :mod:`ingest.qr`), a pull with an identity resolver **holds its events until the
+   whole card is staged** — hand-offs run per clip only in the marker-less modes.
 
 Nothing in :func:`ingest.pull.pull_camera` is modified; the service only triggers
 it and consumes its events. Start/stop are async (use it from a FastAPI lifespan);
@@ -40,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import signal
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -202,6 +206,133 @@ def _to_true_utc(raw: str, clock_tz: str | None) -> str:
         return raw
 
 
+#: Matches the ``YYYY-MM-DD`` staging day directory a pull writes into
+#: (``raw-storage/_camera-staging/<camera_id>/<date>/CLIP.MP4``).
+_STAGING_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _capture_day(mp4_path: str | Path) -> str:
+    """The clip's capture day (``YYYY-MM-DD``) for scoping its S3 key.
+
+    Taken from the staging directory the pull already chose from the clip's
+    ``created_epoch`` (``ingest.storage.jump_dir``) — no second ffprobe, and consistent
+    with where the file lives on disk. Falls back to the file's mtime, then to
+    ``unknown-date``, because a key must always be constructible: an unscoped key is the
+    collision this function exists to prevent.
+    """
+    path = Path(mp4_path)
+    if _STAGING_DAY_RE.match(path.parent.name):
+        return path.parent.name
+    try:
+        from datetime import datetime
+
+        return datetime.fromtimestamp(path.stat().st_mtime).date().isoformat()
+    except OSError:
+        return "unknown-date"
+
+
+def _file_fingerprint(mp4_path: str | Path, *, chunk: int = 1 << 20) -> str:
+    """A short, deterministic content fingerprint: size + sha256 of the first ``chunk``.
+
+    Deterministic so a re-upload of the SAME file lands on the SAME key (idempotency is
+    what makes a retried hand-off safe), while a *different* file that happens to share a
+    filename gets a different one. Only the head is hashed — a 4 GB master must not be
+    read twice per pull, and the first megabyte of an MP4 carries the moov/mdat header
+    that differs between recordings.
+    """
+    import hashlib
+
+    path = Path(mp4_path)
+    digest = hashlib.sha256()
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            digest.update(fh.read(chunk))
+    except OSError as e:  # pragma: no cover - unreadable file fails at upload anyway
+        logger.warning("could not fingerprint %s (%r); using the name only", path, e)
+        return "nofp"
+    digest.update(str(size).encode())
+    return digest.hexdigest()[:12]
+
+
+def _file_size(path: str | Path) -> int | None:
+    """Size of a staged file, or ``None`` if it can't be read (never raises)."""
+    try:
+        return Path(path).stat().st_size
+    except OSError as e:  # pragma: no cover - the upload itself would have failed first
+        logger.warning("could not size %s: %r", path, e)
+        return None
+
+
+def _object_size(client: Any, bucket: str, key: str) -> int | None:
+    """Size of an existing S3 object, or ``None`` when it isn't there / can't be read."""
+    try:
+        return int(client.head_object(Bucket=bucket, Key=key)["ContentLength"])
+    except Exception as e:  # noqa: BLE001 - any "not there / no permission" is the same answer
+        logger.debug("head_object %s: %r", key, e)
+        return None
+
+
+def raw_object_key(
+    mp4_path: str | Path,
+    camera_id: str,
+    *,
+    key_prefix: str = S3_KEY_PREFIX,
+    marker: bool = False,
+    exists: Callable[[str], int | None] | None = None,
+) -> str:
+    """The S3 key for one pulled clip — scoped so two clips can never collide.
+
+    The old layout was ``raw/{camera_id}/{FILENAME}``, and GoPro filenames are **not
+    unique**: a formatted or replaced card restarts at ``GX010001.MP4``, and two unlabeled
+    cards both identify as ``sd-NO-NAME``. One clip therefore overwrote another customer's
+    master, and the notify consumer — which dedupes on the key — then dropped the new clip
+    as a duplicate, losing it silently (``AUDIT_MEDIA_MATCH_ISOLATION.md`` §3-F).
+
+    So the key carries the clip's **capture day**::
+
+        raw/{camera_id}/{YYYY-MM-DD}/{FILENAME}
+        raw/{camera_id}/{YYYY-MM-DD}/markers/{FILENAME}     (a QR session marker)
+
+    and, when ``exists`` reports an object already at that key with a **different size**,
+    a deterministic content fingerprint is inserted to keep both::
+
+        raw/{camera_id}/{YYYY-MM-DD}/{fingerprint}/{FILENAME}
+
+    Two deliberate properties:
+
+    * **The basename stays the GoPro filename.** Every consumer treats the key as opaque
+      but derives the local staging name from ``Path(key).name`` (``api.tasks.
+      ingest_s3_job``, the bridge's temp download, ``Job.raw_s3_keys``), and the archive
+      shows those names to humans. Scoping goes in the *path*, never the filename.
+    * **Same file → same key.** A re-upload after a failed notify overwrites itself
+      instead of piling up copies, which is what keeps the hand-off retry safe.
+    """
+    name = Path(mp4_path).name
+    day = _capture_day(mp4_path)
+    base = f"{key_prefix}/{camera_id}/{day}"
+    if marker:
+        base = f"{base}/markers"
+    key = f"{base}/{name}"
+    if exists is None:
+        return key
+    existing = exists(key)
+    if existing is None:
+        return key
+    try:
+        if existing == Path(mp4_path).stat().st_size:
+            return key  # same clip, re-uploaded (a retried hand-off) — idempotent
+    except OSError:
+        return key
+    scoped = f"{base}/{_file_fingerprint(mp4_path)}/{name}"
+    logger.warning(
+        "S3 key %s already holds a DIFFERENT %d-byte object; storing this clip at %s "
+        "instead of overwriting it (reused GoPro filename — a formatted/replaced card)",
+        key, existing, scoped,
+    )
+    return scoped
+
+
 def s3_notify_uploader(
     skydiveos_url: str,
     *,
@@ -253,14 +384,20 @@ def s3_notify_uploader(
             # A QR session marker is never a job: PUT it under markers/ purely so the
             # retention rule ("deletable only once S3 confirmed it") stays literally
             # true and the sweep can clear it off the card — but never notify.
-            key = f"{key_prefix}/{camera_id}/markers/{Path(mp4_path).name}"
+            key = raw_object_key(
+                mp4_path, camera_id, key_prefix=key_prefix, marker=True,
+                exists=lambda k: _object_size(_client(), bucket, k),
+            )
             _client().upload_file(mp4_path, bucket, key)
             return key
 
-        key = f"{key_prefix}/{camera_id}/{Path(mp4_path).name}"
+        key = raw_object_key(
+            mp4_path, camera_id, key_prefix=key_prefix,
+            exists=lambda k: _object_size(_client(), bucket, k),
+        )
         _client().upload_file(mp4_path, bucket, key)
 
-        payload: dict[str, str] = {"s3_key": key, "camera_id": camera_id}
+        payload: dict[str, Any] = {"s3_key": key, "camera_id": camera_id}
         if instructor_id is not None:
             payload["instructor_id"] = instructor_id
         if camera_role is not None:
@@ -313,6 +450,25 @@ class _QueueEventEmitter(EventEmitter):
 
     def emit(self, event: dict[str, Any]) -> None:
         self._loop.call_soon_threadsafe(self._queue.put_nowait, event)
+
+
+class _HoldingEventEmitter(EventEmitter):
+    """Collects one pull's events so they can be released *after* the pull.
+
+    The QR session flow needs the whole card before it can attribute any clip: the
+    session marker may legitimately be the LAST file filmed (``ingest.qr`` — marker
+    position is not a protocol), so a hand-off that ran per clip mid-pull would ask
+    the index about a marker that hasn't been staged yet and fall back to the serial
+    match for footage the instructor did claim. Same thread-safety posture as
+    :class:`_QueueEventEmitter`: ``emit`` only appends; the flush happens on the
+    pull coroutine after the pull returns.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    def emit(self, event: dict[str, Any]) -> None:
+        self.events.append(event)
 
 
 class CameraDiscoveryService:
@@ -442,14 +598,26 @@ class CameraDiscoveryService:
 
     async def _pull_camera(self, camera_id: str) -> None:
         logger.info("Camera %s discovered, pull enqueued", camera_id)
+        # QR attribution is card-level (the marker may be the LAST clip filmed), so
+        # with an identity resolver the pull's events are held and released only once
+        # the whole card is staged — including after a partial-pull failure, where the
+        # staged clips are still real and must still be handed off.
+        held = _HoldingEventEmitter() if self._identity_resolver is not None else None
         try:
             async with self._pull_lock:
                 if self._stopping.is_set():
                     return
-                await self._pull(camera_id, emitter=self._emitter)
+                await self._pull(camera_id, emitter=held or self._emitter)
         except Exception as e:  # noqa: BLE001 - one failed pull must not stop discovery
             logger.exception("pull failed for camera %s: %r", camera_id, e)
         finally:
+            if held is not None and held.events:
+                logger.info(
+                    "camera %s: card staged; releasing %d held hand-off(s)",
+                    camera_id, len(held.events),
+                )
+                for event in held.events:
+                    self._events.put_nowait(event)
             self._inflight.discard(camera_id)
 
     # --- hand pulled files off to SkydiveOS -------------------------------- #
@@ -563,7 +731,12 @@ class CameraDiscoveryService:
                     )
                     marker_key = self._upload(mp4, camera_id, None, None, marker=True)
                     if marker_key:
-                        record_uploaded(Path(event["jump_dir"]).parent, Path(mp4).name, marker_key)
+                        record_uploaded(
+                            Path(event["jump_dir"]).parent,
+                            Path(mp4).name,
+                            marker_key,
+                            size=_file_size(mp4),
+                        )
                     return
                 staff_id = identity.staff_id
                 if identity.role is not None:
@@ -583,8 +756,10 @@ class CameraDiscoveryService:
             "uploading %s to S3 + notifying SkydiveOS (camera %s, instructor %s, role %s) ...",
             mp4, camera_id, instructor_id, camera_role,
         )
-        # Keyword only when set, so uploaders predating the QR flow keep working.
-        extra = {"staff_id": staff_id} if staff_id is not None else {}
+        # Keywords only when set, so uploaders predating the QR flow keep working.
+        extra: dict[str, Any] = {}
+        if staff_id is not None:
+            extra["staff_id"] = staff_id
         s3_key = self._upload(mp4, camera_id, instructor_id, camera_role, **extra)
         logger.info(
             "handed %s off to SkydiveOS (camera %s, instructor %s, role %s)",
@@ -595,8 +770,15 @@ class CameraDiscoveryService:
         # (ingest.retention); until then the file stays on the card.
         if s3_key:
             # jump_dir is <root>/_camera-staging/<camera_id>/<date>; the ledger belongs
-            # one level up, per camera, so it outlives any single day's folder.
-            record_uploaded(Path(event["jump_dir"]).parent, Path(mp4).name, s3_key)
+            # one level up, per camera, so it outlives any single day's folder. The SIZE
+            # is what makes the record an identity: without it a reused GoPro filename
+            # could authorise deleting a different clip off the card (ingest.retention).
+            record_uploaded(
+                Path(event["jump_dir"]).parent,
+                Path(mp4).name,
+                s3_key,
+                size=_file_size(mp4),
+            )
 
     # --- helpers ----------------------------------------------------------- #
 

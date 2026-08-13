@@ -70,6 +70,32 @@ DEFAULT_TILES: tuple[UpsellTile, ...] = (
 )
 
 
+#: Tile key for the spec-flight load video. Must match ``api.app.PURCHASABLE_ADDONS`` and
+#: SkydiveOS's priced item keys, since it is what ``POST /jobs/{id}/unlock`` records.
+LOAD_VIDEO_KEY = "load_video"
+
+
+def load_video_tile(load_label: str | None, price: str) -> UpsellTile:
+    """The "your load's aerial video" tile, for a media buyer on a spec-flight load.
+
+    A customer who already bought media gets **no second gallery and no second email** —
+    the load video is one more offer in the "Add to your day" row of the page they were
+    already opening. Named after their actual load ("Your Load 14 aerial video") so it
+    reads as a thing that happened on their day, not a generic upsell.
+
+    The blurb is deliberately honest about what a load video is (design doc Stage 7: "your
+    jump day", never "your jump") — the flyer exited with somebody else, so this is the
+    group and the aerials, not their own freefall.
+    """
+    label = load_label or "load"
+    return UpsellTile(
+        key=LOAD_VIDEO_KEY,
+        title=f"Your {label} aerial video",
+        blurb="Filmed from the air on your jump day",
+        price=price,
+    )
+
+
 def parse_tiles(spec: str | None) -> tuple[UpsellTile, ...]:
     """Parse ``$UPSELL_TILES`` into tiles. Never raises — a bad tile is skipped.
 

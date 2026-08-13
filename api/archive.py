@@ -59,7 +59,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .config import Settings, get_settings
-from .jobs import Job, JobStore
+from .jobs import Job, JobKind, JobStore
 from .lifecycle import media_state
 
 logger = logging.getLogger(__name__)
@@ -211,6 +211,21 @@ def archive_root(settings: Settings) -> Path | None:
     from ingest.storage import storage_root
 
     return storage_root()
+
+
+def _archive_root_for(job: Job, settings: Settings) -> Path | None:
+    """The archive root to file ``job`` under, or ``None`` when it must not be filed.
+
+    A ``load_child`` owns no media: every byte its gallery streams belongs to the load
+    master, which is already filed under the flyer's own folder. Filing children too would
+    create an empty jump folder per no-media customer on every spec-flight load, each
+    implying footage that is actually stored elsewhere — and the archive's whole purpose is
+    that a folder answers "what was shot for this jump?" honestly. Their existence is
+    recorded on the master (``Job.load_roster``) and in their own ``job.json``.
+    """
+    if job.job_kind is JobKind.load_child:
+        return None
+    return archive_root(settings)
 
 
 def _link_mode(settings: Settings) -> str:
@@ -580,7 +595,7 @@ def archive_raw_footage(job: Job, store: JobStore, settings: Settings) -> Path |
 
     Returns the archive folder, or ``None`` when archiving is off or failed. Never raises.
     """
-    root = archive_root(settings)
+    root = _archive_root_for(job, settings)
     if root is None:
         return None
     try:
@@ -637,7 +652,7 @@ def archive_deliverables(job: Job, store: JobStore, settings: Settings) -> Path 
 
     Returns the archive folder, or ``None`` when archiving is off or failed. Never raises.
     """
-    root = archive_root(settings)
+    root = _archive_root_for(job, settings)
     if root is None:
         return None
     try:
@@ -718,7 +733,7 @@ def archive_delivery(job: Job, settings: Settings) -> Path | None:
 
     Never raises; returns the archive folder or ``None``.
     """
-    root = archive_root(settings)
+    root = _archive_root_for(job, settings)
     if root is None:
         return None
     try:

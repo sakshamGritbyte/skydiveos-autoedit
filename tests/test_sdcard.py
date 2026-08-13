@@ -207,8 +207,14 @@ def test_sweep_clears_confirmed_files_off_card(tmp_path: Path) -> None:
     root = tmp_path / "raw"
     asyncio.run(pull_camera("4313", camera=SdCardCamera(mount), root=root, emit=False))
 
-    # S3 confirmed only the first clip.
-    record_uploaded(camera_dir(root, "4313"), "GX010001.MP4", "raw/4313/GX010001.MP4")
+    # S3 confirmed only the first clip. The SIZE is part of the record: a ledger entry
+    # authorises deleting the exact file it confirmed, never just a name (ingest.retention
+    # — a reused GX010001.MP4 on a formatted card must survive).
+    clip = mount / "DCIM" / "100GOPRO" / "GX010001.MP4"
+    record_uploaded(
+        camera_dir(root, "4313"), "GX010001.MP4", "raw/4313/2023-11-14/GX010001.MP4",
+        size=clip.stat().st_size,
+    )
 
     asyncio.run(
         pull_camera(

@@ -10,11 +10,23 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from edl.schema import EditDecisionList
 
-from .jobs import Entitlement, Job, JobStatus, Package
+from .jobs import (
+    Entitlement,
+    Job,
+    JobKind,
+    JobStatus,
+    LoadEvidence,
+    LoadRosterEntry,
+    MediaRef,
+    Package,
+    deliverable_names,
+    entitlement_for,
+    primary_ref_of,
+)
 from .lifecycle import MediaState, media_state
 
 
@@ -44,6 +56,37 @@ class CreateJobRequest(BaseModel):
     #: ``preview_only`` for a speculative capture (watermarked preview + paywall).
     #: Omitted → the :class:`Job` default (``edited_download``).
     entitlement: Entitlement | None = Field(default=None, examples=["preview_only"])
+    #: The media products on this jump, one per camera role — send this ONLY for a jumper
+    #: carrying more than one (the mixed case: a paid handcam edit plus a speculative
+    #: camera-flyer one). Omitted, or a single entry, is the ordinary job and behaves
+    #: exactly as before.
+    #:
+    #: Rules, all enforced here so a bad set is a 422 before any footage is staged:
+    #: at most one ref per role; the **primary** ref (the paid one if any, else the
+    #: instructor's) must agree with the top-level ``package``/``entitlement``, because
+    #: those two fields stay the job's own and something must be authoritative.
+    media_refs: list[MediaRef] | None = Field(default=None)
+
+    # -- spec-flight load master / child gallery (see api.jobs.JobKind) -------- #
+    #: ``jump`` (default), ``load_master`` (a spec flyer's card, owns the files) or
+    #: ``load_child`` (a no-media customer's gallery pointing at a master).
+    job_kind: JobKind | None = Field(default=None, examples=["load_master"])
+    #: SkydiveOS ``loads._id`` this job belongs to.
+    load_id: str | None = Field(default=None, examples=["66f1c0de0000000000000014"])
+    #: Human load name, used for the master's archive folder and the child hero line.
+    load_label: str | None = Field(default=None, examples=["Load 14"])
+    #: Index into the load's ``jumpers`` array (the fan-out's dedupe identity).
+    jumper_index: int | None = Field(default=None, ge=0, examples=[2])
+    #: The load master supplying this job's load video. **Required** for a
+    #: ``load_child`` (it owns no footage of its own) and refused if it names an
+    #: unknown job.
+    source_job_id: str | None = Field(default=None, examples=["9f21c7..."])
+    #: The manifest roster a load master fans out to. Ignored for other kinds.
+    load_roster: list[LoadRosterEntry] | None = Field(default=None)
+    #: How a load master's load was resolved: ``flight_window`` (spec flight —
+    #: timestamp evidence only, the fan-out keeps its freefall guard).
+    #: Ignored for other kinds; omitted → treated as ``flight_window``.
+    load_evidence: LoadEvidence | None = Field(default=None, examples=["flight_window"])
 
     @field_validator("entitlement", mode="before")
     @classmethod
@@ -55,6 +98,47 @@ class CreateJobRequest(BaseModel):
         silently default to ``edited_download`` and give the edit away.
         """
         return v.strip().lower() if isinstance(v, str) else v
+
+    @model_validator(mode="after")
+    def _coherent_media_refs(self) -> CreateJobRequest:
+        """Refuse an incoherent ref set — at creation, before any footage is staged.
+
+        Three ways a caller can hand us something unservable, each rejected rather than
+        resolved by guesswork, because every one of them decides where a camera's footage
+        goes and whether the result is watermarked:
+
+        * **Two refs on one role** — one camera cannot feed two products, and the second
+          would silently overwrite the first's dispatch and deliverable names.
+        * **A primary ref that disagrees with the top-level fields** — ``package`` and
+          ``entitlement`` remain the job's own (the whole system reads them), so a
+          mismatch means two different answers to "what did the customer buy?".
+        * **Every ref speculative on a paid job, or vice versa** — caught by the same
+          check, since the primary ref is chosen as the paid one when any ref is paid.
+        """
+        refs = self.media_refs
+        if not refs:
+            return self
+        roles = [r.role for r in refs]
+        if len(set(roles)) != len(roles):
+            raise ValueError(
+                f"media_refs must carry at most one ref per camera role (got {roles}); "
+                "one camera cannot feed two products"
+            )
+        primary = primary_ref_of(refs)
+        assert primary is not None  # refs is non-empty here
+        if self.package is not None and primary.package is not self.package:
+            raise ValueError(
+                f"media_refs' primary ref is {primary.package.value!r} but package is "
+                f"{self.package.value!r} — the top-level package must mirror the primary "
+                "ref (the paid one, else the instructor's)"
+            )
+        if self.entitlement is not None and primary.entitlement is not self.entitlement:
+            raise ValueError(
+                f"media_refs' primary ref is {primary.entitlement.value!r} but "
+                f"entitlement is {self.entitlement.value!r} — the top-level entitlement "
+                "must mirror the primary ref"
+            )
+        return self
 
 
 class JobResponse(BaseModel):
@@ -80,6 +164,22 @@ class JobResponse(BaseModel):
     instructor_id: str | None
     #: The instructor's display name (names their folder in the jump archive).
     instructor_name: str | None
+    #: Ordinary jump, spec-flight load master, or a child gallery on one.
+    job_kind: JobKind
+    #: The load this job belongs to, and its human name (``None`` outside the fan-out).
+    load_id: str | None
+    load_label: str | None
+    #: Index into the load's ``jumpers`` array.
+    jumper_index: int | None
+    #: The load master supplying this job's load video (files only — the lock state is
+    #: always this job's own ``entitlement``). ``load_roster`` is deliberately NOT
+    #: projected here: it carries other customers' names and emails.
+    source_job_id: str | None
+    #: How a load master's load was resolved (``None`` on every other kind).
+    load_evidence: LoadEvidence | None
+    #: Set on a retired ``load_child`` whose gallery token was adopted by the
+    #: customer's own jump job (the gallery-race fix) — this child serves nothing.
+    superseded_by: str | None
     #: Path A vs Path B lock state (``gallery_token`` itself is deliberately NOT
     #: exposed here — the secret travels only via the status callback / delivery link).
     entitlement: Entitlement
@@ -88,6 +188,16 @@ class JobResponse(BaseModel):
     #: Purchased gallery add-ons: item key → captured payment reference. SkydiveOS
     #: reads this to reconcile add-on sales; fulfilment is the gallery's own.
     addons: dict[str, str]
+    #: The media products this job carries, one per camera role — empty for every
+    #: single-product job. Echoed back so SkydiveOS can reconcile the products it
+    #: manifested against the products we actually recorded.
+    media_refs: list[MediaRef]
+    #: **Resolved** lock state per video deliverable, and the ONLY correct answer for a
+    #: mixed job: ``entitlement`` above is the job's default (``edited_download`` when the
+    #: customer bought the handcam edit) and cannot say that the camera-flyer edit beside
+    #: it is still behind the paywall. Empty until the job has rendered; sent fully
+    #: resolved so no consumer reimplements the inherit-from-job rule.
+    deliverable_entitlements: dict[str, Entitlement]
     reject_reason: str | None
     error: str | None
     #: Rendered deliverables, present (non-null) only once status == ready.
@@ -114,9 +224,22 @@ class JobResponse(BaseModel):
             booking_id=job.booking_id,
             instructor_id=job.instructor_id,
             instructor_name=job.instructor_name,
+            job_kind=job.job_kind,
+            load_id=job.load_id,
+            load_label=job.load_label,
+            jumper_index=job.jumper_index,
+            source_job_id=job.source_job_id,
+            load_evidence=job.load_evidence,
+            superseded_by=job.superseded_by,
             entitlement=job.entitlement,
             paid_at=job.paid_at,
             addons=job.addons,
+            media_refs=job.media_refs,
+            deliverable_entitlements=(
+                {n: entitlement_for(job, n) for n in deliverable_names(job)}
+                if job.deliverable_access
+                else {}
+            ),
             reject_reason=job.reject_reason,
             error=job.error,
             outputs=job.outputs,
@@ -266,6 +389,30 @@ class CamerasResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     cameras: list[CameraInfo]
+
+
+class CardIngestStatus(BaseModel):
+    """One SD card's ingest progress (``GET /ingest/cards``).
+
+    ``safe_to_remove`` means the pull finished and the card is idle — the S3
+    upload runs from the staged copy and no longer needs the card. Progress is
+    approximate (already-staged clips are skipped without re-copying), so the
+    terminal ``state`` is the signal, not the percentage.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    camera_id: str = Field(examples=["1234"])
+    state: Literal["detected", "sweeping", "pulling", "safe_to_remove", "error"]
+    files_done: int = 0
+    files_total: int = 0
+    bytes_done: int = 0
+    bytes_total: int = 0
+    #: Master currently copying off the card (``pulling`` only).
+    current_file: str | None = Field(default=None, examples=["GX010042.MP4"])
+    error: str | None = None
+    #: Epoch seconds of the last transition (repo convention: seconds, floats).
+    updated_at: float
 
 
 class AssignCameraRequest(BaseModel):

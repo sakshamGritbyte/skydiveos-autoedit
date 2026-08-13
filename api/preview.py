@@ -24,7 +24,7 @@ from pathlib import Path
 from render.watermark import render_watermark
 
 from .config import Settings
-from .jobs import Entitlement, Job, JobStore
+from .jobs import FINAL_DELIVERABLE, Job, JobStore, locked_deliverables
 
 logger = logging.getLogger(__name__)
 
@@ -93,34 +93,45 @@ def render_preview(
 def render_job_previews(
     job: Job, store: JobStore, settings: Settings, *, runner: Runner | None = None
 ) -> dict[str, str]:
-    """Render every video deliverable's watermarked preview for a Path-B job.
+    """Render a watermarked preview for every LOCKED video deliverable of this job.
 
-    No-op (``{}``) unless ``job.entitlement`` is ``preview_only`` — Path-A jobs gain
-    no new failure mode. For Path B this is load-bearing (a locked gallery with
-    nothing watchable breaks the product), so failures raise: the caller's existing
-    except-branch marks the job ``failed`` and it can be re-queued.
+    Which deliverables are locked is asked **per name** (:func:`api.jobs.entitlement_for`),
+    not per job. For the ordinary single-media-ref job that is the same question as
+    before — a wholly ``preview_only`` job previews everything, an ``edited_download``
+    job previews nothing and gains no new failure mode. For a **mixed** job (a paid
+    handcam edit plus a spec external one) it is the only correct question: the job's
+    own ``entitlement`` is ``edited_download`` because the customer bought the handcam,
+    yet the external deliverables still need watermarked bytes to serve.
 
-    Sources are ``job.outputs``'s videos (the scene-pipeline packages), else the
-    classic pipeline's ``final.mp4``. Returns ``{name: preview path}`` — informational
-    only; previews are found again by filename convention, never via ``Job.outputs``.
+    Where any deliverable IS locked this is load-bearing (a locked card with nothing
+    watchable breaks the product), so failures raise: the caller's existing except-branch
+    marks the job ``failed`` and it can be re-queued.
+
+    Sources are ``job.outputs``'s videos (the scene-pipeline packages), else the classic
+    pipeline's ``final.mp4``. Returns ``{name: preview path}`` — informational only;
+    previews are found again by filename convention, never via ``Job.outputs``.
     """
-    if job.entitlement is not Entitlement.preview_only:
+    locked = locked_deliverables(job)
+    if not locked:
         return {}
 
     job_dir = store.dir(job.job_id)
     sources: dict[str, Path] = {}
     for name, path in (job.outputs or {}).items():
-        if name == "photos":
-            continue  # a directory of stills, not a video
+        if name == "photos" or name not in locked:
+            continue  # a directory of stills, or a deliverable the customer owns
         p = Path(path)
         if p.is_file():
             sources[name] = p
-    if not sources:
+    if not sources and FINAL_DELIVERABLE in locked:
         final = store.final_path(job.job_id)
         if final.is_file():
-            sources["final"] = final
+            sources[FINAL_DELIVERABLE] = final
     if not sources:
-        raise PreviewError(f"job {job.job_id} has no rendered video to preview")
+        raise PreviewError(
+            f"job {job.job_id} has no rendered video to preview for its locked "
+            f"deliverable(s): {', '.join(sorted(locked))}"
+        )
 
     # The dropzone logo makes the mark unmistakably branded; a missing asset just
     # means a text-only watermark, never a failed preview.

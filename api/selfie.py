@@ -1546,6 +1546,7 @@ def compose_edls(
     client: Any | None = None,
     target_duration: float = 90.0,
     use_ai: bool = True,
+    prefix: str = "",
 ) -> EDLResponse:
     """Produce the three EDLs (Claude when available, else an offline house cut).
 
@@ -1596,8 +1597,8 @@ def compose_edls(
         fixed[field] = clips
         repairs[deliverable] = log
     edls = edls.model_copy(update=fixed)
-    _persist_edls(edls, job_id, jobs_root)
-    _write_validation_report(job_dir(job_id, jobs_root), repairs)
+    _persist_edls(edls, job_id, jobs_root, prefix=prefix)
+    _write_validation_report(job_dir(job_id, jobs_root), repairs, prefix=prefix)
     return edls
 
 
@@ -1625,16 +1626,33 @@ def _validated(
     return [Clip.model_validate(c) for c in repaired], log
 
 
-def _write_validation_report(jd: Path, repairs: dict[str, list[str]]) -> None:
-    """Persist the per-deliverable repair log beside the EDLs (a job artifact)."""
+def _write_validation_report(
+    jd: Path, repairs: dict[str, list[str]], *, prefix: str = ""
+) -> None:
+    """Persist the per-deliverable repair log beside the EDLs (a job artifact).
+
+    ``prefix`` keeps a second media ref's report from overwriting the first's — both
+    renders live in one job dir, and the report is the record of what the validator had
+    to fix, so losing one hides real repairs.
+    """
     jd.mkdir(parents=True, exist_ok=True)
-    (jd / "validation_report.json").write_text(
+    (jd / f"{prefix}validation_report.json").write_text(
         json.dumps({"repairs": repairs}, indent=2) + "\n"
     )
 
 
-def _persist_edls(edls: EDLResponse, job_id: str, jobs_root: str | Path | None) -> None:
-    """Write the three EDLs next to the job's other artifacts."""
+def _persist_edls(
+    edls: EDLResponse,
+    job_id: str,
+    jobs_root: str | Path | None,
+    *,
+    prefix: str = "",
+) -> None:
+    """Write the three EDLs next to the job's other artifacts.
+
+    ``prefix`` namespaces them for a second media ref, so ``replay_*`` can re-render
+    either product from the EDL that actually produced it.
+    """
     jd = job_dir(job_id, jobs_root)
     jd.mkdir(parents=True, exist_ok=True)
     for name, clips in (
@@ -1642,7 +1660,7 @@ def _persist_edls(edls: EDLResponse, job_id: str, jobs_root: str | Path | None) 
         ("edl_highlights.json", edls.highlights),
         ("edl_freefall.json", edls.freefall),
     ):
-        (jd / name).write_text(
+        (jd / f"{prefix}{name}").write_text(
             json.dumps([c.model_dump() for c in clips], indent=2) + "\n"
         )
 
@@ -2424,6 +2442,7 @@ def render_outputs(
     jobs_root: str | Path | None = None,
     *,
     music_paths: dict[str, str | None] | None = None,
+    prefix: str = "",
 ) -> dict[str, str]:
     """Render full_video, highlights, and freefall to MP4 (each: footage + logo outro).
 
@@ -2431,6 +2450,11 @@ def render_outputs(
     may give a different track per deliverable (the three need not share music). The
     encodes run **sequentially** so each gets the whole CPU — three concurrent 1080p
     x264 passes just oversubscribe the cores and make the long ``full_video`` crawl.
+
+    ``prefix`` namespaces the output names and filenames (``external_full_video.mp4``),
+    so a second media ref's render can live in the same job dir and the same ``outputs``
+    map as the first — see :func:`api.jobs.deliverable_name`. Empty (the default) is the
+    single-product job and is byte-identical to before.
     """
     music_paths = music_paths or {}
     jd = job_dir(job_id, jobs_root)
@@ -2441,18 +2465,25 @@ def render_outputs(
     # full_video uses the cinematic mix (music → ambient at canopy); the highlights and
     # freefall cuts are music-only.
     targets = {
-        "full_video": (jd / "full_video.mp4", edls.full_video, False),
-        "highlights": (jd / "highlights.mp4", edls.highlights, True),
-        "freefall": (jd / "freefall.mp4", edls.freefall, True),
+        "full_video": (edls.full_video, False),
+        "highlights": (edls.highlights, True),
+        "freefall": (edls.freefall, True),
     }
 
-    for name, (out, clips, music_only) in targets.items():
+    outputs: dict[str, str] = {}
+    for base, (clips, music_only) in targets.items():
+        name = f"{prefix}{base}"
+        out = jd / f"{name}.mp4"
         render_selfie_video(
             out, clips, scene_paths, booking=booking,
-            music_path=music_paths.get(name), music_only=music_only,
+            # Music is chosen per deliverable TYPE, not per camera: the base name is the
+            # key an operator uploaded a track under, and both angles of one event should
+            # share it.
+            music_path=music_paths.get(base), music_only=music_only,
             deploy_offset=deploy_offset,
         )
-    return {name: str(out) for name, (out, *_rest) in targets.items()}
+        outputs[name] = str(out)
+    return outputs
 
 
 # --------------------------------------------------------------------------- #
@@ -2662,7 +2693,7 @@ def run_selfie_pipeline(
     end. Raises on any failure — the caller (the Celery task) flips the job to
     ``failed`` and records the error.
     """
-    from .jobs import JobStatus, Package
+    from .jobs import JobKind, JobStatus, Package
 
     # The two-camera Ultimate product has its own orchestrator (per-camera scene sets,
     # four deliverables); branch before the single-camera scene build below so the
@@ -2693,12 +2724,17 @@ def run_selfie_pipeline(
     # produces the recipes (persisted, so they stay re-editable); any exclude.json
     # time-cuts are applied at render. The external (camera-flyer) package composes
     # deterministically: its distant footage scores too few faces for the AI editor to
-    # sequence reliably, so the house cut's guaranteed complete, in-order edit wins.
+    # sequence reliably, so the house cut's guaranteed complete, in-order edit wins. A
+    # spec-flight load master is the same footage from the same distance (it IS a camera
+    # flyer's card, just with no assigned customer), so it takes the house cut too.
     if package.makes_videos:
         edls = compose_edls(
             scores, manifest, booking, job_id, jobs_root,
             client=client, target_duration=job.target_duration,
-            use_ai=package != Package.external,
+            use_ai=(
+                package != Package.external
+                and job.job_kind is not JobKind.load_master
+            ),
         )
         edls = apply_exclusions(edls, load_exclusions(job_id, jobs_root))
         outputs.update(
@@ -2726,7 +2762,173 @@ def run_selfie_pipeline(
             )
         outputs["photos"] = str(job_dir(job_id, jobs_root) / "photos")
 
-    store.update(job_id, status=JobStatus.ready, outputs=outputs)
+    store.set_pipeline_outputs(job_id, outputs, status=JobStatus.ready)
+    return outputs
+
+
+def _ref_deliverable_names(job: Any, role: str, package: Any) -> set[str]:
+    """Every ``outputs`` key this media ref is responsible for.
+
+    Handed to :meth:`api.jobs.JobStore.set_pipeline_outputs` as ``owns`` so the pass can
+    drop its OWN stale names while never touching the other ref's — the whole reason the
+    merge seam exists.
+    """
+    from .jobs import deliverable_name
+
+    names = set()
+    if package.makes_videos:
+        names |= {
+            deliverable_name(job, role, base)
+            for base in ("full_video", "highlights", "freefall")
+        }
+    if package.makes_photos and _owns_photos(job, role):
+        names.add("photos")
+    return names
+
+
+def _owns_photos(job: Any, role: str) -> bool:
+    """Whether THIS ref produces the job's photo set.
+
+    Only the primary (paid) ref does. ``photos`` is a single ``outputs`` key backed by one
+    directory and one gallery grid, so it carries exactly one lock state — a set built from
+    both a bought and a speculative camera could be neither cleanly served nor cleanly
+    withheld. So the customer's own product supplies the stills, and a spec ref contributes
+    videos only.
+    """
+    primary = job.primary_ref
+    return primary is None or role == primary.role
+
+
+def _seed_deliverable_access(store: Any, job_id: str, names: set[str], ref: Any) -> None:
+    """Record this ref's lock state on each deliverable it produced.
+
+    Written for **every** ref of a multi-ref job, not just the speculative one, so the map
+    is a complete, auditable statement of the job's lock state (and so the status callback
+    can forward it whole).
+
+    **An already-paid deliverable is never re-locked.** A replay or instructor tweak
+    re-runs this seed, and the ref's birth entitlement is still ``preview_only`` — writing
+    it back would take away an edit the customer bought. ``born_locked`` is what identifies
+    the purchasable group, and it is preserved either way.
+    """
+    from .jobs import DeliverableAccess, Entitlement
+
+    existing = store.load(job_id).deliverable_access
+    entries: dict[str, DeliverableAccess] = {}
+    for name in names:
+        prior = existing.get(name)
+        if prior is not None and prior.entitlement is Entitlement.edited_download:
+            entries[name] = prior  # bought already — the seed must not walk it back
+            continue
+        entries[name] = DeliverableAccess(
+            entitlement=ref.entitlement,
+            born_locked=ref.entitlement is Entitlement.preview_only,
+        )
+    if entries:
+        store.set_deliverable_access(job_id, entries)
+
+
+def run_media_ref_pipeline(
+    job_id: str,
+    role: str,
+    *,
+    store: Any,
+    jobs_root: str | Path | None = None,
+    client: Any | None = None,
+) -> dict[str, str]:
+    """Render ONE media ref's deliverables, from ONE camera's footage.
+
+    The mixed job's render unit. A jumper can hold two media products — a paid handcam
+    edit and a speculative camera-flyer one — and they land on a single job so the customer
+    gets a single gallery link. Each product is rendered by its own call to this function,
+    from its own ``raw/<role>/`` folder, with its own entitlement recorded per deliverable.
+
+    Deliberately NOT the Ultimate pipeline: that one *merges* the two cameras into combo
+    cuts, and a merged clip cannot be half-locked. Here the two products stay separate
+    edits that happen to share a page.
+
+    The passes are independent and unordered. The primary (paid) ref keeps the plain
+    deliverable names and normally renders first — the customer should not wait on a
+    speculative extra — but nothing breaks if the cameraman's card lands first, because
+    naming is derived from ``media_refs`` (:func:`api.jobs.deliverable_name`), not from
+    arrival order.
+
+    Returns the ``{name: path}`` this pass produced. Raises on any failure; the calling
+    task marks the job ``failed``.
+    """
+    from .jobs import JobStatus, Package
+
+    _require_ffmpeg()
+    job = store.load(job_id)
+    ref = job.ref_for_role(role)
+    if ref is None:
+        raise RuntimeError(
+            f"job {job_id} has no media product for camera role {role!r} "
+            f"(have {[r.role for r in job.media_refs]})"
+        )
+    raw_dir = store.camera_raw_dir(job_id, role)
+    if not any(raw_dir.glob("*.MP4")) and not any(raw_dir.glob("*.mp4")):
+        raise RuntimeError(f"job {job_id}: no staged footage in {raw_dir} for role {role!r}")
+
+    package = ref.package
+    prefix = "" if _owns_photos(job, role) else f"{role}_"
+    booking = json.loads(store.booking_path(job_id).read_text())
+    booking = _ensure_default_music(booking, job_id, store, jobs_root)
+
+    # One camera's clips → its own scene set (scenes_<role>/) and its own per-second
+    # scores. The same substrate the Ultimate product builds per camera, reused whole.
+    manifest, scores = _build_role_scene_set(job_id, role, raw_dir, jobs_root)
+
+    outputs: dict[str, str] = {}
+    if package.makes_videos:
+        edls = compose_edls(
+            scores, manifest, booking, job_id, jobs_root,
+            client=client, target_duration=job.target_duration,
+            # Distant camera-flyer footage scores too few faces for the AI editor to
+            # sequence reliably — the same reason the standalone external package composes
+            # deterministically. Judged per REF, so the handcam half of a mixed job still
+            # gets the AI edit.
+            use_ai=(package != Package.external),
+            prefix=prefix,
+        )
+        edls = apply_exclusions(edls, load_exclusions(job_id, jobs_root))
+        outputs.update(
+            render_outputs(
+                job_id, edls, manifest, booking, jobs_root,
+                music_paths=_music_paths(booking, job_id, jobs_root),
+                prefix=prefix,
+            )
+        )
+
+    if package.makes_photos and _owns_photos(job, role):
+        # Same two settings the single-product pipeline uses: photo-only asks for a fuller
+        # set from a wider pool, selfie/external aim for ~50 with backfill so distant
+        # footage that scores no faces still fills.
+        if package == Package.photo_only:
+            extract_photos(
+                job_id, scores, manifest, jobs_root,
+                target=PHOTO_ONLY_TARGET, min_gap=_PHOTO_ONLY_MIN_GAP_S, backfill=True,
+            )
+        else:
+            extract_photos(
+                job_id, scores, manifest, jobs_root,
+                target=SELFIE_PHOTO_TARGET, min_gap=_SELFIE_PHOTO_MIN_GAP_S,
+                min_visible=_SELFIE_PHOTO_MIN_VISIBLE, backfill=True,
+            )
+        outputs["photos"] = str(job_dir(job_id, jobs_root) / "photos")
+
+    # Merge, never replace: the other ref's deliverables must survive this pass.
+    store.set_pipeline_outputs(
+        job_id,
+        outputs,
+        status=JobStatus.ready,
+        owns=_ref_deliverable_names(job, role, package),
+    )
+    _seed_deliverable_access(store, job_id, set(outputs), ref)
+    logger.info(
+        "job %s: media ref %s (%s/%s) rendered %s",
+        job_id, role, package.value, ref.entitlement.value, sorted(outputs),
+    )
     return outputs
 
 
@@ -3175,7 +3377,7 @@ def run_ultimum_pipeline(
     )
     outputs["photos"] = str(jd / "photos")
 
-    store.update(job_id, status=JobStatus.ready, outputs=outputs)
+    store.set_pipeline_outputs(job_id, outputs, status=JobStatus.ready)
     return outputs
 
 
@@ -3246,7 +3448,7 @@ def replay_ultimum(
     if photos.exists():
         outputs["photos"] = str(photos)
 
-    store.update(job_id, status=JobStatus.ready, outputs=outputs)
+    store.set_pipeline_outputs(job_id, outputs, status=JobStatus.ready)
     return outputs
 
 
@@ -3448,7 +3650,7 @@ def replay_selfie(
     photos = jd / "photos"
     if photos.exists():
         outputs["photos"] = str(photos)
-    store.update(job_id, status=JobStatus.ready, outputs=outputs)
+    store.set_pipeline_outputs(job_id, outputs, status=JobStatus.ready)
     return outputs
 
 

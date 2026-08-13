@@ -24,9 +24,11 @@ immediately, making the whole camera → customer flow hands-off.
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import time
+import uuid
 from datetime import date
 from pathlib import Path
 
@@ -36,7 +38,18 @@ from render import render_edl
 from . import archive
 from .celery_app import celery_app
 from .config import Settings, get_settings
-from .jobs import Job, JobStatus, JobStore
+from .jobs import (
+    MEDIA_REF_ROLES,
+    Entitlement,
+    Job,
+    JobKind,
+    JobStatus,
+    JobStore,
+    LoadRosterEntry,
+    RoleIngest,
+    deliverable_names,
+    entitlement_for,
+)
 from .lifecycle import media_state
 
 logger = logging.getLogger(__name__)
@@ -98,7 +111,45 @@ def _notify_skydiveos(job: Job) -> None:
         # The design doc's state-machine vocabulary (derived — see api.lifecycle), so
         # SkydiveOS's UI can label the jump without re-deriving it from two fields.
         "media_state": media_state(job).value,
+        # Which KIND of job this is (see api.jobs.JobKind). Always sent, including the
+        # "jump" default, so SkydiveOS can branch without inferring absence: a
+        # `load_child` is a customer-facing gallery it never created and has no booking
+        # for, and it must not be reported as a jump that lost its booking.
+        "job_kind": job.job_kind.value,
     }
+    if job.deliverable_access:
+        # A MIXED job's real lock state, which the single ``entitlement`` above CANNOT
+        # express: it reads `edited_download` because the customer bought the handcam edit,
+        # while the camera-flyer edit beside it is still behind the paywall. Without this
+        # SkydiveOS's offer page falls back to `entitlement`, concludes the spec edit is
+        # already owned, and gives it away for nothing.
+        #
+        # Sent fully RESOLVED (every video deliverable, not just the explicit entries) so
+        # the consumer never has to reimplement the inherit-from-job rule — and sent ONLY
+        # when there is explicit per-deliverable state, so an ordinary job's payload stays
+        # byte-identical to what SkydiveOS receives today.
+        payload["deliverable_entitlements"] = {
+            name: entitlement_for(job, name).value for name in deliverable_names(job)
+        }
+    if job.media_refs:
+        # What this job was opened with, echoed back so SkydiveOS can reconcile the
+        # products it manifested against the products we actually recorded.
+        payload["media_refs"] = [
+            {"role": r.role, "package": r.package.value, "entitlement": r.entitlement.value}
+            for r in job.media_refs
+        ]
+    if job.load_id:
+        # Groups a spec flight's master and all its child galleries under one load, which
+        # is the only handle SkydiveOS has for them — a child has no booking (nothing was
+        # purchased) so `booking_id` below cannot do this job.
+        payload["load_id"] = job.load_id
+    if job.jumper_index is not None:
+        # Which manifest slot, so a per-jumper media chip can be rendered on the load.
+        payload["jumper_index"] = job.jumper_index
+    if job.source_job_id:
+        # The load master this gallery streams — lets SkydiveOS show "Load 17 aerial
+        # video" against the master's render rather than treating the child as orphaned.
+        payload["source_job_id"] = job.source_job_id
     if job.gallery_token and settings.public_base_url:
         # The short, never-expiring customer gallery link — what SkydiveOS should
         # SMS/email on `delivered` (it may append its own ?s= source tag).
@@ -155,19 +206,76 @@ def _render_previews(store: JobStore, job_id: str) -> None:
     render_job_previews(store.load(job_id), store, get_settings())
 
 
+def _auto_deliver_block(store: JobStore, job: Job) -> str | None:
+    """Why this job must NOT be auto-delivered, or ``None`` when it's safe to send.
+
+    The jump-evidence gate for a **customer** job, and the answer to the audit's 🔴-3
+    (``AUDIT_MEDIA_MATCH_ISOLATION.md`` §3-J). A clip set with no jump in it still
+    renders a complete-looking edit: :func:`api.selfie._curated_freefall` deliberately
+    stands in the first scene when there is no ``freefall`` scene "so the EDL is valid",
+    which is right for the renderer and wrong for the customer — an interview-only card
+    (the normal outcome of a split/stale manifest, §3-B) became a delivered "your
+    skydive video is ready".
+
+    So the evidence test that already guards a load master's fan-out
+    (:func:`_flew_a_jump`) is applied to customer jobs too, at the auto-deliver seam:
+
+    * **Hold, don't fail.** The render is kept and the job stays in its reviewable state
+      with :attr:`api.jobs.Job.hold_reason` set. Scene classification is a heuristic; a
+      false negative on a real jump must cost a human glance, not a customer's video. The
+      instructor's ``POST /approve`` still delivers it — that is the deliberate override.
+    * **Only when we actually have evidence to judge.** No scene manifest at all (the
+      single-master :func:`process_job` path, which segments a timeline instead of
+      building scenes) means "unknown", and unknown must not block a legitimate job.
+    * **Never a load master.** :func:`fan_out_load_job` owns that decision.
+    """
+    if job.job_kind is JobKind.load_master:
+        return None
+    if not _scene_manifests(store, job.job_id):
+        return None
+    if _flew_a_jump(store, job.job_id):
+        return None
+    return (
+        "no jump/freefall scene in this job's footage, so the render is not evidence of a "
+        "skydive (an interview-only clip set still produces a valid-looking edit). Held "
+        "back from automatic delivery — review the footage and the scene classification "
+        "(scene_manifest*.json); approving by hand still delivers it."
+    )
+
+
 def _maybe_auto_deliver(store: JobStore, job_id: str) -> None:
     """Skip the review gate when ``AUTO_DELIVER`` is on: approve + enqueue delivery.
 
     Called at every "render finished" site. A no-op unless the setting is enabled
     and the job just landed in a reviewable done-state, so the default flow (wait
     for the instructor's ``POST /approve``) is untouched.
+
+    A **load master** is approved the same way but hands off to :func:`fan_out_load_job`
+    instead of :func:`deliver_job`: it has no customer to deliver to, and what its render
+    unlocks is the *fan-out* — one child gallery per no-media jumper on the load.
+
+    A job with no jump evidence is held for a human instead (:func:`_auto_deliver_block`).
     """
-    if not get_settings().auto_deliver:
-        return
     job = store.load(job_id)
     if job.status not in (JobStatus.ready_for_review, JobStatus.ready):
         return
+    if job.hold_reason:
+        # A fresh render just reached a reviewable state, so any hold from the previous
+        # run is stale: clear it before re-deciding (and unconditionally, since the flag
+        # only ever means "auto-delivery declined to send this render").
+        job = store.update(job_id, hold_reason=None)
+    if not get_settings().auto_deliver:
+        return
+    blocked = _auto_deliver_block(store, job)
+    if blocked is not None:
+        store.update(job_id, hold_reason=blocked)
+        logger.warning("AUTO_DELIVER: job %s HELD for review — %s", job_id, blocked)
+        return
     store.update(job_id, status=JobStatus.approved)
+    if job.job_kind is JobKind.load_master:
+        logger.info("AUTO_DELIVER: load master %s auto-approved, fan-out enqueued", job_id)
+        fan_out_load_job.delay(job_id)
+        return
     logger.info("AUTO_DELIVER: job %s auto-approved, delivery enqueued", job_id)
     deliver_job.delay(job_id)
 
@@ -244,6 +352,37 @@ def process_selfie_package(job_id: str) -> str:
     return job_id
 
 
+@celery_app.task(name="api.process_media_ref_job")
+def process_media_ref_job(job_id: str, role: str) -> str:
+    """Render ONE media product of a mixed job, from ONE camera's footage.
+
+    A jumper can hold two products — a paid handcam edit and a speculative camera-flyer
+    one — on a single job so the customer gets a single gallery link. Each camera's card
+    dispatches its own pass here, independently: the paid edit is delivered as soon as its
+    clips are quiet, and the spec edit joins the SAME gallery whenever its card turns up
+    (the page is a live route, so a deliverable added later simply appears).
+
+    The customer is emailed exactly once no matter how many passes run —
+    :func:`api.delivery.send_gallery_email_once` owns that, keyed on ``email_sent_at``.
+    """
+    store = _store()
+    try:
+        _ensure_repo_on_path()
+        from .selfie import run_media_ref_pipeline
+
+        run_media_ref_pipeline(job_id, role, store=store, jobs_root=get_settings().jobs_root)
+        _render_previews(store, job_id)
+    except Exception as e:  # noqa: BLE001 - surface failures as a job status, then re-raise
+        logger.exception("media-ref processing failed for job %s role %s", job_id, role)
+        store.update(job_id, status=JobStatus.failed, error=f"[{role}] {e}")
+        raise
+
+    _notify_skydiveos(store.load(job_id))
+    _archive_deliverables(store, job_id)
+    _maybe_auto_deliver(store, job_id)
+    return job_id
+
+
 @celery_app.task(name="api.rerender_job")
 def rerender_job(job_id: str) -> str:
     """Re-render a job from its persisted (instructor-tweaked) EDL.
@@ -301,8 +440,23 @@ def deliver_job(job_id: str) -> str:
         # is nothing to send, and crashing would just retry into the same wall.
         logger.warning("delivery for unknown job %s — dropping", job_id)
         return job_id
+    if job.superseded_by:
+        # A retired load child whose gallery was adopted by the customer's own job
+        # (api.app.create_job) — its link now serves that job, and delivering here
+        # would email a second (dead) link. Nothing to send.
+        logger.info("job %s was superseded by %s — skipping delivery", job_id, job.superseded_by)
+        return job_id
     if job.status != JobStatus.approved:
         raise RuntimeError(f"refusing to deliver job {job_id} in status {job.status}")
+    if job.job_kind is JobKind.load_master:
+        # A load master has no customer: its "delivery" is the fan-out. Nothing should
+        # route it here (``_maybe_auto_deliver`` sends it to fan_out_load_job and the
+        # approve endpoint refuses it), so this is a backstop against a hand-queued task
+        # emailing a load's video to nobody — or worse, to the roster's first name.
+        raise RuntimeError(
+            f"job {job_id} is a load master; it fans out (fan_out_load_job) rather than "
+            "being delivered to a customer"
+        )
 
     try:
         from .delivery import deliver_to_customer
@@ -318,6 +472,258 @@ def deliver_job(job_id: str) -> str:
     # Record what the customer got in the jump's archive manifest, so the folder alone
     # answers "was this delivered, and to where?".
     archive.archive_delivery(updated, get_settings())
+    return job_id
+
+
+#: Scene label that proves a card's footage really is a jump — required before a spec
+#: flight is offered as a load video, and before ANY job is delivered automatically.
+#: The freefall scene is the classifier's most reliable label by a distance (an
+#: accelerometer signature, not a position heuristic — see ``AUDIT_SCENE_LABELS.md``),
+#: which is what makes it usable as a "this really was a jump" gate.
+_JUMP_EVIDENCE_SCENE = "freefall"
+
+
+def _scene_manifests(store: JobStore, job_id: str) -> list[Path]:
+    """Every scene manifest this job produced (``scene_manifest*.json``).
+
+    One file for a single-camera package; one **per camera** for Ultimate
+    (``scene_manifest_instructor.json`` / ``_external.json``), because each camera is
+    classified into its own scene set. An empty list means the job never built scenes at
+    all — the single-master :func:`process_job` path, which segments a timeline instead —
+    and callers must read that as "no evidence either way", never as "no jump".
+    """
+    job_dir = store.dir(job_id)
+    if not job_dir.is_dir():
+        return []
+    return sorted(job_dir.glob("scene_manifest*.json"))
+
+
+def _flew_a_jump(store: JobStore, job_id: str) -> bool:
+    """Whether this job's scenes contain freefall — i.e. the card really is a jump.
+
+    Two callers, same question from different directions:
+
+    * **A load master** (:func:`fan_out_load_job`): the spec-flight match resolves a load
+      from the capture *timestamp* alone — there is no crew field on a load document to
+      confirm the flyer was aboard (``ingest.match.resolve_load_for_staff``) — so a card
+      filmed on the ground between loads would resolve to the nearest departed load and,
+      unguarded, become a "load video" offered to five customers who were never on it.
+    * **A customer job** (:func:`_auto_deliver_block`): an interview-only clip set renders
+      a valid-looking edit anyway (``api.selfie._curated_freefall``'s stand-in), so
+      without this it is auto-delivered as a finished skydive video.
+
+    The cheap second opinion in both cases, taken from the footage itself rather than the
+    manifest. ``True`` if ANY of the job's scene manifests carries a freefall scene: on an
+    Ultimate jump each camera has its own manifest, and one camera's freefall is proof the
+    jump happened even if the other card is short. Missing/unreadable manifests →
+    ``False``; the callers decide what that means (the load master refuses, the customer
+    job first checks whether scenes exist at all).
+    """
+    for manifest_path in _scene_manifests(store, job_id):
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, ValueError):
+            continue
+        # Scene entries are keyed ``name`` (not ``scene`` — that is the EDL *clip* field);
+        # ``edl.validate`` and ``api.selfie`` both read them this way.
+        if any(
+            str(scene.get("name", "")).lower() == _JUMP_EVIDENCE_SCENE
+            for scene in manifest.get("scenes", [])
+        ):
+            return True
+    return False
+
+
+def _pointer_job(store: JobStore, master_id: str, jumper_index: int | None) -> Job | None:
+    """An existing job already pointing at this master for this manifest slot, if any.
+
+    The fan-out's idempotency key (``jobs are idempotent and resumable``): a re-run finds
+    what it created last time instead of opening a second gallery for the same customer.
+    """
+    for job in store.list_jobs():
+        if job.source_job_id == master_id and job.jumper_index == jumper_index:
+            return job
+    return None
+
+
+def _is_own_job(job: Job, master: Job, entry: LoadRosterEntry) -> bool:
+    """Whether ``job`` is this roster entry's OWN jump job on the master's load.
+
+    Deliberately two independent join keys, because neither is reliable alone and the two
+    sides of the integration populate different ones:
+
+    * **``booking_id``** — the stable identity. Survives the manifest being edited, which
+      the positional key does not: remove a jumper from a load and every later index
+      shifts, so a stored ``jumper_index`` can come to name a different customer.
+    * **``(load_id, jumper_index)``** — the positional key. The only one available when a
+      job carries no booking id, or when the two sides spell booking ids differently.
+
+    Why both, concretely: our bridge sends `load_id` + `jumper_index` on a jump job, but in
+    production **SkydiveOS** creates these jobs and its payload carries neither — only
+    `booking_id`. With one key, whichever side happens to be creating jobs silently gets no
+    tile at all, which is exactly a missed sale with a WARNING as its only trace.
+
+    A caveat for whoever populates the roster: the roster's ``booking_id`` must be the SAME
+    identifier the jump job carries. Ours is the booking ObjectId on both sides
+    (`ingest.match`), so they join. SkydiveOS uses `booking.bookingNumber` on jump jobs, so
+    its roster must use `bookingNumber` too — an ObjectId there would compare against a
+    human ref and never match.
+    """
+    if job.job_kind is not JobKind.jump:
+        return False
+    if entry.booking_id and job.booking_id and job.booking_id == entry.booking_id:
+        return True
+    return (
+        master.load_id is not None
+        and job.load_id == master.load_id
+        and job.jumper_index is not None
+        and job.jumper_index == entry.jumper_index
+    )
+
+
+def _fan_out_to_jumper(
+    store: JobStore, master: Job, entry: LoadRosterEntry, existing: list[Job]
+) -> str | None:
+    """Offer the load video to ONE jumper. Returns a log word, or ``None`` if skipped.
+
+    Two tiers, and the test between them is **"do they already have a gallery of their
+    own?"** — deliberately NOT "did they buy media?":
+
+    * **has their own job** → stamp ``source_job_id`` on it and stop. The load video becomes
+      an upsell tile in the page they are already opening: one customer, one link, no second
+      email. Their own deliverables, status and entitlement are untouched.
+    * **has no job at all** → a ``load_child`` gallery: their name, their short code, their
+      unlock, ``preview_only`` so it streams the master's watermarked preview. Approved on
+      creation because there is no edit of its own to review — the master's edit already
+      was — then handed to the normal delivery task.
+
+    Why not ``bought_media``: a jumper who bought NOTHING still normally has a gallery,
+    because the instructor's handcam films every tandem anyway — that footage becomes a
+    speculative ``selfie`` + ``preview_only`` job with its own token and its own unlock
+    (``ingest.match.package_and_entitlement_for``). Branching on the purchase would create a
+    child ON TOP of it: two links and two emails to one customer, the same failure class as
+    the 2026-08-06 four-emails incident. ``bought_media`` survives only to tell the two
+    "no job found" cases apart (below).
+
+    Ordering: a non-buyer with no job yet gets a child here, and if their own footage is
+    ingested *afterwards*, ``api.app.create_job`` adopts the child's gallery token onto
+    the new job (and retires the child, ``superseded_by``) — so the link the customer
+    already received keeps working and they never end up with two galleries. Nothing in
+    this function can see a job that does not exist yet; the fix lives at job-creation.
+    """
+    own = next((j for j in existing if _is_own_job(j, master, entry)), None)
+    if own is not None:
+        if own.source_job_id == master.job_id:
+            return None  # already stamped (a re-run)
+        store.update(own.job_id, source_job_id=master.job_id)
+        return f"tile→{own.job_id}"
+
+    if entry.bought_media:
+        # They PAID for media, so a job of their own is coming (SkydiveOS may have created
+        # it already, or their footage hasn't landed). A child would become their SECOND
+        # link the moment it appears — skip and say so rather than guess.
+        logger.warning(
+            "load master %s: jumper %s (%s) bought media but has no job on this load "
+            "yet — no load-video tile offered",
+            master.job_id, entry.jumper_index, entry.customer_name,
+        )
+        return None
+
+    if _pointer_job(store, master.job_id, entry.jumper_index) is not None:
+        return None  # this child already exists (a re-run)
+
+    child_id = uuid.uuid4().hex
+    store.create(
+        Job(
+            job_id=child_id,
+            status=JobStatus.approved,
+            job_kind=JobKind.load_child,
+            source_job_id=master.job_id,
+            load_id=master.load_id,
+            load_label=master.load_label,
+            jumper_index=entry.jumper_index,
+            customer_name=entry.customer_name or "Valued Skydiver",
+            customer_email=entry.customer_email,
+            booking_id=entry.booking_id,
+            jump_date=master.jump_date,
+            package=master.package,
+            # Locked by definition: they bought nothing, so the whole point is a
+            # watermarked taste behind an unlock CTA.
+            entitlement=Entitlement.preview_only,
+            instructor_id=master.instructor_id,
+            instructor_name=master.instructor_name,
+        )
+    )
+    store.ensure_gallery_token(child_id)
+    deliver_job.delay(child_id)
+    return f"child→{child_id}"
+
+
+@celery_app.task(name="api.fan_out_load_job")
+def fan_out_load_job(job_id: str) -> str:
+    """Offer a finished load master to everybody on its load (the upsell fan-out).
+
+    The load master owns the only render; this turns it into one offer per customer
+    without editing anything again (the class-photo principle: shoot the class once, sell
+    copies per family). Steps, in order:
+
+    1. **Freefall guard** (:func:`_flew_a_jump`) — no freefall in the master's scenes means
+       the timestamp-resolved load is not evidence enough that this card is a jump at all,
+       so the job fails with an actionable error and **no** child is created.
+    2. The deliverables upload to S3 as the durable copy, with ``presign=False``: a
+       presigned URL carries no entitlement check, and every gallery hanging off this
+       master is locked.
+    3. Each roster entry is offered the video (:func:`_fan_out_to_jumper`).
+
+    Idempotent — a re-run re-stamps nothing and re-creates nothing (a second run would
+    otherwise email one customer twice, the failure mode the whole settle window exists to
+    prevent).
+    """
+    store = _store()
+    job = store.load(job_id)
+    if job.job_kind is not JobKind.load_master:
+        raise RuntimeError(f"job {job_id} is not a load master ({job.job_kind})")
+    if job.status != JobStatus.approved:
+        raise RuntimeError(f"refusing to fan out job {job_id} in status {job.status}")
+
+    try:
+        # A master is TIMESTAMP-resolved (spec flight): the window alone can't prove
+        # the flyer was aboard, so the footage itself must show a jump.
+        if not _flew_a_jump(store, job_id):
+            raise RuntimeError(
+                f"load master {job_id} has no freefall scene, so there is no evidence its "
+                "footage is a jump on the load its timestamps matched. Refusing to offer "
+                "it to that load's customers. If this really is a spec flight, check the "
+                "scene classification (jobs/<id>/scene_manifest.json) and re-queue."
+            )
+        settings = get_settings()
+        from .delivery import collect_deliverables, upload_and_link
+
+        files = collect_deliverables(job, store)
+        if not files:
+            raise RuntimeError(f"load master {job_id} has no rendered deliverables")
+        # Durable copy only. NOT presigned: every gallery that streams these bytes is
+        # behind a paywall, and a presigned URL answers to whoever holds it.
+        upload_and_link(files, job_id=job_id, settings=settings, presign=False)
+
+        existing = store.list_jobs()
+        actions = [
+            action
+            for entry in job.load_roster
+            if (action := _fan_out_to_jumper(store, job, entry, existing)) is not None
+        ]
+    except Exception as e:  # noqa: BLE001 - surface as a job status, then re-raise
+        logger.exception("fan-out failed for load master %s", job_id)
+        store.update(job_id, status=JobStatus.failed, error=str(e))
+        raise
+
+    updated = store.update(job_id, status=JobStatus.delivered)
+    logger.info(
+        "load master %s fanned out to %d of %d on %s: %s",
+        job_id, len(actions), len(job.load_roster), job.load_label or "the load",
+        ", ".join(actions) or "nobody",
+    )
+    _notify_skydiveos(updated)
     return job_id
 
 
@@ -392,11 +798,27 @@ def ingest_s3_job(job_id: str, s3_key: str, camera_role: str | None = None) -> s
     job = store.load(job_id)
     filename = Path(s3_key).name
 
-    if job.package.is_ultimum:
-        if camera_role not in ("instructor", "external"):
+    if job.staged_by_camera_role:
+        # Two products (or two cameras) on one job: the clips must be kept apart, both
+        # because two GoPros emit colliding filenames and because a mixed job resolves
+        # WHICH product a clip feeds — and therefore whether the result is watermarked —
+        # from its role alone. A missing role is refused rather than defaulted.
+        if camera_role not in MEDIA_REF_ROLES:
+            what = "ultimum" if job.package.is_ultimum else "multi-product"
             store.update(job_id, status=JobStatus.failed,
-                         error=f"ultimum S3 ingest needs a valid camera_role (got {camera_role!r})")
-            raise RuntimeError(f"job {job_id}: ultimum S3 ingest without a valid camera_role")
+                         error=f"{what} S3 ingest needs a valid camera_role (got {camera_role!r})")
+            raise RuntimeError(f"job {job_id}: {what} S3 ingest without a valid camera_role")
+        if job.is_multi_ref and job.ref_for_role(camera_role) is None:
+            store.update(
+                job_id,
+                status=JobStatus.failed,
+                error=(
+                    f"no media product on this job for camera_role {camera_role!r} "
+                    f"(have {[r.role for r in job.media_refs]}) — refusing to guess which "
+                    "product this footage belongs to"
+                ),
+            )
+            raise RuntimeError(f"job {job_id}: no media ref for role {camera_role!r}")
         dest = store.camera_raw_dir(job_id, camera_role) / filename
     else:
         dest = store.raw_dir(job_id) / filename
@@ -416,6 +838,28 @@ def ingest_s3_job(job_id: str, s3_key: str, camera_role: str | None = None) -> s
     # File the freshly-downloaded master under the jump in the browsable archive before
     # any editing runs, so the raw footage is preserved even if the edit later fails.
     archive.archive_raw_footage(job, store, settings)
+
+    # Mixed job: this role's product renders from this role's footage, on its own settle
+    # window. Deliberately NOT "wait for both cameras" like ultimum below — the two are
+    # separate products, and the one the customer PAID for must not be held hostage to a
+    # speculative card that may arrive much later or never.
+    if job.is_multi_ref:
+        assert camera_role is not None  # staged_by_camera_role refused a missing role
+        state = job.role_ingest.get(camera_role) or RoleIngest()
+        store.update(
+            job_id,
+            error=None,
+            role_ingest={
+                **job.role_ingest,
+                camera_role: state.model_copy(update={"last_clip_at": time.time()}),
+            },
+        )
+        settle = get_settings().raw_clip_settle_seconds
+        if settle <= 0:
+            _dispatch_processing(store, job_id, camera_role)  # opt-out: dispatch now
+        else:
+            raw_clips_settled_job.apply_async((job_id, camera_role), countdown=settle)
+        return job_id
 
     # Two-camera Ultimate: wait until BOTH roles are on disk before processing.
     if job.package.is_ultimum:
@@ -473,27 +917,51 @@ def ingest_s3_job(job_id: str, s3_key: str, camera_role: str | None = None) -> s
     return job_id
 
 
-def _dispatch_processing(store: JobStore, job_id: str) -> bool:
-    """Enqueue the pipeline for ``job_id`` exactly once. True if this call dispatched.
+def _dispatch_processing(store: JobStore, job_id: str, role: str | None = None) -> bool:
+    """Enqueue the pipeline exactly once for a job — or, on a mixed job, for one ROLE.
 
     The guard is what makes the multi-clip ``s3_key`` path safe: a late clip re-arming
     the settle check, two settle checks overlapping, or a duplicate notification must
-    never produce a second render of the same job.
+    never produce a second render of the same footage.
+
+    ``role`` is set only for a multi-ref (mixed) job, where each media product renders
+    from its own camera and gets its own exactly-once guard in ``Job.role_ingest``. The
+    two are deliberately independent: the paid handcam edit must ship as soon as ITS
+    clips are quiet, rather than waiting on a speculative camera-flyer card that may
+    arrive an hour later or never.
     """
     job = store.load(job_id)
-    if job.processing_dispatched:
-        logger.info("job %s already dispatched — not enqueuing a second render", job_id)
+    if role is None:
+        if job.processing_dispatched:
+            logger.info("job %s already dispatched — not enqueuing a second render", job_id)
+            return False
+        store.update(job_id, processing_dispatched=True)
+        if job.package.uses_scene_pipeline:
+            process_selfie_package.delay(job_id)
+        else:
+            process_job.delay(job_id)
+        return True
+
+    state = job.role_ingest.get(role) or RoleIngest()
+    if state.dispatched:
+        logger.info(
+            "job %s role %s already dispatched — not enqueuing a second render",
+            job_id, role,
+        )
         return False
-    store.update(job_id, processing_dispatched=True)
-    if job.package.uses_scene_pipeline:
-        process_selfie_package.delay(job_id)
-    else:
-        process_job.delay(job_id)
+    store.update(
+        job_id,
+        role_ingest={
+            **job.role_ingest,
+            role: state.model_copy(update={"dispatched": True}),
+        },
+    )
+    process_media_ref_job.delay(job_id, role)
     return True
 
 
 @celery_app.task(name="api.raw_clips_settled_job")
-def raw_clips_settled_job(job_id: str) -> str:
+def raw_clips_settled_job(job_id: str, role: str | None = None) -> str:
     """Dispatch processing once a job's raw clips have stopped arriving.
 
     Armed (with a countdown) by every ``s3_key`` ingest. If another clip landed since,
@@ -501,8 +969,12 @@ def raw_clips_settled_job(job_id: str) -> str:
     WHOLE jump. Re-scheduling (rather than cancelling the previous countdown, which
     Celery can't do reliably) is the same trick :func:`ultimum_watchdog_job` uses.
 
-    A no-op once the job has been dispatched, has moved past ``queued``, or was failed
-    /rejected in the meantime.
+    ``role`` is set only for a multi-ref (mixed) job: each camera's product settles on its
+    own stamp and dispatches its own render, so one card's silence never holds up the
+    other's edit. Everything else about the check is identical.
+
+    A no-op once that footage has been dispatched, once the job has moved past ``queued``,
+    or if it was failed/rejected in the meantime.
     """
     _ensure_repo_on_path()
 
@@ -517,25 +989,40 @@ def raw_clips_settled_job(job_id: str) -> str:
         logger.warning("settle check for unknown job %s — dropping", job_id)
         return job_id
 
-    if job.processing_dispatched or job.status != JobStatus.queued:
-        return job_id  # already underway, or no longer waiting to be processed
+    if role is None:
+        if job.processing_dispatched or job.status != JobStatus.queued:
+            return job_id  # already underway, or no longer waiting to be processed
+    else:
+        state = job.role_ingest.get(role)
+        if state is not None and state.dispatched:
+            return job_id  # this role's render is already underway
+        if job.status in (JobStatus.failed, JobStatus.rejected):
+            return job_id
+        # NOTE: a mixed job is deliberately NOT required to be `queued` here. Its second
+        # camera routinely lands after the first render finished, by which time the job
+        # reads `ready`/`delivered` — the whole point of the flow is that the paid edit
+        # ships first and the spec one joins the same gallery later.
 
     # A missing stamp must read as "not settled", never as "quiet forever": the
     # stamp can be absent when this check races the ingest's own update (two
     # writers on job.json — observed on a lagging machine, where it dispatched a
     # 1-clip render of an 8-clip jump). updated_at moves on every write, so it is
     # a safe lower bound for "something happened recently".
-    stamp = job.last_raw_clip_at or job.updated_at or time.time()
+    if role is None:
+        stamp = job.last_raw_clip_at or job.updated_at or time.time()
+    else:
+        role_state = job.role_ingest.get(role)
+        stamp = (role_state.last_clip_at if role_state else None) or job.updated_at or time.time()
     quiet_for = time.time() - stamp
     if quiet_for < settings.raw_clip_settle_seconds:
         # Still arriving — check again shortly. Poll interval rather than the full
         # settle window so a jump that just went quiet isn't delayed by a whole window.
         raw_clips_settled_job.apply_async(
-            (job_id,), countdown=settings.raw_clip_settle_poll_seconds
+            (job_id, role), countdown=settings.raw_clip_settle_poll_seconds
         )
         return job_id
 
-    if job.package.is_ultimum:
+    if role is None and job.package.is_ultimum:
         from .selfie import CAMERA_ROLES
 
         if not store.camera_roles_present(job_id, CAMERA_ROLES):
@@ -545,12 +1032,13 @@ def raw_clips_settled_job(job_id: str) -> str:
             # one-camera "Ultimate".
             return job_id
 
-    n_clips = len(list(store.raw_dir(job_id).glob("*"))) if store.raw_dir(job_id).exists() else 0
+    raw = store.camera_raw_dir(job_id, role) if role else store.raw_dir(job_id)
+    n_clips = len(list(raw.glob("*"))) if raw.exists() else 0
     logger.info(
-        "job %s: raw clips settled (quiet %.0fs, %d file(s) staged) — dispatching",
-        job_id, quiet_for, n_clips,
+        "job %s%s: raw clips settled (quiet %.0fs, %d file(s) staged) — dispatching",
+        job_id, f" role {role}" if role else "", quiet_for, n_clips,
     )
-    _dispatch_processing(store, job_id)
+    _dispatch_processing(store, job_id, role)
     return job_id
 
 

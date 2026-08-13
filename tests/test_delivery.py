@@ -10,6 +10,7 @@ delivery the moment a render finishes.
 
 from __future__ import annotations
 
+import json
 import smtplib
 import time
 from dataclasses import replace
@@ -298,6 +299,108 @@ def test_deliver_without_email_ok_when_skydiveos_forwards(store: JobStore) -> No
 
 
 # --------------------------------------------------------------------------- #
+# Delivery is idempotent at the EMAIL boundary (audit §3-M).
+#
+# Celery runs task_acks_late=True, so a worker killed after the SMTP send but before
+# the ack re-runs deliver_job from the top — and the `status != approved` guard cannot
+# catch it, because the status is still `approved` for the whole run. The customer got
+# a second "your video is ready".
+# --------------------------------------------------------------------------- #
+
+
+def test_delivery_emails_the_customer_exactly_once_across_retries(
+    store: JobStore,
+) -> None:
+    job = _rendered_job(store, customer_email="jane@example.com")
+    smtp = FakeSMTP()
+
+    for _ in range(3):  # the task re-running after a crash, three times over
+        deliver_to_customer(
+            store.load(job.job_id), store, _settings(),
+            s3_client=FakeS3(), smtp_factory=lambda: smtp,  # type: ignore[arg-type,return-value]
+        )
+
+    assert len(smtp.sent) == 1
+    assert store.load(job.job_id).email_sent_at is not None
+
+
+def test_a_retry_still_returns_links_and_does_not_fail_the_job(store: JobStore) -> None:
+    """The re-run must not conclude "unreachable" and fail a job already delivered.
+
+    ``send_gallery_email_once`` reports "the customer HAS their link", so the
+    reachability check that raises when nothing reached anyone stays satisfied on a
+    retry — even with no SkydiveOS callback configured to forward to.
+    """
+    job = _rendered_job(store, customer_email="jane@example.com")
+    smtp = FakeSMTP()
+    settings = _settings(skydiveos_api_base=None)
+    first = deliver_to_customer(
+        job, store, settings, s3_client=FakeS3(), smtp_factory=lambda: smtp  # type: ignore[arg-type,return-value]
+    )
+    second = deliver_to_customer(
+        store.load(job.job_id), store, settings,
+        s3_client=FakeS3(), smtp_factory=lambda: smtp,  # type: ignore[arg-type,return-value]
+    )
+    assert set(second) == set(first)
+    assert len(smtp.sent) == 1
+
+
+def test_a_second_worker_racing_the_same_job_does_not_send(store: JobStore) -> None:
+    """The claim is an O_EXCL create, so the filesystem — not job.json — arbitrates."""
+    job = _rendered_job(store, customer_email="jane@example.com")
+    assert store.claim_email_send(job.job_id) is True   # "worker A" holds it
+    assert store.claim_email_send(job.job_id) is False  # worker B is refused
+
+    smtp = FakeSMTP()
+    deliver_to_customer(
+        job, store, _settings(), s3_client=FakeS3(), smtp_factory=lambda: smtp  # type: ignore[arg-type,return-value]
+    )
+    assert smtp.sent == []  # B did not send behind A's back
+
+
+def test_a_failed_send_releases_the_claim_so_a_retry_can_deliver(
+    store: JobStore,
+) -> None:
+    """A transient SMTP outage must not permanently suppress the customer's email."""
+    job = _rendered_job(store, customer_email="jane@example.com")
+
+    class _BrokenSMTP(FakeSMTP):
+        def send_message(self, msg: EmailMessage) -> None:
+            raise OSError("connection reset")
+
+    with pytest.raises(OSError, match="connection reset"):
+        deliver_to_customer(
+            job, store, _settings(),
+            s3_client=FakeS3(), smtp_factory=lambda: _BrokenSMTP(),  # type: ignore[arg-type,return-value]
+        )
+    assert store.load(job.job_id).email_sent_at is None
+
+    smtp = FakeSMTP()
+    deliver_to_customer(
+        store.load(job.job_id), store, _settings(),
+        s3_client=FakeS3(), smtp_factory=lambda: smtp,  # type: ignore[arg-type,return-value]
+    )
+    assert len(smtp.sent) == 1
+
+
+def test_an_unconfigured_send_releases_the_claim(store: JobStore) -> None:
+    """No SMTP yet → nothing went out, so configuring it later must still send."""
+    job = _rendered_job(store, customer_email="jane@example.com")
+    deliver_to_customer(
+        job, store, _settings(smtp_host=None, skydiveos_api_base="http://skydiveos.test"),
+        s3_client=FakeS3(),
+    )
+    assert store.load(job.job_id).email_sent_at is None
+
+    smtp = FakeSMTP()
+    deliver_to_customer(
+        store.load(job.job_id), store, _settings(),
+        s3_client=FakeS3(), smtp_factory=lambda: smtp,  # type: ignore[arg-type,return-value]
+    )
+    assert len(smtp.sent) == 1
+
+
+# --------------------------------------------------------------------------- #
 # F-14 — a locked (preview_only) job must never be handed a clean-master URL.
 #
 # The leak this closes: the legacy S3 gallery presigns `job.outputs` — the CLEAN
@@ -447,6 +550,150 @@ def test_auto_deliver_off_leaves_review_gate(
     assert store.load("j1").status == JobStatus.ready_for_review
 
 
+# --------------------------------------------------------------------------- #
+# A customer job with no JUMP in it is never auto-delivered (audit §3-J).
+#
+# api.selfie._curated_freefall stands in the first scene when there is no freefall
+# scene "so the EDL is valid" — right for the renderer, wrong for the customer: an
+# interview-only clip set (the normal outcome of a split/stale manifest) rendered and
+# was emailed as a finished skydive video.
+# --------------------------------------------------------------------------- #
+
+
+def _scene_manifest(store: JobStore, job_id: str, *names: str, suffix: str = "") -> None:
+    path = store.dir(job_id) / f"scene_manifest{suffix}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"scenes": [{"name": n, "duration": 10.0} for n in names]}))
+
+
+def test_auto_deliver_holds_a_job_with_no_freefall_scene(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from api import tasks
+
+    _rendered_job(store, status=JobStatus.ready, customer_email="jane@example.com")
+    _scene_manifest(store, "j1", "intro_interview", "boarding")  # no jump on this card
+    monkeypatch.setattr(
+        tasks, "get_settings", lambda: _settings(auto_deliver=True, jobs_root=str(tmp_path))
+    )
+    monkeypatch.setattr(
+        tasks.deliver_job, "delay", lambda _id: pytest.fail("must not deliver a non-jump")
+    )
+
+    tasks._maybe_auto_deliver(store, "j1")
+
+    job = store.load("j1")
+    assert job.status == JobStatus.ready  # render kept, review gate holds it
+    assert job.hold_reason and "no jump/freefall scene" in job.hold_reason
+    assert job.email_sent_at is None
+
+
+def test_auto_deliver_proceeds_when_the_scenes_show_a_jump(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard must not touch a legitimate jump."""
+    from api import tasks
+
+    _rendered_job(store, status=JobStatus.ready)
+    _scene_manifest(store, "j1", "boarding", "freefall", "canopy", "landing")
+    monkeypatch.setattr(
+        tasks, "get_settings", lambda: _settings(auto_deliver=True, jobs_root=str(tmp_path))
+    )
+    delayed: list[str] = []
+    monkeypatch.setattr(tasks.deliver_job, "delay", delayed.append)
+
+    tasks._maybe_auto_deliver(store, "j1")
+
+    assert store.load("j1").status == JobStatus.approved
+    assert delayed == ["j1"]
+
+
+def test_one_ultimate_camera_with_freefall_is_enough(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-camera manifests: one camera's freefall proves the jump happened."""
+    from api import tasks
+
+    _rendered_job(store, status=JobStatus.ready)
+    _scene_manifest(store, "j1", "boarding", "plane", suffix="_instructor")
+    _scene_manifest(store, "j1", "freefall", "canopy", suffix="_external")
+    monkeypatch.setattr(
+        tasks, "get_settings", lambda: _settings(auto_deliver=True, jobs_root=str(tmp_path))
+    )
+    delayed: list[str] = []
+    monkeypatch.setattr(tasks.deliver_job, "delay", delayed.append)
+
+    tasks._maybe_auto_deliver(store, "j1")
+
+    assert store.load("j1").status == JobStatus.approved
+    assert delayed == ["j1"]
+
+
+def test_a_job_with_no_scene_manifest_at_all_is_not_blocked(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No scenes = no evidence either way (the single-master process_job path).
+
+    "Unknown" must not block a legitimate job — the guard only fires on positive
+    evidence that the footage contains no jump.
+    """
+    from api import tasks
+
+    _rendered_job(store, status=JobStatus.ready_for_review)
+    monkeypatch.setattr(
+        tasks, "get_settings", lambda: _settings(auto_deliver=True, jobs_root=str(tmp_path))
+    )
+    delayed: list[str] = []
+    monkeypatch.setattr(tasks.deliver_job, "delay", delayed.append)
+
+    tasks._maybe_auto_deliver(store, "j1")
+
+    assert store.load("j1").status == JobStatus.approved
+    assert delayed == ["j1"]
+
+
+def test_a_re_render_clears_a_stale_hold(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The missing clips arrived and the job re-rendered: the old hold must not stick."""
+    from api import tasks
+
+    _rendered_job(store, status=JobStatus.ready, hold_reason="no jump/freefall scene ...")
+    _scene_manifest(store, "j1", "boarding", "freefall", "landing")
+    monkeypatch.setattr(
+        tasks, "get_settings", lambda: _settings(auto_deliver=True, jobs_root=str(tmp_path))
+    )
+    delayed: list[str] = []
+    monkeypatch.setattr(tasks.deliver_job, "delay", delayed.append)
+
+    tasks._maybe_auto_deliver(store, "j1")
+
+    job = store.load("j1")
+    assert job.hold_reason is None
+    assert job.status == JobStatus.approved
+    assert delayed == ["j1"]
+
+
+def test_the_instructor_can_still_approve_a_held_job_by_hand(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hold is not a refusal to deliver — a human who watched it may override."""
+    from api import delivery, tasks
+
+    _rendered_job(store, status=JobStatus.approved, customer_email="jane@example.com",
+                  hold_reason="no jump/freefall scene ...")
+    _scene_manifest(store, "j1", "intro_interview")
+    monkeypatch.setattr(tasks, "get_settings", lambda: _settings(jobs_root=str(tmp_path)))
+    monkeypatch.setattr(delivery, "_default_s3_client", lambda settings: FakeS3())
+    smtp = FakeSMTP()
+    monkeypatch.setattr(smtplib, "SMTP", lambda *a, **k: smtp)
+
+    tasks.deliver_job(job_id="j1")
+
+    assert store.load("j1").status == JobStatus.delivered
+    assert len(smtp.sent) == 1
+
+
 def test_deliver_job_task_persists_links_and_marks_delivered(
     store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -529,6 +776,10 @@ def test_status_callback_hits_skydiveos_route_with_links_and_token(
         "entitlement": "edited_download",
         # The design doc's state vocabulary, derived from status + entitlement.
         "media_state": "DELIVERED",
+        # Always sent, default included, so SkydiveOS branches on a present value rather
+        # than on absence (a load_child is a gallery it never created and has no booking
+        # for — it must not read as a jump that lost its booking).
+        "job_kind": "jump",
         "delivery_links": {"final": "https://s3.test/final.mp4"},
         # Identity so SkydiveOS can link a job it did not create; this fixture knows
         # only the model's default name, so that is all that rides along.

@@ -28,6 +28,7 @@ Endpoints (all under the OpenAPI docs at ``/docs``):
 ``GET  /j/{code}``          the customer gallery landing page (token-authed)
 ``GET  /j/{code}/media/{name}``   stream a deliverable (preview while locked)
 ``GET  /j/{code}/photos/{filename}`` fetch one photo (unlocked only)
+``GET  /ingest/cards``      live SD-card pull progress (safe-to-remove signal)
 ==========================  ===============================================
 
 Run locally with ``uvicorn api.app:app --reload`` (and a Celery worker — see
@@ -58,7 +59,23 @@ from . import archive
 from .auth import PUBLIC_PATH_PREFIX, AdminDep, PrincipalDep, service_token_allows
 from .config import Settings, get_settings
 from .gallery import render_gallery_html
-from .jobs import MUSIC_SUFFIXES, REVIEWABLE, Entitlement, Job, JobStatus, JobStore
+from .jobs import (
+    CAMERA_ROLE_EXTERNAL,
+    CAMERA_ROLE_INSTRUCTOR,
+    MEDIA_REF_ROLES,
+    MUSIC_SUFFIXES,
+    REVIEWABLE,
+    Entitlement,
+    Job,
+    JobKind,
+    JobStatus,
+    JobStore,
+    all_locked,
+    any_locked,
+    entitlement_for,
+    locked_deliverables,
+    unlockable_group,
+)
 from .preview import preview_path
 from .queue import CeleryJobQueue, JobQueue
 from .ratelimit import FixedWindowLimiter, caller_key
@@ -66,6 +83,7 @@ from .schemas import (
     AssignCameraRequest,
     CameraInfo,
     CamerasResponse,
+    CardIngestStatus,
     CreateJobRequest,
     CreateJobResponse,
     DeliverableInfo,
@@ -82,9 +100,10 @@ from .schemas import (
     UnlockRequest,
     UploadResponse,
 )
-from .upsell import link_tiles
+from .upsell import LOAD_VIDEO_KEY, UpsellTile, link_tiles, load_video_tile
 
 if TYPE_CHECKING:
+    from ingest.cardstatus import CardStatusRegistry
     from ingest.events import EventEmitter
     from ingest.scanner import CameraScanner
 
@@ -230,7 +249,40 @@ def _served_under(path: Path, root: Path) -> bool:
 #: Gallery upsell items ``POST /jobs/{id}/unlock`` can record besides the paywall
 #: ``unlock`` itself. Must stay in step with SkydiveOS's priced item keys — and, like
 #: SkydiveOS's ``NON_PURCHASABLE_ITEMS``, ``rebook`` is a promo and deliberately absent.
-PURCHASABLE_ADDONS = frozenset({"raw", "photos"})
+#: ``load_video`` is the spec-flight load's aerial cut, sold to a customer who already
+#: has a gallery of their own (a no-media customer buys the same footage through their
+#: child gallery's ordinary ``unlock`` instead).
+PURCHASABLE_ADDONS = frozenset({"raw", "photos", LOAD_VIDEO_KEY})
+
+#: ``POST /jobs/{id}/unlock`` items that buy ONE camera's locked deliverables — the
+#: speculative edit filmed alongside a purchased one, or either half of a jump where
+#: nothing was bought at all. Distinct from the legacy ``unlock``, which moves the job's
+#: own default and leaves every explicit per-deliverable entry untouched (so on a job with
+#: media refs it takes the money and opens nothing).
+#:
+#: **Scoped per camera because the two angles sell separately.** A jumper who bought
+#: nothing has both edits born locked, and one who wants only the outside angle must be
+#: able to buy only that — an unscoped group would hand over both for one payment.
+#: SkydiveOS therefore sends one item per angle and prices each; this service never
+#: prices anything.
+UNLOCK_GROUP_ITEM_BY_ROLE = {
+    CAMERA_ROLE_INSTRUCTOR: "unlock_instructor",
+    CAMERA_ROLE_EXTERNAL: "unlock_external",
+}
+#: The reverse map the unlock endpoint resolves an incoming ``item`` through.
+UNLOCK_GROUP_ITEMS = {item: role for role, item in UNLOCK_GROUP_ITEM_BY_ROLE.items()}
+
+#: Customer-facing CTA text per camera. No price: SkydiveOS prices each item, and a single
+#: ``PREVIEW_PRICE_DISPLAY`` cannot speak for two independently-priced angles.
+UNLOCK_GROUP_LABEL_BY_ROLE = {
+    CAMERA_ROLE_INSTRUCTOR: "🔒 Unlock the handcam video",
+    CAMERA_ROLE_EXTERNAL: "🔒 Unlock the outside-camera video",
+}
+
+#: Hero product line for a child gallery. Deliberately not a ``Package`` member and
+#: deliberately not a media product the customer didn't buy — the design's Stage 7
+#: wording: "your jump day", never "your jump".
+LOAD_CHILD_PRODUCT_LABEL = "Tandem · Jump Day"
 
 
 def _is_audio(file: UploadFile) -> bool:
@@ -273,6 +325,81 @@ def _booking_sidecar(job: Job) -> dict[str, object]:
         "package": job.package.value,
         "music": job.music,
     }
+
+
+async def _upload_media_ref(
+    job: Job,
+    store: JobStore,
+    queue: JobQueue,
+    settings: Settings,
+    uploaded: list[UploadFile],
+    camera_role: str | None,
+) -> UploadResponse:
+    """Stage ONE camera's clips on a mixed job and render that camera's product.
+
+    A mixed job carries two media products — typically a paid handcam edit and a
+    speculative camera-flyer one — and each renders from its own ``raw/<role>/`` folder
+    with its own entitlement. Unlike the Ultimate package this does **not** wait for the
+    second camera: the two are separate products, and the one the customer paid for must
+    not be held hostage to a speculative card that may arrive hours later or never.
+
+    ``camera_role`` is therefore required, and a role this job has no product for is
+    refused rather than guessed — the role is what decides whether the resulting edit is
+    watermarked.
+    """
+    from .selfie import CAMERA_ROLES
+
+    if camera_role not in CAMERA_ROLES:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"this job carries {len(job.media_refs)} media products, so an upload must "
+                f"name camera_role (one of {list(CAMERA_ROLES)}, got {camera_role!r}) — it "
+                "is what decides which product the footage feeds"
+            ),
+        )
+    if job.ref_for_role(camera_role) is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"no media product on this job for camera_role {camera_role!r} "
+                f"(have {[r.role for r in job.media_refs]})"
+            ),
+        )
+
+    role_dir = store.camera_raw_dir(job.job_id, camera_role)
+    role_dir.mkdir(parents=True, exist_ok=True)
+    for f in uploaded:
+        name = Path(f.filename or "clip.mp4").name
+        with (role_dir / name).open("wb") as out:
+            while chunk := await f.read(_UPLOAD_CHUNK):
+                out.write(chunk)
+
+    store.write_booking(job.job_id, _booking_sidecar(job))
+    # File this camera's masters under the jump before the edit runs, so the footage
+    # survives a failed render. Idempotent — the other camera adds to the same folder.
+    archive.archive_raw_footage(job, store, settings)
+
+    # A byte upload delivers a whole clip set in one call, so there is nothing to settle:
+    # dispatch this role now. The per-role guard keeps a repeated upload from starting a
+    # second render of the same footage.
+    store.update(job.job_id, error=None)
+    queue.enqueue_media_ref_processing(job.job_id, camera_role)
+    n = len(uploaded)
+    ref = job.ref_for_role(camera_role)
+    assert ref is not None  # refused above
+    return UploadResponse(
+        job_id=job.job_id,
+        status=store.load(job.job_id).status,
+        source="upload",
+        package=job.package,
+        camera_role=camera_role,
+        files_received=n,
+        detail=(
+            f"received {n} files for {camera_role} ({ref.package.value}/"
+            f"{ref.entitlement.value}); processing enqueued for that product"
+        ),
+    )
 
 
 async def _upload_ultimum(
@@ -347,12 +474,16 @@ async def _upload_ultimum(
     )
 
 
-def _build_scanner(settings: Settings) -> CameraScanner:
+def _build_scanner(
+    settings: Settings, card_status: CardStatusRegistry | None = None
+) -> CameraScanner:
     """The discovery scanner for the configured mode.
 
     ``static`` → a fixed list (no-hardware simulation); ``usb`` → mDNS detection of a
     USB-connected GoPro (the kiosk path); ``sdcard`` → physically inserted SD cards
-    (mount-root polling); anything else → the real BLE scan.
+    (mount-root polling, wrapped to mirror card presence into the ingest status
+    registry when one is given — the ``GET /ingest/cards`` view); anything else →
+    the real BLE scan.
     """
     from ingest.scanner import (
         BleCameraScanner,
@@ -366,7 +497,12 @@ def _build_scanner(settings: Settings) -> CameraScanner:
     if settings.camera_scanner == "usb":
         return UsbCameraScanner()
     if settings.camera_scanner == "sdcard":
-        return SdCardScanner(roots=settings.sdcard_mount_roots)
+        scanner: CameraScanner = SdCardScanner(roots=settings.sdcard_mount_roots)
+        if card_status is not None:
+            from ingest.cardstatus import ObservingScanner
+
+            scanner = ObservingScanner(scanner, card_status)
+        return scanner
     return BleCameraScanner()
 
 
@@ -389,7 +525,9 @@ def _cleanup_kwargs(settings: Settings) -> dict[str, Any]:
     }
 
 
-def _build_pull(settings: Settings) -> Callable[..., Awaitable[Any]] | None:
+def _build_pull(
+    settings: Settings, card_status: CardStatusRegistry | None = None
+) -> Callable[..., Awaitable[Any]] | None:
     """The pull coroutine for the configured mode.
 
     ``None`` means "use the service default" (the real wireless BLE+WiFi
@@ -397,7 +535,9 @@ def _build_pull(settings: Settings) -> Callable[..., Awaitable[Any]] | None:
     path against a :class:`~ingest.camera.WiredGoProCamera` (the kiosk path). ``static``
     returns a no-hardware simulation that stages the configured sample MP4
     (``DISCOVERY_SAMPLE_MP4``, or the bundled ``sample-data/discovery_sample.mp4``) and
-    emits the same ``ready_for_processing`` event a real download would.
+    emits the same ``ready_for_processing`` event a real download would. In ``sdcard``
+    mode, ``card_status`` (when given) tracks the pull's progress so the API can tell
+    the operator when the card is safe to remove (``GET /ingest/cards``).
     """
     if settings.camera_scanner == "usb":
         async def _usb_pull(camera_id: str, *, emitter: EventEmitter | None = None) -> object:
@@ -415,19 +555,39 @@ def _build_pull(settings: Settings) -> Callable[..., Awaitable[Any]] | None:
 
     if settings.camera_scanner == "sdcard":
         async def _sdcard_pull(camera_id: str, *, emitter: EventEmitter | None = None) -> object:
+            from ingest.camera import Camera
             from ingest.pull import pull_camera
             from ingest.sdcard import SdCardCamera, mount_for
 
-            # Re-resolve the mount at pull time — the card may have been re-inserted
-            # (or yanked) between the scan and this pull; a gone card raises the same
-            # CameraError a camera wandering out of BLE range would.
-            mount = mount_for(camera_id, settings.sdcard_mount_roots)
-            return await pull_camera(
-                camera_id,
-                camera=SdCardCamera(mount),
-                emitter=emitter,
-                **_cleanup_kwargs(settings),
-            )
+            if card_status is not None:
+                card_status.pull_started(camera_id)
+            try:
+                # Re-resolve the mount at pull time — the card may have been re-inserted
+                # (or yanked) between the scan and this pull; a gone card raises the same
+                # CameraError a camera wandering out of BLE range would.
+                mount = mount_for(camera_id, settings.sdcard_mount_roots)
+                camera: Camera = SdCardCamera(mount)
+                if card_status is not None:
+                    from ingest.cardstatus import TrackedCamera
+
+                    camera = TrackedCamera(camera, card_status, camera_id)
+                result = await pull_camera(
+                    camera_id,
+                    camera=camera,
+                    emitter=emitter,
+                    **_cleanup_kwargs(settings),
+                )
+            except Exception as e:
+                # The operator is standing at the reader: a failed pull must show as
+                # a red card state, not only as a server log line.
+                if card_status is not None:
+                    card_status.error(camera_id, str(e))
+                raise
+            # The pull loop is done and the camera closed: the card is idle. The S3
+            # upload + notify run later from the STAGED copy and don't need the card.
+            if card_status is not None:
+                card_status.safe_to_remove(camera_id)
+            return result
 
         return _sdcard_pull
 
@@ -554,6 +714,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
             from ingest.qr import qr_identity_resolver
 
+            # SD-card mode: an operator is physically waiting at the reader, so the
+            # pull's progress is tracked and served (GET /ingest/cards) to tell them
+            # when the card is safe to remove. Other transports have no card to eject.
+            if settings.camera_scanner == "sdcard":
+                from ingest.cardstatus import CardStatusRegistry as _CardStatusRegistry
+
+                app.state.card_status = _CardStatusRegistry()
+
             if not settings.skydiveos_api_base:
                 raise RuntimeError(
                     "auto-discovery needs SKYDIVEOS_API_BASE set: pulled files are "
@@ -588,8 +756,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     list(settings.discovery_fake_cameras),
                     settings.discovery_sample_mp4 or _DEFAULT_SAMPLE_MP4,
                 )
+            card_status = getattr(app.state, "card_status", None)
             service = CameraDiscoveryService(
-                scanner=_build_scanner(settings),
+                scanner=_build_scanner(settings, card_status),
                 registry=registry,
                 upload=s3_notify_uploader(
                     settings.skydiveos_api_base,
@@ -598,7 +767,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     region_name=settings.s3_region,
                     clock_tz=settings.camera_clock_tz,
                 ),
-                pull=_build_pull(settings),
+                pull=_build_pull(settings, card_status),
                 interval=settings.discovery_interval,
                 # In sdcard mode the QR identity resolver subsumes role resolution
                 # (it fills the load-derived role per clip), so the plain role
@@ -752,6 +921,34 @@ def create_app() -> FastAPI:
     )
 
 
+    def _adoptable_child(store: JobStore, body: CreateJobRequest) -> Job | None:
+        """An existing ``load_child`` gallery this NEW jump job should adopt, if any.
+
+        The gallery race: a load master's fan-out can open a child gallery for a
+        customer *before* their own footage is ingested (flyer's card arrives first).
+        When the customer's own job is then created, minting a fresh token would give
+        one customer two live links and two emails — so the new job adopts the child's
+        token instead (:meth:`api.jobs.JobStore.adopt_gallery_token`). Matching uses the
+        same two independent join keys as the fan-out's ``_is_own_job``: ``booking_id``
+        (the stable identity), else ``(load_id, jumper_index)`` (the positional key) —
+        because the two sides of the integration populate different ones.
+        """
+        if body.job_kind not in (None, JobKind.jump):
+            return None  # masters and children never adopt
+        for j in store.list_jobs():
+            if j.job_kind is not JobKind.load_child or j.superseded_by or not j.source_job_id:
+                continue
+            if body.booking_id and j.booking_id and j.booking_id == body.booking_id:
+                return j
+            if (
+                body.load_id
+                and j.load_id == body.load_id
+                and body.jumper_index is not None
+                and j.jumper_index == body.jumper_index
+            ):
+                return j
+        return None
+
     @app.post(
         "/jobs",
         status_code=201,
@@ -774,6 +971,10 @@ def create_app() -> FastAPI:
         — before any footage is uploaded or a single frame is rendered — means that
         delivery-time failure can never be reached in production, and the operator
         finds out at booking time instead of after the jump.
+
+        **A ``load_child`` must name an existing ``source_job_id``.** A child gallery owns
+        no footage of its own — every byte it streams comes from that load master — so one
+        created without a valid pointer could only ever render an empty page.
         """
         if (
             body.entitlement is Entitlement.preview_only
@@ -788,12 +989,56 @@ def create_app() -> FastAPI:
                     "master. Set PUBLIC_BASE_URL, or create the job as edited_download."
                 ),
             )
+        if body.job_kind is JobKind.load_child and not body.source_job_id:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "a load_child job owns no footage; it needs source_job_id naming the "
+                    "load master whose renders its gallery streams"
+                ),
+            )
+        if body.source_job_id and not store.exists(body.source_job_id):
+            raise HTTPException(
+                status_code=422,
+                detail=f"source_job_id {body.source_job_id!r} is not a known job",
+            )
         job_id = uuid.uuid4().hex
         fields = body.model_dump(exclude_none=True)
         store.create(Job(job_id=job_id, **fields))
-        # Every job carries its gallery short code from birth, so the customer link
-        # exists (and stays stable) before anything renders or delivers.
-        store.ensure_gallery_token(job_id)
+        child = _adoptable_child(store, body)
+        if child is not None:
+            # The gallery race, fixed at the token-minting boundary: this customer was
+            # already given a load-child gallery (the flyer's card arrived first), so
+            # the new job ADOPTS that link instead of minting a second one. The child
+            # is retired (superseded_by); the customer keeps ONE gallery, which now
+            # shows their own footage plus the load-video tile (source_job_id).
+            store.adopt_gallery_token(child.job_id, job_id)
+            updates: dict[str, object] = {"source_job_id": child.source_job_id}
+            # Fill positional/label gaps from the child so the tile renders with the
+            # load's name and later fan-out re-runs join on the same keys.
+            if body.load_id is None and child.load_id:
+                updates["load_id"] = child.load_id
+            if body.jumper_index is None and child.jumper_index is not None:
+                updates["jumper_index"] = child.jumper_index
+            if body.load_label is None and child.load_label:
+                updates["load_label"] = child.load_label
+            if child.paid_at is not None or child.entitlement is Entitlement.edited_download:
+                # The customer already PAID for the load video through the child's
+                # unlock — the purchase must survive adoption, as the fulfilled
+                # load-video section of their (single) gallery.
+                updates["addons"] = {
+                    **child.addons,
+                    LOAD_VIDEO_KEY: child.payment_reference or "adopted-from-child",
+                }
+            store.update(job_id, **updates)
+            logger.info(
+                "job %s adopted gallery of load child %s (customer %r keeps one link)",
+                job_id, child.job_id, child.customer_name,
+            )
+        else:
+            # Every job carries its gallery short code from birth, so the customer link
+            # exists (and stays stable) before anything renders or delivers.
+            store.ensure_gallery_token(job_id)
         return CreateJobResponse(job_id=job_id, job=JobResponse.from_job(store.load(job_id)))
 
     @app.get(
@@ -870,6 +1115,18 @@ def create_app() -> FastAPI:
         job = _load_or_404(store, job_id)
         if job.status == JobStatus.processing:
             raise HTTPException(status_code=409, detail="job is already processing")
+        if job.job_kind is JobKind.load_child:
+            # A child gallery is a *view* of its load master's renders, never a job with
+            # footage of its own. Attaching clips here would render a second copy of the
+            # load video per customer and break the render-once economics the whole
+            # feature rests on — so refuse rather than quietly editing five times.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"job {job_id} is a load_child gallery: it streams load master "
+                    f"{job.source_job_id}'s renders and takes no footage of its own"
+                ),
+            )
 
         # Accept both the multi-file ``files`` field and the legacy single ``file``.
         uploaded = list(files or [])
@@ -889,6 +1146,11 @@ def create_app() -> FastAPI:
                 raise HTTPException(
                     status_code=422,
                     detail="at least one .mp4 is required (an .lrv proxy alone cannot be rendered)",
+                )
+
+            if job.is_multi_ref:
+                return await _upload_media_ref(
+                    job, store, queue, settings, uploaded, camera_role
                 )
 
             if job.package.is_ultimum:
@@ -959,15 +1221,27 @@ def create_app() -> FastAPI:
                     status_code=422,
                     detail=f"s3_key must point to an .mp4 master (got {bad!r})",
                 )
-            if job.package.is_ultimum:
+            if job.staged_by_camera_role:
                 from .selfie import CAMERA_ROLES
 
                 if camera_role not in CAMERA_ROLES:
+                    what = (
+                        "the ultimum package" if job.package.is_ultimum
+                        else f"a job carrying {len(job.media_refs)} media products"
+                    )
                     raise HTTPException(
                         status_code=422,
                         detail=(
-                            f"the ultimum package requires camera_role to be one of "
+                            f"{what} requires camera_role to be one of "
                             f"{list(CAMERA_ROLES)} for an S3 ingest (got {camera_role!r})"
+                        ),
+                    )
+                if job.is_multi_ref and job.ref_for_role(camera_role) is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"no media product on this job for camera_role {camera_role!r} "
+                            f"(have {[r.role for r in job.media_refs]})"
                         ),
                     )
             store.write_booking(job_id, _booking_sidecar(job))
@@ -978,12 +1252,27 @@ def create_app() -> FastAPI:
             # pipeline globs `raw/` when it runs), and clearing it there would let a
             # second render start. `processing` already 409s above.
             retrying = job.status in (JobStatus.failed, JobStatus.rejected)
-            store.update(
-                job_id,
-                status=JobStatus.queued,
-                error=None,
-                **({"processing_dispatched": False} if retrying else {}),
-            )
+            if job.is_multi_ref:
+                # A mixed job's second camera routinely lands after the first product was
+                # rendered and delivered, so its status must NOT be knocked back to
+                # `queued` — that would undo a completed review/delivery. The per-role
+                # guard in `role_ingest` is cleared instead, and only on a real retry.
+                clear: dict[str, object] = {}
+                if retrying and camera_role is not None:
+                    state = job.role_ingest.get(camera_role)
+                    if state is not None:
+                        clear["role_ingest"] = {
+                            **job.role_ingest,
+                            camera_role: state.model_copy(update={"dispatched": False}),
+                        }
+                store.update(job_id, error=None, **clear)
+            else:
+                store.update(
+                    job_id,
+                    status=JobStatus.queued,
+                    error=None,
+                    **({"processing_dispatched": False} if retrying else {}),
+                )
             for key in s3_key:
                 queue.enqueue_s3_ingest(job_id, key, camera_role)
             detail = (
@@ -1039,7 +1328,13 @@ def create_app() -> FastAPI:
         summary="Approve a reviewed edit and deliver it",
     )
     def approve(job_id: JobId, store: StoreDep, queue: QueueDep) -> JobResponse:
-        """Instructor approves the rendered edit; delivery to the customer is queued."""
+        """Instructor approves the rendered edit; delivery to the customer is queued.
+
+        A **load master** is approved the same way, but what follows is the *fan-out*
+        (one gallery offer per customer on its load) rather than a delivery: it has no
+        customer of its own to send anything to. This is the manual counterpart of
+        ``AUTO_DELIVER``'s branch in :func:`api.tasks._maybe_auto_deliver`.
+        """
         job = _load_or_404(store, job_id)
         if job.status != JobStatus.ready_for_review:
             raise HTTPException(
@@ -1047,7 +1342,10 @@ def create_app() -> FastAPI:
                 detail=f"can only approve a job ready_for_review (is {job.status.value})",
             )
         updated = store.update(job_id, status=JobStatus.approved)
-        queue.enqueue_delivery(job_id)
+        if job.job_kind is JobKind.load_master:
+            queue.enqueue_load_fan_out(job_id)
+        else:
+            queue.enqueue_delivery(job_id)
         return JobResponse.from_job(updated)
 
     @app.post(
@@ -1107,11 +1405,50 @@ def create_app() -> FastAPI:
                 principal.instructor_id or "service",
             )
             return JobResponse.from_job(updated)
+        if item in UNLOCK_GROUP_ITEMS:
+            # ONE camera's speculative edit — filmed alongside a purchased one, or on a
+            # jump where nothing was bought at all. It cannot go through the legacy
+            # ``unlock`` above, which moves the job's DEFAULT: a job with media refs gives
+            # every locked deliverable an explicit entry, so that path would take the
+            # money and open nothing.
+            #
+            # Scoped to the item's camera, because the two angles are priced and sold
+            # separately. The group is ``born_locked`` and still locked, so re-running this
+            # is a no-op rather than a re-write: the customer's own edits (never born
+            # locked) can never be swept in, the OTHER camera's locked edit is untouched,
+            # and an already-paid deliverable keeps its original payment reference.
+            group = unlockable_group(job, role=UNLOCK_GROUP_ITEMS[item])
+            if not group:
+                return JobResponse.from_job(job)  # nothing locked to buy — idempotent
+            now = time.time()
+            updated = store.set_deliverable_access(
+                job_id,
+                {
+                    n: job.deliverable_access[n].model_copy(
+                        update={
+                            "entitlement": Entitlement.edited_download,
+                            "paid_at": now,
+                            "payment_reference": body.payment_reference,
+                        }
+                    )
+                    for n in group
+                },
+            )
+            logger.info(
+                "job %s group-unlocked [%s] %s payment=%s by=%s",
+                job_id,
+                UNLOCK_GROUP_ITEMS[item],
+                sorted(group),
+                body.payment_reference,
+                principal.instructor_id or "service",
+            )
+            return JobResponse.from_job(updated)
         if item not in PURCHASABLE_ADDONS:
             raise HTTPException(
                 status_code=400,
                 detail=f"unknown purchasable item {item!r} (one of: unlock, "
-                + ", ".join(sorted(PURCHASABLE_ADDONS)) + ")",
+                + ", ".join(sorted(UNLOCK_GROUP_ITEMS))
+                + ", " + ", ".join(sorted(PURCHASABLE_ADDONS)) + ")",
             )
         if item in job.addons:
             return JobResponse.from_job(job)  # already purchased — idempotent
@@ -1361,15 +1698,97 @@ def create_app() -> FastAPI:
             clips.append((label, str(rel)))
         return clips
 
+    def _media_job(store: JobStore, job: Job) -> Job:
+        """The job whose FILES back ``job``'s gallery — itself, or its load master.
+
+        **The invariant that makes child galleries safe:** the files come from here, the
+        **lock state always comes from the original ``job``**. A ``load_child`` owns no
+        renders of its own; it streams the load master's, and its own ``entitlement``
+        decides whether that means the watermarked preview or the clean master. So
+        unlocking one child flips only that child — every other child on the load keeps
+        getting the preview of the very same file, and the master is never touched.
+
+        Never follow the pointer for a ``jump`` job: a media buyer on a spec-flight load
+        also carries ``source_job_id``, but their own deliverables are theirs and the load
+        video is only an add-on section. A missing/unreadable master degrades to the job
+        itself, so a page renders empty rather than 500ing.
+        """
+        if job.job_kind is not JobKind.load_child or not job.source_job_id:
+            return job
+        try:
+            return store.load(job.source_job_id)
+        except (FileNotFoundError, ValueError):
+            logger.warning(
+                "gallery: load child %s points at missing master %s",
+                job.job_id, job.source_job_id,
+            )
+            return job
+
+    def _product_label(job: Job) -> str:
+        """The hero meta line's product name.
+
+        A child gallery is deliberately NOT labelled with a tandem media product it did not
+        buy — and not with a new ``Package`` member either (that enum is closed, and four
+        properties plus a ``KeyError``-prone label dict enumerate it). "Tandem · Jump Day"
+        is the honest wording from the design's Stage 7: the flyer exited with somebody
+        else, so this is their jump *day* from the air, never their jump.
+        """
+        if job.job_kind is JobKind.load_child:
+            return LOAD_CHILD_PRODUCT_LABEL
+        return job.package.display_label
+
+    def _load_video_tiles(job: Job, settings: Settings) -> tuple[UpsellTile, ...]:
+        """The load-video upsell tile for a media buyer on a spec-flight load, if any.
+
+        Only for a ``jump`` job carrying a ``source_job_id``: a child gallery already *is*
+        the load video (its unlock CTA sells it), so offering it a tile would sell the same
+        customer the same file twice. Unlinked (plain text) when there's no checkout
+        template — the page never dead-links, same rule as the unlock CTA.
+        """
+        if job.job_kind is not JobKind.jump or not job.source_job_id:
+            return ()
+        tile = load_video_tile(job.load_label, settings.preview_price_display)
+        return link_tiles(
+            [tile],
+            template=settings.checkout_url_template,
+            job_id=job.job_id,
+            booking_id=job.booking_id,
+        )
+
+    def _gallery_load_video(store: JobStore, job: Job) -> list[tuple[str, str]]:
+        """The purchased load video: ``(label, deliverable_name)`` from the load master.
+
+        One entry — the master's main cut — not its whole deliverable set: the customer
+        bought "the load's aerial video", and offering them a highlights variant of
+        somebody else's load would be padding. Empty when the pointer is missing or the
+        master has not rendered yet.
+        """
+        if not job.source_job_id:
+            return []
+        try:
+            master = store.load(job.source_job_id)
+        except (FileNotFoundError, ValueError):
+            return []
+        names = [n for n in (master.outputs or {}) if n != "photos"]
+        if not names:
+            return []
+        name = "full_video" if "full_video" in names else names[0]
+        return [(master.load_label or "Load video", name)]
+
     def _gallery_videos(store: JobStore, job: Job) -> list[str]:
-        """The video deliverable names this job's gallery can stream, in order."""
-        names = [n for n in (job.outputs or {}) if n != "photos"]
-        if not names and store.final_path(job.job_id).is_file():
+        """The video deliverable names this job's gallery can stream, in order.
+
+        Resolved against the job that owns the files (see :func:`_media_job`), so a child
+        gallery lists its load master's deliverables.
+        """
+        owner = _media_job(store, job)
+        names = [n for n in (owner.outputs or {}) if n != "photos"]
+        if not names and store.final_path(owner.job_id).is_file():
             names = ["final"]
         return names
 
     def _gallery_photo_names(store: JobStore, job: Job) -> list[str]:
-        index = store.dir(job.job_id) / "photos" / "index.json"
+        index = store.dir(_media_job(store, job).job_id) / "photos" / "index.json"
         if not index.exists():
             return []
         try:
@@ -1392,7 +1811,7 @@ def create_app() -> FastAPI:
         name = "full_video" if "full_video" in video_names else video_names[0]
         bits = ["1080p MP4"]
         try:
-            size = (store.dir(job.job_id) / f"{name}.mp4").stat().st_size
+            size = (store.dir(_media_job(store, job).job_id) / f"{name}.mp4").stat().st_size
         except OSError:
             size = 0
         if size:
@@ -1411,7 +1830,11 @@ def create_app() -> FastAPI:
         never auth. Lock state is computed per request, never from the URL.
         """
         job = _job_by_token(store, token)
-        locked = job.entitlement is Entitlement.preview_only
+        # Wholly locked (Path B) drives the page's own treatment — badges, the unlock CTA
+        # as the primary action, the photo teaser. A MIXED job is not that: the customer
+        # owns something, so the page is the unlocked layout with the spec deliverables
+        # locked card-by-card and their own group CTA.
+        locked = all_locked(job)
         # Purchased add-ons unlock their own section independently of the paywall:
         # a photos purchase opens the grid on a still-locked page, and a raw purchase
         # adds the camera-master players to either state.
@@ -1419,6 +1842,14 @@ def create_app() -> FastAPI:
         raw_clips = (
             [(label, f"/j/{token}/raw/{rel}") for label, rel in _gallery_raw_clips(store, job)]
             if "raw" in job.addons else []
+        )
+        # A media buyer on a spec-flight load who bought the load video: their OWN
+        # deliverables stay the page's main videos, and the load's aerial cut is an extra
+        # section. (A no-media customer's child gallery has no own footage, so the load
+        # video *is* its main video — handled by _gallery_videos/_media_job instead.)
+        load_clips = (
+            [(label, f"/j/{token}/load/{name}") for label, name in _gallery_load_video(store, job)]
+            if LOAD_VIDEO_KEY in job.addons and job.job_kind is JobKind.jump else []
         )
         video_names = _gallery_videos(store, job)
         photo_names = _gallery_photo_names(store, job)
@@ -1439,8 +1870,28 @@ def create_app() -> FastAPI:
             unlock_url = settings.checkout_url_template.format(
                 job_id=job.job_id, booking_id=job.booking_id or "", item="unlock"
             )
+        # Which deliverables are still locked, and one checkout PER CAMERA that buys that
+        # camera's group. Per camera because the two angles are priced and sold separately
+        # — SkydiveOS prices each item; this service never prices anything. Empty for an
+        # ordinary Path-B job (no ``deliverable_access``), which keeps the single
+        # whole-job ``unlock`` CTA it has always had.
+        locked_names = sorted(locked_deliverables(job)) if not locked else []
+        group_unlocks: list[tuple[str, str | None]] = []
+        for role in MEDIA_REF_ROLES:
+            if not unlockable_group(job, role=role):
+                continue
+            url = None
+            if settings.checkout_url_template:
+                url = settings.checkout_url_template.format(
+                    job_id=job.job_id,
+                    booking_id=job.booking_id or "",
+                    item=UNLOCK_GROUP_ITEM_BY_ROLE[role],
+                )
+            group_unlocks.append((UNLOCK_GROUP_LABEL_BY_ROLE[role], url))
+        # The primary action is a download whenever the customer owns SOMETHING — on a
+        # mixed page that is their own edit, not the offer.
         dl_url, dl_note = (None, None) if locked else _primary_download(
-            store, job, token, video_names
+            store, job, token, [n for n in video_names if n not in locked_names]
         )
         html_page = render_gallery_html(
             brand=settings.delivery_brand_name,
@@ -1454,25 +1905,33 @@ def create_app() -> FastAPI:
             ),
             photos_unlocked=not locked or photos_purchased,
             raw_videos=raw_clips,
+            load_videos=load_clips,
             download_all_url=None,
             locked=locked,
+            locked_videos=locked_names,
+            group_unlocks=group_unlocks,
             unlock_url=unlock_url,
             price_display=settings.preview_price_display,
             photo_count_teaser=len(photo_names),
             tabbed=True,
             show_downloads=not locked,
             instructor_name=job.instructor_name,
-            product_label=job.package.display_label,
+            product_label=_product_label(job),
             primary_download_url=dl_url,
             primary_download_note=dl_note,
             # Entitlement-independent: the same row on the locked and unlocked page —
-            # minus tiles already purchased, which have become fulfilled sections.
+            # minus tiles already purchased, which have become fulfilled sections. A media
+            # buyer on a spec-flight load additionally gets the load-video tile, which is
+            # per-job (it names their load) rather than an operator-configured one.
             upsells=[
-                t for t in link_tiles(
-                    settings.upsell_tiles,
-                    template=settings.checkout_url_template,
-                    job_id=job.job_id,
-                    booking_id=job.booking_id,
+                t for t in (
+                    *link_tiles(
+                        settings.upsell_tiles,
+                        template=settings.checkout_url_template,
+                        job_id=job.job_id,
+                        booking_id=job.booking_id,
+                    ),
+                    *_load_video_tiles(job, settings),
                 )
                 if t.key not in job.addons
             ],
@@ -1499,7 +1958,14 @@ def create_app() -> FastAPI:
         """
         job = _job_by_token(store, token)
         return {
-            "locked": job.entitlement is Entitlement.preview_only,
+            # True while ANY deliverable is still behind the paywall — a mixed job whose
+            # spec half is unpaid is still "locked" for the purpose of re-rendering the
+            # page when that changes.
+            "locked": any_locked(job),
+            # Which deliverables are locked, so a mixed page can flip just the cards that
+            # changed. Names only — no paths, no references, nothing the page didn't
+            # already render.
+            "locked_deliverables": sorted(locked_deliverables(job)),
             # Purchased add-on keys (sorted, names only — no references), so an open
             # page can also notice a raw/photos purchase and re-render in place.
             "addons": sorted(job.addons),
@@ -1511,15 +1977,28 @@ def create_app() -> FastAPI:
     ) -> FileResponse:
         """Stream one deliverable to the customer (range-enabled).
 
-        The **entitlement**, never the ``name``, selects the file: a locked
-        (``preview_only``) job serves only its watermarked ``preview_<name>.mp4`` —
-        the clean master is unreachable by any request until ``/unlock``.
+        The **entitlement**, never the ``name``, selects the file: a locked deliverable
+        serves only its watermarked ``preview_<name>.mp4`` — the clean master is
+        unreachable by any request until it is paid for.
+
+        Asked **per deliverable** (:func:`api.jobs.entitlement_for`), which is what makes a
+        mixed job servable: on a jump where the handcam edit was bought and a
+        camera-flyer edit was filmed on spec, the same page streams clean bytes for one
+        and watermarked bytes for the other. A job-level answer would have to either leak
+        the unbought edit or watermark the bought one.
+
+        For a child gallery on a spec-flight load, the *directory* is the load master's
+        (:func:`_media_job`) while the lock is still **this** job's. That is what lets
+        several customers share one render and unlock independently: the pair
+        ``(master's file, this customer's lock)`` is evaluated per request.
         """
         job = _job_by_token(store, token)
         if not _is_safe_segment(name) or name not in _gallery_videos(store, job):
             raise HTTPException(status_code=404, detail="no such video")
-        job_dir = store.dir(job.job_id)
-        if job.entitlement is Entitlement.preview_only:
+        owner = _media_job(store, job)
+        job_dir = store.dir(owner.job_id)
+        locked = entitlement_for(job, name) is Entitlement.preview_only
+        if locked:
             path = preview_path(job_dir, name)
         else:
             path = job_dir / f"{name}.mp4"
@@ -1528,11 +2007,13 @@ def create_app() -> FastAPI:
         # Disk-retention fallback (scripts/prune_jobs.py): a pruned clean master is
         # still in S3 under deliveries/, so the never-expiring gallery link keeps
         # working — redirect to a short-lived presigned URL minted per request.
-        # NEVER for a locked job: its watermarked previews are local-only by design,
+        # NEVER for a locked deliverable: its watermarked preview is local-only by design,
         # and a presigned master URL is the paywall bypass. The pruner refuses to
-        # remove a locked job's previews for the same reason.
-        if job.entitlement is not Entitlement.preview_only:
-            url = _presigned_delivery_url(job.job_id, f"{name}.mp4", settings)
+        # remove a locked deliverable's preview for the same reason.
+        if not locked:
+            # Keyed on the job that OWNS the file, since that is the prefix its renders
+            # were uploaded under (``deliveries/{owner}/…``).
+            url = _presigned_delivery_url(owner.job_id, f"{name}.mp4", settings)
             if url:
                 return RedirectResponse(url, status_code=302)  # type: ignore[return-value]
         raise HTTPException(status_code=404, detail="video not found")
@@ -1545,11 +2026,39 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="photos unlock with the full video")
         if not _is_safe_segment(filename):
             raise HTTPException(status_code=400, detail="invalid photo filename")
-        photos_dir = store.dir(job.job_id) / "photos"
+        photos_dir = store.dir(_media_job(store, job).job_id) / "photos"
         path = photos_dir / filename
         if not path.exists() or not _served_under(path, photos_dir):
             raise HTTPException(status_code=404, detail="photo not found")
         return FileResponse(path, media_type="image/jpeg", filename=filename)
+
+    @app.get("/j/{token}/load/{name}", include_in_schema=False, response_class=FileResponse)
+    def public_load_video(token: str, name: str, store: StoreDep) -> FileResponse:
+        """Stream the purchased spec-flight load video from its load master.
+
+        Same rule as every other public media route: the **purchase**, never the URL,
+        opens the file — without ``load_video`` in ``Job.addons`` every path here 404s.
+        The bytes served are the load master's *clean* render, because that is precisely
+        what was bought; the master's own ``preview_only`` entitlement is about ITS
+        (never-handed-out) gallery, not about who may buy the cut.
+
+        Only for a ``jump`` job: a ``load_child`` streams the load video through
+        ``/media/{name}`` under its own lock state, and routing it here would serve the
+        clean master to a customer who hasn't unlocked.
+        """
+        job = _job_by_token(store, token)
+        if job.job_kind is not JobKind.jump or LOAD_VIDEO_KEY not in job.addons:
+            raise HTTPException(status_code=404, detail="the load video is a paid add-on")
+        if not _is_safe_segment(name):
+            raise HTTPException(status_code=400, detail="invalid deliverable")
+        allowed = {n for _, n in _gallery_load_video(store, job)}
+        if name not in allowed:
+            raise HTTPException(status_code=404, detail="no such load video")
+        master_dir = store.dir(str(job.source_job_id))
+        path = master_dir / f"{name}.mp4"
+        if not path.is_file() or not _served_under(path, master_dir):
+            raise HTTPException(status_code=404, detail="load video not found")
+        return FileResponse(path, media_type="video/mp4", filename=f"{name}.mp4")
 
     @app.get("/j/{token}/raw/{name:path}", include_in_schema=False, response_class=FileResponse)
     def public_raw(token: str, name: str, store: StoreDep) -> FileResponse:
@@ -1691,6 +2200,31 @@ def create_app() -> FastAPI:
         if not removed:
             raise HTTPException(status_code=404, detail="no music uploaded for this deliverable")
         return _music_slots(store, job)
+
+    # ----------------------------------------------------------------------- #
+    # SD-card ingest status: the operator-facing "safe to remove" signal.
+    # ----------------------------------------------------------------------- #
+
+    @app.get(
+        "/ingest/cards",
+        response_model=list[CardIngestStatus],
+        tags=["cameras"],
+        summary="Live SD-card ingest status (progress + safe-to-remove)",
+    )
+    def list_card_ingest_status(request: Request) -> list[CardIngestStatus]:
+        """Per-card pull progress for the operator standing at the card reader.
+
+        Populated only under ``CAMERA_SCANNER=sdcard`` with discovery enabled;
+        empty otherwise. ``safe_to_remove`` means the pull loop finished and the
+        card is idle — the S3 upload + SkydiveOS notify run from the *staged*
+        copy and no longer need the card. The route only reads the in-memory
+        registry (never the mount), so polling it is free. SkydiveOS polls it
+        via its backend proxy so the service token stays server-side.
+        """
+        tracker = getattr(request.app.state, "card_status", None)
+        if tracker is None:
+            return []
+        return [CardIngestStatus(**entry) for entry in tracker.snapshot()]
 
     # ----------------------------------------------------------------------- #
     # Camera registry: the paired-camera allow-list that auto-discovery reads.

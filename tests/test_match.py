@@ -16,9 +16,13 @@ import pytest
 from ingest.match import (
     AmbiguousMatch,
     Candidate,
+    LoadCandidate,
     NoBookingMatch,
+    NoLoadMatch,
+    NotSpecFlight,
     package_and_entitlement_for,
     package_for,
+    select_load,
     select_match,
 )
 
@@ -40,6 +44,92 @@ def _cand(
         jumper={"booking": "b", "customer": "c"},
         role=role,
     )
+
+
+def _load(
+    *,
+    load_id: str = "L1",
+    number: int = 1,
+    day: str | None = "2026-07-21",
+    departure: datetime | None = None,
+    jumpers: list[dict] | None = None,
+) -> LoadCandidate:
+    return LoadCandidate(
+        load_id=load_id,
+        load_number=number,
+        departure_local=departure,
+        business_day=day,
+        load={"_id": load_id, "loadNumber": number, "jumpers": jumpers or []},
+    )
+
+
+class TestSelectLoad:
+    """The spec-flight load pick: same causal rule as jumpers, but the window is a MUST.
+
+    A spec flyer holds no slot on the manifest, so the capture timestamp is the only
+    evidence tying his card to a load. That is why these tests care so much about the
+    window: relaxing it is what would turn footage shot on the ground between loads into
+    a "load video" offered to five customers who were never on it.
+    """
+
+    def test_no_candidates_refuses(self) -> None:
+        with pytest.raises(NoLoadMatch):
+            select_load([], datetime(2026, 7, 21, 13, 5), captured_day="2026-07-21")
+
+    def test_lone_load_must_still_contain_the_clip(self) -> None:
+        """The one behavioural difference from select_match, and the reason it exists.
+
+        A single jumper-keyed candidate is accepted without a window check (the jumper
+        predicate is itself evidence). A single *load* is not: a clip captured at 22:00
+        does not belong to the day's only 09:00 load just because nothing else is on offer.
+        """
+        far_off = [_load(departure=datetime(2026, 7, 21, 9, 0))]
+        with pytest.raises(NoLoadMatch):
+            select_load(far_off, datetime(2026, 7, 21, 22, 0), captured_day="2026-07-21")
+
+        # …and the same lone load DOES match a clip inside its window.
+        got = select_load(far_off, datetime(2026, 7, 21, 9, 20), captured_day="2026-07-21")
+        assert got.load_id == "L1"
+
+    def test_overlapping_windows_resolve_to_the_latest_departure(self) -> None:
+        """WINDOW_POST is 2.5 h, so a 12:05 clip sits in the 10:00, 11:00 and 12:00 windows."""
+        loads = [
+            _load(load_id="L10", number=1, departure=datetime(2026, 7, 21, 10, 0)),
+            _load(load_id="L11", number=2, departure=datetime(2026, 7, 21, 11, 0)),
+            _load(load_id="L12", number=3, departure=datetime(2026, 7, 21, 12, 0)),
+        ]
+        got = select_load(loads, datetime(2026, 7, 21, 12, 5), captured_day="2026-07-21")
+        assert got.load_id == "L12"  # footage can't precede its own flight
+
+    def test_clip_before_every_departure_takes_the_earliest(self) -> None:
+        loads = [
+            _load(load_id="L11", departure=datetime(2026, 7, 21, 11, 0)),
+            _load(load_id="L12", departure=datetime(2026, 7, 21, 12, 0)),
+        ]
+        got = select_load(loads, datetime(2026, 7, 21, 10, 45), captured_day="2026-07-21")
+        assert got.load_id == "L11"  # can only be the next flight up
+
+    def test_business_day_narrows_before_the_window(self) -> None:
+        loads = [
+            _load(load_id="Lyest", day="2026-07-20", departure=datetime(2026, 7, 21, 13, 0)),
+            _load(load_id="Ltoday", day="2026-07-21", departure=datetime(2026, 7, 21, 13, 0)),
+        ]
+        got = select_load(loads, datetime(2026, 7, 21, 13, 5), captured_day="2026-07-21")
+        assert got.load_id == "Ltoday"
+
+    def test_two_loads_sharing_a_departure_refuse(self) -> None:
+        dep = datetime(2026, 7, 21, 13, 0)
+        loads = [_load(load_id="La", departure=dep), _load(load_id="Lb", departure=dep)]
+        with pytest.raises(AmbiguousMatch):
+            select_load(loads, datetime(2026, 7, 21, 13, 5), captured_day="2026-07-21")
+
+    def test_a_load_with_no_departure_never_matches(self) -> None:
+        with pytest.raises(NoLoadMatch):
+            select_load(
+                [_load(departure=None)],
+                datetime(2026, 7, 21, 13, 5),
+                captured_day="2026-07-21",
+            )
 
 
 class TestPackageFor:
@@ -96,9 +186,12 @@ class TestSelectMatch:
         assert len(ei.value.candidates) == 2
 
     def test_different_day_dropped_leaving_one(self):
-        dep = datetime(2026, 7, 21, 13, 0)
-        today = _cand(load_id="L1", day="2026-07-21", departure=dep)
-        other = _cand(load_id="L2", day="2026-07-20", departure=dep)
+        # Yesterday's load departs YESTERDAY: its window is a day away from the clip, so
+        # the day check drops it. (The previous day is only eligible when its flight
+        # window still contains the clip — the just-after-midnight case, covered by
+        # ``test_a_load_that_departed_before_midnight_still_owns_a_post_midnight_clip``.)
+        today = _cand(load_id="L1", day="2026-07-21", departure=datetime(2026, 7, 21, 13, 0))
+        other = _cand(load_id="L2", day="2026-07-20", departure=datetime(2026, 7, 20, 13, 0))
         got = select_match([today, other], self._cap, captured_day=self._day)
         assert got.load_id == "L1"
 
@@ -362,7 +455,7 @@ class TestResolveForStaff:
         matcher._db["staffs"] = self._SerialStaffs()
         seen: dict[str, object] = {}
 
-        def _spy(staff_id, captured_at, *, staff_name=None):
+        def _spy(staff_id, captured_at, *, staff_name=None, clip_ref=None):
             seen.update(staff_id=staff_id, staff_name=staff_name)
             return "sentinel"
 
@@ -393,3 +486,109 @@ class TestResolveForStaff:
         monkeypatch.delenv("MONGO_URL", raising=False)
         with pytest.raises(RegistryUnavailable):
             FootageMatcher(None).resolve_for_staff("s1", "2026-07-21T13:05:00")
+
+    # -- the spec-flight (load master) path -------------------------------------- #
+
+    def _spec_matcher(self, *, flyer="marc", jumpers=None):
+        """A matcher whose one load carries ``jumpers`` and (by default) NOT the flyer."""
+        from ingest.match import FootageMatcher
+
+        load = {
+            "_id": "L17",
+            "status": "planned",
+            "loadNumber": 17,
+            "businessDate": datetime(2026, 7, 21),
+            "departureTime": datetime(2026, 7, 21, 13, 0),
+            "jumpers": jumpers
+            if jumpers is not None
+            else [
+                # Two media buyers and two who bought nothing — the fan-out's two tiers.
+                {"instructor": "i1", "customer": "c1", "booking": "b1",
+                 "mediaPackage": "video", "videoType": "inside"},
+                {"instructor": "i1", "customer": "c2", "booking": "b2",
+                 "mediaPackage": "none"},
+                {"instructor": "i2", "customer": "c3", "booking": "b3",
+                 "mediaPackage": None},
+                {"instructor": "i2", "customer": "c4", "booking": "b4",
+                 "mediaPackage": "photos"},
+            ],
+        }
+        # clock_tz pinned to UTC so the naive capture strings below are taken at face
+        # value: the load path insists the clip fall inside a flight window, so a dev
+        # box's real $CAMERA_CLOCK_TZ would silently shift these clips out of it.
+        matcher = FootageMatcher("mongodb://unused-in-test", clock_tz="UTC")
+        matcher._db = {
+            "staffs": self._Coll([{"_id": flyer, "firstName": "Marc", "lastName": "T"}]),
+            "loads": self._Coll([load]),
+            "customers": self._Coll([
+                {"_id": "c1", "email": "one@x.test", "firstName": "Daniel"},
+                {"_id": "c2", "email": "two@x.test", "firstName": "Priya"},
+                {"_id": "c3", "email": "three@x.test", "firstName": "Kevin"},
+                {"_id": "c4", "email": "four@x.test", "firstName": "Aisha"},
+            ]),
+        }
+        return matcher
+
+    def test_resolve_load_returns_the_whole_manifest_roster(self) -> None:
+        """A spec flight resolves to the LOAD, with every jumper's tier already decided."""
+        r = self._spec_matcher().resolve_load_for_staff("marc", "2026-07-21T13:05:00")
+
+        assert (r.load_id, r.load_number, r.label) == ("L17", 17, "Load 17")
+        assert r.staff_name == "Marc T"
+        assert [j.customer_name for j in r.jumpers] == [
+            "Daniel", "Priya", "Kevin", "Aisha",
+        ]
+        # bought_media is the fan-out's fork: a tile for buyers, a child gallery for the
+        # rest. "photos" counts as a purchase; "none"/None/"" do not.
+        assert [j.bought_media for j in r.jumpers] == [True, False, False, True]
+        assert [j.jumper_index for j in r.jumpers] == [0, 1, 2, 3]
+        assert r.jumpers[1].customer_email == "two@x.test"
+
+    def test_resolve_load_refuses_when_the_flyer_has_an_assigned_customer(self) -> None:
+        """v1 is spec flights only: an assigned flyer's footage is his customer's product.
+
+        Building a load master from it would need the customer's personal scenes excluded
+        from four strangers' videos, which scene labels cannot guarantee (the
+        clip-position heuristic in AUDIT_SCENE_LABELS.md). So refuse rather than promise it.
+        """
+        matcher = self._spec_matcher(
+            jumpers=[
+                {"instructor": "i1", "assignedCameraman": "marc", "customer": "c1",
+                 "booking": "b1", "mediaPackage": "video-photos", "videoType": "both"},
+            ]
+        )
+        with pytest.raises(NotSpecFlight, match="assignedCameraman"):
+            matcher.resolve_load_for_staff("marc", "2026-07-21T13:05:00")
+
+    def test_resolve_load_refuses_footage_outside_every_window(self) -> None:
+        """Ground footage shot between loads must resolve to nothing, not the nearest load."""
+        with pytest.raises(NoLoadMatch):
+            self._spec_matcher().resolve_load_for_staff("marc", "2026-07-21T22:00:00")
+
+    def test_resolve_load_skips_cancelled_loads(self) -> None:
+        matcher = self._spec_matcher()
+        matcher._db["loads"]._docs[0]["status"] = "cancelled"
+        with pytest.raises(NoLoadMatch):
+            matcher.resolve_load_for_staff("marc", "2026-07-21T13:05:00")
+
+    def test_resolve_load_serial_path_delegates(self, monkeypatch) -> None:
+        """``resolve_load`` is the serial shim over ``resolve_load_for_staff``."""
+        matcher = self._spec_matcher()
+        matcher._db["staffs"] = self._SerialStaffs()
+        seen: dict[str, object] = {}
+
+        def _spy(staff_id, captured_at, *, staff_name=None, clip_ref=None):
+            seen.update(staff_id=staff_id, staff_name=staff_name)
+            return "sentinel"
+
+        monkeypatch.setattr(matcher, "resolve_load_for_staff", _spy)
+        assert matcher.resolve_load("4313", "2026-07-21T13:05:00") == "sentinel"
+        assert seen == {"staff_id": "s1", "staff_name": "Greg B"}
+
+    def test_resolve_load_requires_db(self, monkeypatch) -> None:
+        from ingest.match import FootageMatcher, RegistryUnavailable
+
+        monkeypatch.delenv("MONGO_URL", raising=False)
+        with pytest.raises(RegistryUnavailable):
+            FootageMatcher(None).resolve_load_for_staff("s1", "2026-07-21T13:05:00")
+

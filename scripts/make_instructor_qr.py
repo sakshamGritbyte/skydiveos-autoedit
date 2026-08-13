@@ -2,7 +2,8 @@
 """Generate the printable QR codes instructors film to claim an SD-card session.
 
 The SD-card ingest flow (``CAMERA_SCANNER=sdcard``) attributes footage to whoever
-filmed a short clip of their QR code at the start of the recording session
+filmed a short clip of their QR code during the recording session — at the start,
+at the end, or anywhere in between; attribution is card-level, not sequential
 (:mod:`ingest.qr`). Each code's payload is ``skydiveos-staff:<staffs._id>`` — the
 SkydiveOS staff document id, NOT the auto-edit camera registry's instructor id
 (the two differ; see ``ingest/match.py``). This script writes one captioned,
@@ -17,9 +18,11 @@ Usage::
     python scripts/make_instructor_qr.py --all
 
 Print each PNG at least ~10 cm wide and laminate it. Filming guidance for the
-instructor: hold the code steady and roughly a third of the frame for 3–5 seconds
-at the start of the session — that clip becomes the session marker and is dropped
-from the edit.
+instructor: hold the code steady and roughly a third of the frame for 3–5 seconds,
+once per session — before the first jump or after the last, whichever is easier.
+That clip becomes the session marker and is dropped from the edit. Only when one
+card carries TWO OR MORE people's sessions does consistency matter: then everyone
+should film on the same side of their session (all at the start, or all at the end).
 
 Exits non-zero on an unknown staff id or an empty staff collection.
 """
@@ -47,8 +50,14 @@ def _slug(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-").lower() or "instructor"
 
 
-def _render(staff_id: str, name: str, out_dir: Path) -> Path:
-    """Encode + caption one instructor's QR; returns the written PNG path."""
+def _render(
+    staff_id: str, name: str, out_dir: Path, *, payload: str | None = None,
+    file_stem: str | None = None,
+) -> Path:
+    """Encode + caption one QR card; returns the written PNG path.
+
+    ``payload`` defaults to the instructor payload ``skydiveos-staff:<staff_id>``.
+    """
     try:
         import cv2
         import numpy as np
@@ -61,7 +70,7 @@ def _render(staff_id: str, name: str, out_dir: Path) -> Path:
     params = cv2.QRCodeEncoder.Params()
     params.correction_level = cv2.QRCodeEncoder_CORRECT_LEVEL_H
     encoder = cv2.QRCodeEncoder.create(params)
-    code = encoder.encode(f"{QR_STAFF_PREFIX}{staff_id}")
+    code = encoder.encode(payload or f"{QR_STAFF_PREFIX}{staff_id}")
 
     module_px = max(1, _QR_SIZE_PX // code.shape[0])
     quiet = _QUIET_MODULES * module_px
@@ -95,8 +104,8 @@ def _render(staff_id: str, name: str, out_dir: Path) -> Path:
     # Two staff docs can share a display name (real DBs have duplicates); the id
     # suffix keeps one from silently overwriting the other's code — handing the
     # wrong laminate to an instructor mis-attributes every session they film.
-    out = out_dir / f"{_slug(name)}.png"
-    if out.exists():
+    out = out_dir / f"{file_stem or _slug(name)}.png"
+    if file_stem is None and out.exists():
         out = out_dir / f"{_slug(name)}-{staff_id[-6:]}.png"
     page.save(out)
     return out
@@ -155,7 +164,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("either --all, or both --staff-id and --name")
     out = _render(args.staff_id, args.name, out_dir)
     print(f"{out}  <- {args.name} ({args.staff_id})")
-    print("Print at >=10 cm wide; film it steady for 3-5 s at the start of the session.")
+    print(
+        "Print at >=10 cm wide; film it steady for 3-5 s once per session — start "
+        "or end, either works."
+    )
     return 0
 
 

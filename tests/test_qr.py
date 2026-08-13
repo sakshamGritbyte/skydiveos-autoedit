@@ -176,7 +176,13 @@ def test_long_clip_is_skipped_not_decoded(
 # --------------------------------------------------------------------------- #
 
 
-def _stage(day_dir: Path, name: str, epoch: float, *, staff: str | None = None) -> None:
+def _stage(
+    day_dir: Path,
+    name: str,
+    epoch: float,
+    *,
+    staff: str | None = None,
+) -> None:
     """Fabricate one staged clip: MP4 stub + .ingest.json manifest + .qr.json sidecar."""
     day_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(name).stem
@@ -196,6 +202,7 @@ def _stage(day_dir: Path, name: str, epoch: float, *, staff: str | None = None) 
 
 
 def test_session_index_attributes_clips_between_markers(tmp_path: Path) -> None:
+    """Two staff sessions with leading markers: the historical walk still holds."""
     day = tmp_path / "4313" / "2026-08-04"
     _stage(day, "GX010001.MP4", 100.0, staff="staff-A")  # marker A
     _stage(day, "GX010002.MP4", 200.0)
@@ -211,21 +218,81 @@ def test_session_index_attributes_clips_between_markers(tmp_path: Path) -> None:
     assert index.identity_for(day / "GX010005.MP4") == ClipIdentity("staff-B")
 
 
-def test_clips_before_first_marker_get_no_staff(tmp_path: Path) -> None:
+def test_single_staff_marker_claims_the_whole_card_wherever_it_sits(tmp_path: Path) -> None:
+    """Marker position is not a protocol: one staff on the card → every clip is theirs,
+    including clips filmed BEFORE the marker (instructor scans at the end of the day)."""
     day = tmp_path / "4313" / "2026-08-04"
-    _stage(day, "GX010001.MP4", 100.0)  # card started mid-session
-    _stage(day, "GX010002.MP4", 200.0, staff="staff-A")
-    _stage(day, "GX010003.MP4", 300.0)
+    _stage(day, "GX010001.MP4", 100.0)  # jump filmed before the scan
+    _stage(day, "GX010002.MP4", 200.0)
+    _stage(day, "GX010003.MP4", 300.0, staff="staff-A")  # marker filmed LAST
+    index = build_session_index(day)
+    assert index.identity_for(day / "GX010001.MP4") == ClipIdentity("staff-A")
+    assert index.identity_for(day / "GX010002.MP4") == ClipIdentity("staff-A")
+
+    # …and a marker in the middle behaves identically.
+    day2 = tmp_path / "4313" / "2026-08-05"
+    _stage(day2, "GX010001.MP4", 100.0)
+    _stage(day2, "GX010002.MP4", 200.0, staff="staff-A")  # scanned between jumps
+    _stage(day2, "GX010003.MP4", 300.0)
+    index2 = build_session_index(day2)
+    assert index2.identity_for(day2 / "GX010001.MP4") == ClipIdentity("staff-A")
+    assert index2.identity_for(day2 / "GX010003.MP4") == ClipIdentity("staff-A")
+
+
+def test_two_staff_with_trailing_markers_is_inferred_from_the_layout(tmp_path: Path) -> None:
+    """clips → marker A → clips → marker B (nothing after B): the markers can only be
+    END-of-session scans, so each clip belongs to the NEXT marker's staff."""
+    day = tmp_path / "4313" / "2026-08-04"
+    _stage(day, "GX010001.MP4", 100.0)  # A's jump
+    _stage(day, "GX010002.MP4", 200.0)  # A's jump
+    _stage(day, "GX010003.MP4", 300.0, staff="staff-A")  # A scans when handing over
+    _stage(day, "GX010004.MP4", 400.0)  # B's jump
+    _stage(day, "GX010005.MP4", 500.0, staff="staff-B")  # B scans at day's end
 
     index = build_session_index(day)
+    assert index.direction == "trailing"
+    assert index.identity_for(day / "GX010001.MP4") == ClipIdentity("staff-A")
+    assert index.identity_for(day / "GX010002.MP4") == ClipIdentity("staff-A")
+    assert index.identity_for(day / "GX010004.MP4") == ClipIdentity("staff-B")
+
+
+def test_two_staff_ambiguous_layout_falls_back_to_leading(tmp_path: Path) -> None:
+    """Clips on BOTH outer edges read either way — keep the historical rule, so the
+    orphan before the first marker stays unclaimed (serial fallback downstream)."""
+    day = tmp_path / "4313" / "2026-08-04"
+    _stage(day, "GX010001.MP4", 100.0)  # before every marker
+    _stage(day, "GX010002.MP4", 200.0, staff="staff-A")
+    _stage(day, "GX010003.MP4", 300.0)
+    _stage(day, "GX010004.MP4", 400.0, staff="staff-B")
+    _stage(day, "GX010005.MP4", 500.0)  # after every marker
+
+    index = build_session_index(day)
+    assert index.direction == "leading"
     assert index.identity_for(day / "GX010001.MP4") == ClipIdentity(None)
     assert index.identity_for(day / "GX010003.MP4") == ClipIdentity("staff-A")
+    assert index.identity_for(day / "GX010005.MP4") == ClipIdentity("staff-B")
 
 
 def test_session_index_with_no_markers(tmp_path: Path) -> None:
     day = tmp_path / "4313" / "2026-08-04"
     _stage(day, "GX010001.MP4", 100.0)
     assert build_session_index(day).identity_for(day / "GX010001.MP4") == ClipIdentity(None)
+
+
+def test_from_clips_builds_the_same_index_without_manifests(tmp_path: Path) -> None:
+    """check_sdcard.py reads straight off the mount (no .ingest.json): from_clips must
+    reach the same attribution the pipeline's manifest walk would."""
+    from ingest.qr import QrSessionIndex
+
+    index = QrSessionIndex.from_clips(
+        [
+            ("GX010001.MP4", 100.0, None),
+            ("GX010002.MP4", 200.0, None),
+            ("GX010003.MP4", 300.0, "staff-A"),  # marker last
+        ]
+    )
+    assert index.identity_for("GX010001.MP4") == ClipIdentity("staff-A")
+    assert index.identity_for("GX010003.MP4").is_qr_marker is True
 
 
 # --------------------------------------------------------------------------- #

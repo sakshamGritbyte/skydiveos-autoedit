@@ -180,6 +180,36 @@ Two runtime media roots, with different audiences:
   hand-off `_materialize` uses the load-derived role over the registry's static hint,
   falling back to the hint (never blocking) when the capture time is unreadable or the
   match is unknown/ambiguous.
+- **The matcher decides a jumper's products PER CAMERA, from the add-on docs — not from
+  the jumper's derived union** (`ingest.match.resolve_media_products`, read from
+  `jumper.mediaAddOnRefs` → the `bookingpackages` catalogue). The union
+  (`mediaPackage`/`videoType`, what `package_for` reads) cannot express this and gets two
+  things wrong on its own: a **pair** of inside+outside products derives
+  `videoType: 'both'`, indistinguishable from a genuine `ultimum` booking — which *merges*
+  the cameras, and a merged clip cannot be half-locked; and a lone **spec twin** carries
+  the same `mediaType` as the paid product it twins (it *is* that product, at $0), so the
+  union reads it as a purchase and hands the unpaid edit over clean. Identification is
+  **structural, never by name** (SkydiveOS's BUG 156 — names are staff-editable):
+  `mediaType`, `videoAngle` (+ scene `cameraSource`), `isTwoCameraVideo`, `specOf`. The
+  rule the per-camera resolution enforces is:
+  **whoever filmed gets a deliverable — covered by an add-on → that add-on's entitlement;
+  not covered → `preview_only`.** Which cameras filmed is read off the *slots*
+  (`jumper.instructor`, `jumper.assignedCameraman`), never off the products: an assigned
+  cameraman filmed whether or not anybody bought his angle, and that footage is exactly
+  what the paywall exists to offer. So a jumper who bought nothing but had a flyer sent up
+  gets BOTH edits watermarked on one link, and one who bought only the cameraman's angle
+  still has the handcam's offered rather than discarded. It **fails closed** by
+  construction. It answers the **no-add-on** jumper too, from the slots alone: one camera
+  → the plain Path B job exactly as before; two → both locked, which is what stops a
+  manually-assigned flyer's footage landing in the handcam's `raw/` and rendering as one
+  edit of two mixed cameras. `(None, None, [])` — a jumper who **did** buy but has no
+  `mediaAddOnRefs` (a legacy row: guessing would demote a real `ultimum` booking,
+  `videoType: 'both'` with no refs, to two speculative single-camera products),
+  `ultimum` beside another product, an unclassifiable add-on, or two products on one
+  camera — defers to the union, so legacy behaviour is byte-identical. The `bridge`
+  mirrors this: `_job_payload` sends `media_refs` only when more than one resolved, and
+  `state["jumps"]` (`"{load_id}:{jumper_index}" → job_id`) makes the SECOND camera's card
+  attach to the job the first opened rather than creating a second job, link and email.
 - **Per-deliverable music** can be uploaded per job *before* processing
   (`POST /jobs/{id}/upload` for footage, `POST /jobs/{id}/music` for tracks), stored at
   `jobs/<id>/music/<deliverable>.<ext>` (deliverable ∈ `Package.music_deliverables`).
@@ -217,8 +247,9 @@ Two runtime media roots, with different audiences:
     the product, and the raw footage is archived so a re-queue is cheap. An
     `edited_download` job returns early and gains no new failure mode.
   * **The entitlement — never the URL — picks the file** at `GET /j/{code}/media/{name}`:
-    while locked the clean master is unreachable at any URL. `locked` is computed **per
-    request**, so unlock flips the page with no regeneration.
+    while locked the clean master is unreachable at any URL. Asked **per deliverable**
+    (`api.jobs.entitlement_for`) and computed **per request**, so unlock flips the page
+    with no regeneration and a mixed jump serves clean and watermarked bytes side by side.
   * **`POST /jobs/{id}/unlock` is idempotent and never touches `status`** — it sets
     `entitlement`+`paid_at`+`payment_reference` only, staying clear of the
     review/delivery machine (notably the `ready` vs `ready_for_review` approve quirk).
@@ -228,6 +259,24 @@ Two runtime media roots, with different audiences:
     SkydiveOS calls it server-to-server from the payment-captured seam
     (`paymentEventHandler` → `autoEditOrchestrationService.unlockPaidMedia`), gated on
     `paymentScope === 'media-unlock'` so paying for the *jump* never unlocks media.
+    On any job carrying `media_refs` that legacy `item: "unlock"` buys nothing — it moves
+    the job's *default*, and every locked deliverable there carries an explicit entry — so
+    a speculative group is bought **per camera**: `item: "unlock_instructor"` /
+    `"unlock_external"` (`api.app.UNLOCK_GROUP_ITEM_BY_ROLE`) →
+    `unlockable_group(job, role=…)`, which flips that camera's `born_locked` deliverables,
+    records the reference on each, and leaves `entitlement`/`status`, the customer's own
+    edit, **and the other camera's locked edit** untouched. Idempotent for the same
+    reason: the group is "born locked AND still locked", so a retried webhook finds nothing
+    to do. **Per camera because the two angles sell separately** — on a jump where nothing
+    was bought BOTH edits are born locked (the handcam films every tandem; a flyer took the
+    open seat), and a customer who wants only the outside angle must be able to buy only
+    that; one unscoped payment would hand over both. The role is *derived* from the
+    deliverable name (`api.jobs.role_for_deliverable`, the inverse of `deliverable_name`)
+    rather than stored, so it cannot drift from the one naming authority. The gallery
+    mirrors this: one CTA per still-locked camera, and the whole-job `unlock` CTA is
+    **suppressed** whenever any per-camera offer exists — leaving it there would take a
+    payment and open nothing. A plain Path-B job (no `deliverable_access`, no refs) has no
+    per-camera groups and keeps its single `unlock` CTA exactly as before.
   * **A locked job is delivered as the `/j/{code}` gallery or not at all**
     (`api/delivery.py`). A presigned URL answers to whoever holds it — there is no
     entitlement check on a URL — so a `preview_only` job mints **none**: the masters
@@ -237,6 +286,48 @@ Two runtime media roots, with different audiences:
     which embeds presigned *clean masters* and would hand over the unbought edit
     (it also persists them on the job, mirrors them into the archive manifest, and
     forwards them to SkydiveOS).
+- **One jumper can hold TWO media products, on ONE job and ONE link** — a paid handcam
+  package plus a **spec twin** filmed by a camera flyer (SkydiveOS's `BookingPackage.specOf`;
+  Rev 04 replaces the cancelled load-master architecture). SkydiveOS sends them as
+  `media_refs` on `POST /jobs`: `[{role, package, entitlement}]`, at most one per camera
+  role, whose **primary** ref (the paid one, else the instructor's) must mirror the
+  top-level `package`/`entitlement`. Omitted — or a single entry — is the ordinary job and
+  behaves **byte-identically to before**; `Job.is_multi_ref` (`len(media_refs) > 1`) is the
+  only thing anything branches on. Five rules:
+  * **The lock is per DELIVERABLE, not per job** (`Job.deliverable_access`,
+    `api.jobs.entitlement_for`). A single `entitlement` scalar cannot serve a mixed jump:
+    `edited_download` hands over the unpaid external edit clean and `preview_only`
+    watermarks a video the customer paid for ("a paid customer left locked is the worst
+    failure this module has"). An **absent** entry inherits `Job.entitlement`, which is
+    what makes an empty map identical to every job written before the field.
+  * **Each ref renders on its own, from its own camera** (`api.selfie.run_media_ref_pipeline`,
+    one `process_media_ref_job` per role, per-role settle + dispatch in `Job.role_ingest`).
+    Deliberately NOT the Ultimate pipeline, which *merges* the cameras — a merged clip
+    cannot be half-locked. The paid edit ships as soon as ITS clips are quiet; the spec
+    edit joins the same gallery whenever its card turns up (the page is a live route, so a
+    deliverable added later simply appears, and `send_gallery_email_once` keeps it to one
+    email). The primary ref keeps the plain deliverable names, every other ref is
+    namespaced `<role>_<name>` (`api.jobs.deliverable_name`) so both renders share one
+    `outputs` map.
+  * **`outputs` is merged, never replaced** (`JobStore.set_pipeline_outputs`, `owns=`).
+    The four render sites pass `owns=None` (a wholesale replace, exactly as before); a
+    per-role pass names the set it owns, so it drops only its own stale keys. Without this
+    the second render deletes the first's deliverables from the gallery — which lists
+    `outputs` keys — while their bytes linger.
+  * **Photos come from the PAID ref only.** `photos` is one `outputs` key, one directory
+    and one grid, so it carries exactly one lock state; a set built from both a bought and
+    a speculative camera could be neither cleanly served nor cleanly withheld.
+  * **The per-deliverable state is what SkydiveOS is told**, on the status callback and
+    on `JobResponse`, as `deliverable_entitlements` — fully **resolved** (every video
+    deliverable, not just the explicit entries) so nothing over there reimplements the
+    inherit-from-job rule, and sent **only** when `deliverable_access` is non-empty so an
+    ordinary job's payload stays byte-identical. Without it their offer page falls back to
+    the job's `entitlement`, reads `edited_download`, and gives the speculative edit away.
+  * **A paid deliverable is never re-locked.** A replay or tweak re-seeds
+    `deliverable_access` and the ref's *birth* entitlement is still `preview_only`, so the
+    seed preserves any entry that has been bought (`api.selfie._seed_deliverable_access`).
+    `born_locked` is immutable — it is what identifies the purchasable group and what tells
+    reconciliation money was once owed on that file.
 - **The customer gallery is a LIVE route, not a file** (`GET /j/{code}` in `api.app`,
   HTML from the pure `api.gallery.render_gallery_html`). `Job.gallery_token` is an
   11-char base62 short code minted once at `POST /jobs` (stable across replays, like
@@ -271,6 +362,51 @@ Two runtime media roots, with different audiences:
   `POST /jobs/{id}/unlock` must flip the paywall **without** touching `status`. It is
   pure, never persisted (so it can't drift), and nothing in the pipeline branches on
   it: drive UI copy off `media_state`, drive the pipeline off `JobStatus`.
+- **A spec flight turns one flyer's card into an upsell for the whole load**
+  (`api.jobs.JobKind`, `ingest.match.resolve_load_for_staff`,
+  `api.tasks.fan_out_load_job`). The selfie upsell works because the instructor's handcam
+  films every tandem anyway; external/Ultimate can't reuse it, because they need a
+  camera-flyer in the air and nobody sends one up for a non-buyer. So the rule is
+  inverted: **whenever a flyer IS airborne, his card becomes an upsell engine for
+  everybody on the load.** Three `JobKind`s carry it:
+  * `load_master` — the flyer's card. **Owns the files**, has no customer (no email, its
+    own gallery link is never handed out), runs `video_only` + `preview_only`. That
+    entitlement is both true (nobody bought it) and load-bearing: it is what makes
+    `_render_previews` produce the watermarked bytes every locked child streams.
+  * `load_child` — a customer on that load with **no job of their own**. Owns **no files**;
+    `source_job_id` points at the master. Own name, own `gallery_token`, own unlock,
+    own email.
+  * `jump` — an existing customer's job, untouched except that `source_job_id` is
+    stamped so their gallery grows a **load-video tile** (`load_video` in
+    `PURCHASABLE_ADDONS`, fulfilled at `GET /j/{code}/load/{name}`). One customer, one
+    link — nobody gets a second page or a second email.
+  The tier test is **"do they already have a gallery?"**, never "did they buy media?" — a
+  jumper who bought nothing usually *does* have one, because the instructor's handcam films
+  every tandem and that becomes a speculative `selfie`/`preview_only` job. Branching on the
+  purchase gives that customer a child ON TOP of it: two links, two emails.
+  **The invariant:** for any gallery request the **files** come from `source_job_id`'s job
+  (`api.app._media_job`) while the **lock state** comes from the requesting job. That is
+  what lets five customers share one render and unlock independently — unlocking Priya
+  flips Priya only, and the master is never touched. A master is approved like any job but
+  hands off to `fan_out_load_job`, never `deliver_job` (which refuses one outright).
+  **The gallery race is fixed at the token-minting boundary** (`api.app.create_job`): a
+  customer's own jump job arriving *after* the fan-out already opened them a `load_child`
+  **adopts** the child's `gallery_token` (`JobStore.adopt_gallery_token` — same dual join
+  key as `_is_own_job`: `booking_id`, else `(load_id, jumper_index)`), inherits
+  `source_job_id` (the tile) and any purchase made on the child (`addons["load_video"]`);
+  the child is retired (`superseded_by`, token cleared, `deliver_job` skips it). One
+  customer, one link — the URL they were already emailed now serves their own gallery.
+- **A load master comes from a SPEC FLIGHT — never from scene labels.**
+  (`load_evidence: flight_window`): a flyer with no assigned customer.
+  Because there is **no crew field on a load document**, he is tied to his load by
+  `captured_at` alone — so `select_load` insists the clip fall inside a flight window
+  (unlike `select_match`, where a lone jumper-keyed candidate is accepted on the jumper
+  predicate's strength), and `fan_out_load_job` additionally requires a **`freefall`
+  scene** in the master's manifest before anything fans out. Ground footage shot between
+  loads must produce nothing, not a "load video" sold to five people who never flew.
+  His WHOLE card is the master. `resolve_load_for_staff` raises
+  `ingest.match.NotSpecFlight` for a flyer holding a jumper slot — that path never
+  softens (an assigned cameraman's card is his customer's product, never a master).
 
 ## Bash Commands
 - `pip install -r requirements.txt` — install Python deps
@@ -304,6 +440,16 @@ Two runtime media roots, with different audiences:
   watermarked previews rendered → locked `/j/{code}` page serves the *preview* bytes →
   `POST /unlock` → same URL now serves the clean master. Exits non-zero if the lock
   ever leaks the master or the unlock doesn't flip
+- `python scripts/demo_mixed_job.py --instructor-cam <clips…> [--external-cam <clips…>]`
+  — the **mixed job** end to end: one jumper holding a paid handcam package *and* a spec
+  camera-flyer one. Drives the live API in-process (eager, no worker): manifest with two
+  `media_refs` → the instructor's card renders and is servable **before** the cameraman's
+  exists → the cameraman's card joins the SAME job → `unlock_external`. Asserts what must
+  never happen: a locked deliverable served clean at any URL, the customer's own edit
+  watermarked or withheld, an unlock reaching past the speculative group, or the second
+  render deleting the first's deliverables. Omit `--external-cam` to prove the paid edit
+  ships alone. Needs real jump masters — footage with no GPMF telemetry has no exit or
+  deployment to segment on, and the script says so rather than tracebacking
 - `python scripts/qa_all_packages.py [--packages <p,…>] [--email <you>] [--no-email]` —
   the pre-demo audit: drives **every** package through the live API (no GoPro — it
   reuses the real masters already in `jobs/*/raw/`) and then opens each job's working
@@ -344,9 +490,12 @@ Two runtime media roots, with different audiences:
   — read-only: shows what the footage→customer matcher WOULD decide against the live
   shared DB, with no camera. `--readiness` reports the two data prerequisites that
   actually break this (staff without `goproSerial`, unset `CAMERA_CLOCK_TZ`, registry
-  cameras owned by nobody); `--day` replays every load that day as one simulated clip
+  cameras owned by nobody, plus an unset `PUBLIC_BASE_URL`, without which a spec flight
+  can't fan out); `--day` replays every load that day as one simulated clip
   per camera and prints `deliverable / no-media / FAILED`, exiting non-zero on any
-  FAILED — a morning pre-flight before jumping
+  FAILED — a morning pre-flight before jumping. Each load also gets a `spec flight → N
+  locked galleries + M upsell tiles` line: what sending a flyer up on that load's open
+  seat would produce, which is the "is the seat worth it?" arithmetic ops needs
 - `python scripts/demo_from_load.py --dir <folder-of-MP4s> [--serial <s>] [--api <url>]`
   — drive the FULL edit→deliver flow from a camera's footage matched to the load it
   belongs to, bypassing discovery/BLE/WiFi. Reads the earliest clip's capture time,
@@ -356,15 +505,31 @@ Two runtime media roots, with different audiences:
   a name you typed. The workaround when the unattended pull is blocked (macOS Wi-Fi, a
   headless service without Location Services, or SkydiveOS not yet turning the raw-upload
   into a job). Needs `MONGO_URL` + the auto-edit API at `--api` with `AUTO_DELIVER=1`
-- `python scripts/skydiveos_bridge.py [--port 9000] [--api <auto-edit>] [--debounce 20]`
+- `python scripts/skydiveos_bridge.py [--port 9000] [--api <auto-edit>]`
   — local stand-in for the SkydiveOS raw-upload consumer (and the executable reference
   for its implementation): receives discovery's notify, matches via `FootageMatcher`
   (`staff_id` from the QR, else camera serial), debounces a jump's clips into ONE job,
   creates it over the live API and attaches the footage from S3. Dedupe/flag state in
   `jobs/_bridge_state.json`; refuse-and-flag returns 200 (a 5xx would make discovery
-  retry forever). `bash scripts/run_sdcard_stack.sh` starts worker + bridge + API with
-  `CAMERA_SCANNER=sdcard AUTO_DELIVER=1` — the one-command "insert card → customer
-  emailed" stack for a single machine
+  retry forever). **The clip-settle debounce defaults to 900 s** (`--debounce`) and that
+  default must stay long: the gap between two notifications is really the next clip's S3
+  upload time, and at 20 s a card pulled over a dropzone uplink split one jump into four
+  jobs — four renders, four "your video is ready" emails to one customer (2026-08-06).
+  For local test cycles shorten it with the dev-only `--dev-debounce <s>` (or
+  `BRIDGE_DEV_DEBOUNCE_SECONDS`, deliberately *not* in `.env.example`): off by default,
+  refuses any value that doesn't shorten, and logs a warning banner naming that incident
+  the whole time it's active. `bash scripts/run_sdcard_stack.sh` starts worker + bridge +
+  API with `CAMERA_SCANNER=sdcard AUTO_DELIVER=1` — the one-command "insert card →
+  customer emailed" stack for a single machine
+- `python scripts/unflag_bridge_key.py [<s3_key>… | --all] [--dry-run]` — clear a key
+  from the bridge state's `flagged` map so its clip can be re-notified. A flag is
+  terminal on purpose (every later notify for that key is a duplicate, so nothing is
+  silently retried into a mis-matched job), but the usual cause is fixable data — an
+  unmanifested load, a staff member without `goproSerial`, an unmapped purchase. Bare
+  run lists what's flagged and why (read-only; clearing needs a key or `--all`); only
+  `flagged` is ever touched, and a key already in `handled` is **refused** with a
+  non-zero exit — clearing it would create a second job for delivered footage. Restart
+  the bridge after clearing: it holds state in memory and would write the flag back
 - `python scripts/make_instructor_qr.py --staff-id <staffs._id> --name "<name>"` (or
   `--all` from `MONGO_URL`) — print-ready QR PNGs instructors film to claim an SD-card
   session (payload `skydiveos-staff:<_id>`, H-level correction, captioned via Pillow)
@@ -420,8 +585,14 @@ Two runtime media roots, with different audiences:
   else an `sd-<label>` fallback. **Who the footage belongs to comes from the filmed QR
   session marker**: the instructor records a short clip of their printed QR
   (`scripts/make_instructor_qr.py`, payload `skydiveos-staff:<staffs._id>` — the
-  SkydiveOS staff id, NOT the registry's `instructor_id`) at the start of each session;
-  every later clip (until the next marker, by capture order) belongs to that staff.
+  SkydiveOS staff id, NOT the registry's `instructor_id`) **once per session — start,
+  end, or mid-card; marker position is not a protocol**. Attribution is card-level
+  (`ingest.qr.QrSessionIndex`): one staff id among a day's markers claims every clip of
+  that day regardless of side; two or more staff sessions infer the marker direction
+  (leading/trailing) from the card's layout once, falling back to leading (the
+  historical rule) with a warning when the layout reads both ways. Because the marker
+  may be filmed last, discovery in QR mode **holds a pull's hand-offs until the whole
+  card is staged** (`_HoldingEventEmitter`).
   `ingest.qr.qr_identity_resolver` is discovery's per-clip `identity_resolver`: decode
   results cache in `<stem>.qr.json` sidecars (clips > `SDCARD_QR_MAX_CLIP_SECONDS`
   are never probed), the raw-upload payload gains `staff_id` + `staff_source: "qr"`
@@ -433,6 +604,15 @@ Two runtime media roots, with different audiences:
   allow-list (an inserted card is an operator action; the QR + load match is the real
   gate) and a clip with no preceding marker falls back to the serial-based match with
   a WARNING. Probe cards read-only with `python scripts/check_sdcard.py [--decode]`.
+  **Card ingest status is observable** (`ingest/cardstatus.py` → `GET /ingest/cards`):
+  in sdcard mode the pull path updates an in-memory per-card registry
+  (`detected → sweeping/pulling → safe_to_remove | error`, with file/byte progress)
+  so the operator screen can show a progress bar and a "safe to remove" popup.
+  `safe_to_remove` fires when the pull loop finishes — the S3 upload + notify run
+  from the STAGED copy and never need the card. Tracking never raises into a pull
+  (same never-fail rule as archiving), nothing in the pipeline reads the registry,
+  and the SkydiveOS front end polls it via its backend proxy (the service token
+  stays server-side). Empty list when sdcard ingest is off.
 - `python scripts/check_camera.py --usb` / `--wifi --camera <id>` — hardware smoke test: open a real GoPro and list its media (read-only), using the same Camera classes the pull uses. Verifies the SDK + connectivity before enabling discovery.
 - **The service-token gate is what makes this API safe to expose** (`api.auth`
   `service_token_allows`, enforced as a middleware in `create_app`). Every route
@@ -512,7 +692,36 @@ Two runtime media roots, with different audiences:
   The pipeline reads `jobs/<job_id>/`; the archive is a mirror for humans
 - Don't delete footage off a camera on any weaker signal than an S3 key recorded in the
   retention ledger — not "it's on local disk", not "the job succeeded". And never
-  `delete_all_media`: it's per-file, or not at all
+  `delete_all_media`: it's per-file, or not at all. **A filename is not that signal
+  either**: GoPro numbering restarts at `GX010001.MP4` on a formatted/replaced card and
+  two unlabeled cards both identify as `sd-NO-NAME`, so every ledger record carries the
+  **size** of the file it confirmed and `deletable()` requires the on-card file to still
+  match it (`AUDIT_MEDIA_MATCH_ISOLATION.md` §3-F). A record without a size is
+  unverifiable and never deletable
+- Don't scope an ingest S3 key by camera + filename alone. The same reused filename
+  overwrote one customer's master with another's — and because the notify consumer dedupes
+  on the key, the newcomer was then dropped as a "duplicate" and lost silently. Keys are
+  day-scoped (`ingest.discovery.raw_object_key` → `raw/{camera}/{YYYY-MM-DD}/{FILE}`,
+  fingerprint-scoped on a same-day size mismatch), the **basename stays the GoPro
+  filename** (every consumer derives its local staging name from `Path(key).name`), and
+  the same file always maps to the same key so a retried hand-off stays idempotent
+- Don't auto-deliver a job whose footage contains no jump. `api.selfie._curated_freefall`
+  substitutes the first scene when there is no `freefall` scene so the EDL validates —
+  right for the renderer, wrong for the customer: an interview-only clip set rendered and
+  was emailed as a finished skydive video. `api.tasks._auto_deliver_block` **holds** such
+  a job (keeps the render, sets `Job.hold_reason`, skips `AUTO_DELIVER`) rather than
+  failing it, because scene classification is a heuristic and a false negative must cost a
+  human glance, not a customer's video — the instructor's manual approve still delivers.
+  Only when scenes exist to judge (no `scene_manifest*.json` = "unknown", never "no
+  jump"), and never for a `load_master` (`fan_out_load_job` owns that rule)
+- Don't send a customer email without going through `api.delivery.send_gallery_email_once`.
+  Celery runs `task_acks_late=True`, so a worker killed after the SMTP send but before the
+  ack re-runs `deliver_job` from the top — and the `status != approved` guard can't catch
+  it, because the status is still `approved` for the whole run. The guard is two records:
+  an `O_EXCL` claim (`JobStore.claim_email_send` — the filesystem arbitrates, because
+  `job.json` is read-modify-write and cannot) plus `Job.email_sent_at` written after a
+  successful send. A failed or unconfigured send **releases** the claim so a retry can
+  still deliver
 - Don't file a camera pull directly into the archive — a pull knows only the camera and
   the timestamp, not the booking, so it stages into `raw-storage/_camera-staging/` and is
   mirrored into the jump folder once a job identifies whose jump it is. The dropzone Mac
@@ -524,10 +733,20 @@ Two runtime media roots, with different audiences:
   entitlement picks the file, never the request. No "preview" URL parameter, no
   client-side gating, no `?s=` value that unlocks, and the clean bytes are never put
   in the locked gallery's HTML. The one way to unlock is `POST /jobs/{id}/unlock`
-- **Don't presign anything for a `preview_only` job** — not the master, not the photo
-  zip, not "just for SkydiveOS". A presigned URL carries no entitlement check, and
-  those links are persisted, archived and forwarded onward. Upload with
-  `presign=False`; the customer's only address for a locked jump is `/j/{code}`
+- **Don't presign anything LOCKED** — not the master, not the photo zip, not "just for
+  SkydiveOS". A presigned URL carries no entitlement check, and those links are persisted,
+  archived and forwarded onward. `upload_and_link`'s `presign` takes a **name collection**
+  for exactly this reason: on a mixed job the bought edit gets links and the speculative one
+  gets none. The customer's only address for a locked deliverable is `/j/{code}`
+- **Don't ask "is this job locked?" where the question is "is this deliverable locked?"**
+  Use `api.jobs.entitlement_for` / `locked_deliverables` / `any_locked` / `all_locked` —
+  never `job.entitlement is preview_only` inline. That job-level test is what served the
+  clean, unpaid camera-flyer edit on a mixed jump, and what rendered **zero** previews for
+  it (the job reads `edited_download` because the handcam was bought). `all_locked` drives
+  the page's own treatment, `any_locked` drives "previews are load-bearing here"
+- **Don't write `Job.outputs` wholesale from a render** — go through
+  `JobStore.set_pipeline_outputs`. A mixed job renders twice, and a replace deletes the
+  other pass's deliverables from the gallery while their bytes and lock state linger
 - Don't add a route that assumes the network is the security boundary: the identity
   headers are self-asserted, so anything outside `/j/*` must sit behind the service
   token (it does automatically — the gate is a middleware; don't add exemptions)
@@ -539,6 +758,21 @@ Two runtime media roots, with different audiences:
 - Don't persist `media_state`, branch pipeline logic on it, or rename `JobStatus` to the
   design doc's vocabulary — it's a derived view (`api/lifecycle.py`) precisely so unlock
   can flip the paywall without touching `status`
+- **Don't build a load master's cut by filtering scene labels.** It looks like a
+  parameter and it is a labelling project: the personal-vs-shared split is decided by clip
+  position, not content, so a customer's interview filmed mid-card is labelled `boarding`
+  and would land in four strangers' galleries (`AUDIT_SCENE_LABELS.md`). Masters come from
+  **spec flights only** (no assigned customer, nothing to exclude) — a master's input
+  file set simply never contains a personal clip; no downstream filtering exists or is
+  needed
+- Don't give a `load_child` footage, outputs, or an archive folder — it is a customer-named
+  *view* of its master's renders. Rendering per child would break the render-once
+  economics the whole feature rests on (one edit, N offers), and its media must always
+  resolve through `source_job_id` with **its own** entitlement deciding preview-vs-master
+- Don't let the pruner delete a load master's renders or previews while any job points at
+  it: a locked child's only watchable media is the master's *local* `preview_*.mp4`, and
+  `public_media` deliberately refuses the presigned-S3 fallback for a locked job. Deleting
+  them blacks out a live paywall
 - Don't let the gallery emit a dead link: an upsell tile or unlock CTA with no
   `CHECKOUT_URL_TEMPLATE` renders as text. And don't gate the upsell row on entitlement
   — the row is the same on the locked and unlocked page

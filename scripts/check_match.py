@@ -184,6 +184,13 @@ def _readiness(matcher, settings) -> int:
             "\nWARNING: CAMERA_CLOCK_TZ is unset. GoPro writes LOCAL time labelled UTC, so "
             "matches will skew by the dropzone's UTC offset."
         )
+    if not settings.public_base_url:
+        print(
+            "\nWARNING: PUBLIC_BASE_URL is unset, so a SPEC FLIGHT cannot fan out. Every "
+            "child gallery it creates is preview_only, and a locked job's only safe "
+            "customer link is the served {PUBLIC_BASE_URL}/j/{code} page — POST /jobs "
+            "refuses to create one without it. Assigned-flyer jumps are unaffected."
+        )
     return 0 if with_serial and loads else 1
 
 
@@ -236,9 +243,33 @@ def _replay_day(matcher, settings, day: str) -> int:
                 ok += verdict == OK
                 skipped += verdict == PREV
                 failed += verdict == FAIL
+        print(f"    {_spec_flight_line(load)}")
         print()
     print(f"deliverable {ok}, preview-only {skipped}, FAILED {failed}")
     return 0 if failed == 0 else 1
+
+
+def _spec_flight_line(load: dict) -> str:
+    """What sending a camera flyer up on this load on spec would produce.
+
+    The ops-facing half of "is the open seat worth it?": one load master, edited once,
+    becomes a locked gallery for every jumper who bought no media plus an upsell tile for
+    every jumper who did. Read-only arithmetic over the manifest — it does not resolve
+    anything, because a spec flyer is by definition not on the load document.
+    """
+    jumpers = load.get("jumpers") or []
+    if not jumpers:
+        return "spec flight → nobody on the manifest, no load master worth building"
+    buyers = sum(
+        1 for j in jumpers
+        if str(j.get("mediaPackage") or "").strip().lower() not in ("", "none")
+    )
+    children = len(jumpers) - buyers
+    return (
+        f"spec flight → {children} locked galler{'y' if children == 1 else 'ies'} "
+        f"+ {buyers} upsell tile{'' if buyers == 1 else 's'} "
+        f"({len(jumpers)} on the manifest)"
+    )
 
 
 def _list_owner_loads(matcher, settings, serial: str) -> int:

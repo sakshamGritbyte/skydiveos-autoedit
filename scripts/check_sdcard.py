@@ -55,7 +55,11 @@ def main(argv: list[str] | None = None) -> int:
     from api.config import get_settings
     from ingest.discovery import _probe_capture_time  # noqa: PLC2701 - diagnostic tool
     from ingest.match import FootageMatcher, FootageMatchError
-    from ingest.qr import _probe_video, decode_staff_qr  # noqa: PLC2701 - diagnostic tool
+    from ingest.qr import (  # noqa: PLC2701 - diagnostic tool
+        QrSessionIndex,
+        _probe_video,
+        decode_staff_qr,
+    )
     from ingest.sdcard import SdCardCamera, _serial_from_version_txt, find_cards
 
     settings = get_settings()
@@ -84,24 +88,36 @@ def main(argv: list[str] | None = None) -> int:
             print("  (no GoPro MP4s on card)")
             continue
 
-        session_staff: str | None = None
-        for media in videos:
-            line = f"  {media.filename:<16} {_fmt_epoch(media.created_epoch)}"
-            if not args.decode:
-                print(line)
-                continue
+        if not args.decode:
+            for media in videos:
+                print(f"  {media.filename:<16} {_fmt_epoch(media.created_epoch)}")
+            continue
 
+        # Two passes, exactly like the pipeline: decode every marker first, THEN
+        # attribute — a marker filmed at the END of the session is just as valid as
+        # one at the start (attribution is card-level, see ingest.qr).
+        rows: list[tuple[str, float, str | None]] = []
+        for media in videos:
             clip = card.mount / "DCIM" / media.camera_path
             duration, _w, _h = _probe_video(clip)
-            staff_id = None
+            staff_payload = None
             if duration is None or duration <= settings.sdcard_qr_max_clip_seconds:
-                staff_id = decode_staff_qr(clip, scan_seconds=settings.sdcard_qr_scan_seconds)
+                staff_payload = decode_staff_qr(
+                    clip, scan_seconds=settings.sdcard_qr_scan_seconds
+                )
+            rows.append((media.filename, media.created_epoch or 0.0, staff_payload))
+        index = QrSessionIndex.from_clips(rows)
+
+        for media, (filename, _epoch, staff_id) in zip(videos, rows, strict=True):
+            line = f"  {media.filename:<16} {_fmt_epoch(media.created_epoch)}"
+            clip = card.mount / "DCIM" / media.camera_path
             if staff_id is not None:
-                session_staff = staff_id
-                print(f"{line}  QR MARKER -> staff {staff_id}")
+                print(f"{line}  QR MARKER -> {staff_id}")
                 continue
+            identity = index.identity_for(filename)
+            session_staff = identity.staff_id
             if session_staff is None:
-                print(f"{line}  NO SESSION (no preceding QR marker; serial-based fallback)")
+                print(f"{line}  NO SESSION (no QR marker on this card; serial-based fallback)")
                 failed = True
                 continue
             verdict = f"session staff {session_staff}"

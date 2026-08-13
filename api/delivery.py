@@ -23,13 +23,22 @@ import logging
 import mimetypes
 import shutil
 import smtplib
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Collection
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
 from .config import Settings
-from .jobs import Entitlement, Job, JobStore
+from .jobs import (
+    Entitlement,
+    Job,
+    JobKind,
+    JobStore,
+    any_locked,
+    entitlement_for,
+    locked_deliverables,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +107,7 @@ def upload_and_link(
     job_id: str,
     settings: Settings,
     s3_client: Any | None = None,
-    presign: bool = True,
+    presign: bool | Collection[str] = True,
 ) -> dict[str, str]:
     """Upload each deliverable to S3; return a presigned URL per name.
 
@@ -106,11 +115,18 @@ def upload_and_link(
     ``delivery_link_ttl_days`` (≤ 7, the SigV4 maximum). ``ContentType`` is set so
     browsers stream the videos instead of prompting a raw download.
 
-    ``presign=False`` uploads without minting any URL and returns ``{}`` — the
-    durable copy still lands in S3, but nothing hands out a link to it. That is the
-    ``preview_only`` (Path B) case: the clean masters must exist so ``/unlock`` is
-    instant, and a presigned URL to one of them **is** the paywall bypass (a URL,
-    unlike the gallery route, carries no entitlement check).
+    ``presign`` decides which names get a URL — every file uploads either way, because
+    the durable copy is what makes ``/unlock`` instant:
+
+    * ``True`` — a URL for every name (the customer owns the whole set).
+    * ``False`` — no URLs at all, returning ``{}``. The wholly ``preview_only``
+      (Path B) case.
+    * a **collection of names** — a URL for those names only. This is the *mixed* job:
+      a paid handcam edit alongside a spec external one. Naming the allowed set here,
+      rather than filtering afterwards, is deliberate — a presigned URL carries no
+      entitlement check (unlike the ``/j/{code}`` route), it is persisted on the job,
+      mirrored into the archive manifest and forwarded to SkydiveOS, so a locked
+      deliverable must never have one minted in the first place.
     """
     if not settings.s3_bucket:
         raise RuntimeError(
@@ -118,6 +134,7 @@ def upload_and_link(
         )
     client = s3_client if s3_client is not None else _default_s3_client(settings)
     ttl_seconds = int(settings.delivery_link_ttl_days * 86400)
+    allowed: Collection[str] | None = None if isinstance(presign, bool) else presign
     links: dict[str, str] = {}
     for name, path in files.items():
         key = f"{DELIVERY_KEY_PREFIX}/{job_id}/{path.name}"
@@ -125,7 +142,7 @@ def upload_and_link(
         client.upload_file(
             str(path), settings.s3_bucket, key, ExtraArgs={"ContentType": content_type}
         )
-        if presign:
+        if presign is True or (allowed is not None and name in allowed):
             links[name] = client.generate_presigned_url(
                 "get_object",
                 Params={"Bucket": settings.s3_bucket, "Key": key},
@@ -247,6 +264,67 @@ def send_gallery_email(
     return True
 
 
+def send_gallery_email_once(
+    job: Job,
+    store: JobStore,
+    gallery_url: str,
+    settings: Settings,
+    *,
+    smtp_factory: Callable[[], smtplib.SMTP] | None = None,
+    link_expires: bool = True,
+) -> bool:
+    """Send the gallery email **at most once per job**, across retries and workers.
+
+    The idempotency guard for delivery. Celery runs ``task_acks_late=True``, so a worker
+    killed after the SMTP send but before the ack re-runs ``deliver_job`` from the top —
+    and the ``status != approved`` guard cannot catch it, because the status is still
+    ``approved`` for the whole run. Two workers draining a re-queued delivery hit the same
+    window. Either way the customer got a second "your video is ready" (the failure class
+    of the 2026-08-06 four-emails incident, from a different direction).
+
+    Two records, deliberately:
+
+    * :meth:`JobStore.claim_email_send` — an ``O_EXCL`` create, so the *filesystem*
+      arbitrates the race that a read-modify-write ``job.json`` field cannot.
+    * :attr:`api.jobs.Job.email_sent_at` — the durable, inspectable answer to "has this
+      customer been emailed?", written only after a send actually succeeded.
+
+    Returns **"the customer has their link"** — True when an email went out now *or* on an
+    earlier run. That is what the caller's reachability check needs: a retry must not
+    conclude the gallery reached nobody and fail a job that was, in fact, delivered.
+    Returns False only in the pre-existing skip cases (no ``customer_email``, no SMTP),
+    and releases the claim then so configuring SMTP and re-queueing still sends.
+    """
+    if job.email_sent_at is not None:
+        logger.info(
+            "job %s was already emailed (at %.0f) — not sending a second time",
+            job.job_id, job.email_sent_at,
+        )
+        return True
+    if not store.claim_email_send(job.job_id):
+        # Another worker holds the claim: it will either send (and stamp) or release.
+        # Reporting "reachable" here is the safe side — the alternative is failing a job
+        # whose email is in flight.
+        logger.warning(
+            "job %s: another delivery run holds the email claim — not sending again",
+            job.job_id,
+        )
+        return True
+    try:
+        sent = send_gallery_email(
+            job, gallery_url, settings,
+            smtp_factory=smtp_factory, link_expires=link_expires,
+        )
+    except Exception:
+        store.release_email_claim(job.job_id)  # a transient SMTP failure must be retryable
+        raise
+    if not sent:
+        store.release_email_claim(job.job_id)
+        return False
+    store.update(job.job_id, email_sent_at=time.time())
+    return True
+
+
 def send_delivery_email(
     job: Job,
     links: dict[str, str],
@@ -302,6 +380,50 @@ def send_delivery_email(
     return True
 
 
+def _deliver_load_child(
+    job: Job,
+    store: JobStore,
+    settings: Settings,
+    *,
+    smtp_factory: Callable[[], smtplib.SMTP] | None = None,
+) -> dict[str, str]:
+    """Deliver a child gallery: email its link, upload nothing.
+
+    A ``load_child`` owns no files — it is a customer-named *view* of its load master's
+    renders, which :func:`api.tasks.fan_out_load_job` already uploaded to S3. So this
+    skips :func:`collect_deliverables` and every upload: re-uploading the same bytes once
+    per customer is exactly the per-customer cost the render-once design exists to avoid.
+
+    A child is ``preview_only`` by construction, so the served ``/j/{code}`` gallery is
+    the only safe address for it (a presigned URL carries no entitlement check) — hence
+    the hard requirement on ``PUBLIC_BASE_URL`` rather than a fall back to the legacy S3
+    page, which would embed presigned clean masters.
+    """
+    served_url = gallery_link(job, store, settings)
+    if served_url is None:
+        raise RuntimeError(
+            f"load child {job.job_id} needs PUBLIC_BASE_URL set: its gallery is served "
+            "live at {PUBLIC_BASE_URL}/j/{code}, and the legacy S3 page would hand out "
+            "presigned clean masters of a video this customer has not bought."
+        )
+    emailed = send_gallery_email_once(
+        job,
+        store,
+        f"{served_url}?s=e#tab-video",
+        settings,
+        smtp_factory=smtp_factory,
+        link_expires=False,
+    )
+    if not emailed and not settings.skydiveos_api_base:
+        raise RuntimeError(
+            f"load child {job.job_id}: gallery generated but unreachable — no "
+            "customer_email/SMTP and no SKYDIVEOS_API_BASE to forward it to"
+        )
+    # Only the gallery link: a locked job contributes no per-deliverable URLs, and the
+    # master's files are not this job's to hand out.
+    return {"gallery": served_url}
+
+
 def deliver_to_customer(
     job: Job,
     store: JobStore,
@@ -337,6 +459,9 @@ def deliver_to_customer(
     from . import gallery
     from .upsell import link_tiles
 
+    if job.job_kind is JobKind.load_child:
+        return _deliver_load_child(job, store, settings, smtp_factory=smtp_factory)
+
     files = collect_deliverables(job, store)  # videos + photos.zip (photos dir zipped)
     if not files:
         raise RuntimeError(f"job {job.job_id} has no rendered deliverables to deliver")
@@ -350,46 +475,59 @@ def deliver_to_customer(
 
     # ── Path B: the paywall decides what may be LINKED, not just what's shown ──
     # A presigned URL bypasses every entitlement check by construction, so a locked
-    # job mints none: the masters and the photo zip still upload (durable, and what
-    # /unlock serves instantly), but the customer's only address for this jump is
-    # the lock-aware `/j/{code}` route, which picks preview-vs-master per request.
-    locked = job.entitlement is Entitlement.preview_only
+    # deliverable mints none: the masters and the photo zip still upload (durable, and
+    # what /unlock serves instantly), but the customer's only address for a locked file
+    # is the lock-aware `/j/{code}` route, which picks preview-vs-master per request.
+    #
+    # Asked per deliverable, so a MIXED job (paid handcam + spec external) links the
+    # edit the customer bought and withholds the one they haven't — the job-level
+    # question would have to choose between leaking the spec edit and withholding the
+    # paid one.
+    locked = any_locked(job)
     if locked and served_url is None:
         raise RuntimeError(
-            f"job {job.job_id} is preview_only but PUBLIC_BASE_URL is not set: the only "
-            "safe customer link is the served /j/{code} gallery (the legacy S3 gallery "
-            "hands out presigned clean masters, which would bypass the paywall). Set "
-            "PUBLIC_BASE_URL and re-queue delivery."
+            f"job {job.job_id} has locked deliverable(s) "
+            f"({', '.join(sorted(locked_deliverables(job)))}) but PUBLIC_BASE_URL is not "
+            "set: the only safe customer link is the served /j/{code} gallery (the legacy "
+            "S3 gallery hands out presigned clean masters, which would bypass the "
+            "paywall). Set PUBLIC_BASE_URL and re-queue delivery."
         )
 
-    # Videos → durable copy in S3, presigned only when the customer owns the edit.
+    # Videos → durable copy in S3, presigned only for the ones the customer owns.
     video_files = {n: p for n, p in files.items() if n != "photos"}
+    unlocked_videos = {
+        n for n in video_files if entitlement_for(job, n) is Entitlement.edited_download
+    }
     video_links = upload_and_link(
         video_files,
         job_id=job.job_id,
         settings=settings,
         s3_client=client,
-        presign=not locked,
+        presign=unlocked_videos,
     )
 
     # Photos zip → durable copy + "download all" (locked: no link; the gallery
-    # shows a count teaser instead of the stills).
+    # shows a count teaser instead of the stills). The photo set is produced from the
+    # PAID ref on a mixed job, so it inherits the job's own entitlement unless an
+    # explicit access entry says otherwise.
     zip_url: str | None = None
     if "photos" in files:
+        photos_owned = entitlement_for(job, "photos") is Entitlement.edited_download
         zip_url = upload_and_link(
             {"photos": files["photos"]},
             job_id=job.job_id,
             settings=settings,
             s3_client=client,
-            presign=not locked,
+            presign=photos_owned,
         ).get("photos")
 
     if served_url is not None:
         # Served gallery: the page and its media stream live from this API, so no
         # gallery.html / per-photo uploads. The email carries the source-tagged link.
         gallery_url = served_url
-        emailed = send_gallery_email(
+        emailed = send_gallery_email_once(
             job,
+            store,
             f"{served_url}?s=e#tab-video",
             settings,
             smtp_factory=smtp_factory,
@@ -428,7 +566,9 @@ def deliver_to_customer(
             ),
         )
         gallery_url = _upload_gallery_html(client, page, job.job_id, settings, ttl)
-        emailed = send_gallery_email(job, gallery_url, settings, smtp_factory=smtp_factory)
+        emailed = send_gallery_email_once(
+            job, store, gallery_url, settings, smtp_factory=smtp_factory
+        )
 
     if not emailed and not settings.skydiveos_api_base:
         raise RuntimeError(
@@ -436,9 +576,11 @@ def deliver_to_customer(
             "and no SKYDIVEOS_API_BASE to forward it to"
         )
     # gallery is the customer link; individual links ride along for SkydiveOS.
-    # A locked job contributes NO per-deliverable links: these are persisted on the
-    # job, mirrored into the archive manifest and forwarded to SkydiveOS, so one
-    # clean-master URL here would leak the paywalled edit through any of those.
+    # Only UNLOCKED deliverables appear here: these links are persisted on the job,
+    # mirrored into the archive manifest and forwarded to SkydiveOS, so one
+    # clean-master URL for a locked deliverable would leak the paywalled edit through
+    # any of those. A wholly locked job therefore contributes none, and a mixed one
+    # contributes exactly the edits the customer bought.
     links = {"gallery": gallery_url, **video_links}
     if zip_url:
         links["photos"] = zip_url

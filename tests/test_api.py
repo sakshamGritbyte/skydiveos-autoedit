@@ -39,6 +39,9 @@ class FakeQueue:
     def enqueue_selfie_processing(self, job_id: str) -> None:
         self.calls.append(("selfie", (job_id,)))
 
+    def enqueue_media_ref_processing(self, job_id: str, role: str) -> None:
+        self.calls.append(("media_ref", (job_id, role)))
+
     def enqueue_rerender(self, job_id: str) -> None:
         self.calls.append(("rerender", (job_id,)))
 
@@ -1023,16 +1026,30 @@ def test_gallery_state_endpoint_reports_only_the_lock(client: TestClient) -> Non
 
     resp = client.get(f"/j/{token}/state")
     assert resp.status_code == 200
-    assert resp.json() == {"locked": True, "addons": []}
+    # `locked_deliverables` names WHICH cards are behind the paywall, so a mixed page
+    # (a bought handcam edit beside a speculative one) can flip only what changed.
+    assert resp.json() == {
+        "locked": True,
+        "locked_deliverables": ["full_video"],
+        "addons": [],
+    }
     assert "Sophie" not in resp.text and token not in resp.text
 
     client.post(f"/jobs/{job_id}/unlock", json=_PAYMENT_BODY)
-    assert client.get(f"/j/{token}/state").json() == {"locked": False, "addons": []}
+    assert client.get(f"/j/{token}/state").json() == {
+        "locked": False,
+        "locked_deliverables": [],
+        "addons": [],
+    }
 
     # An add-on purchase shows up as its key only — never the payment reference.
     client.post(f"/jobs/{job_id}/unlock", json={**_PAYMENT_BODY, "item": "raw"})
     state = client.get(f"/j/{token}/state")
-    assert state.json() == {"locked": False, "addons": ["raw"]}
+    assert state.json() == {
+        "locked": False,
+        "locked_deliverables": [],
+        "addons": ["raw"],
+    }
     assert _PAYMENT_BODY["payment_reference"] not in state.text
 
 

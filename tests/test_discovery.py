@@ -24,6 +24,19 @@ from ingest.pull import pull_camera
 from ingest.registry import CameraRecord, CameraRegistry
 from ingest.scanner import BleCameraScanner, StaticCameraScanner, camera_id_from_name
 
+#: The staging day a pull writes into (``_camera-staging/<camera>/<DAY>/CLIP.MP4``).
+#: S3 keys are scoped by it, so tests stage their clips there rather than at the root.
+STAGING_DAY = "2026-08-11"
+
+
+def _staged(tmp_path: Path, name: str, *, day: str = STAGING_DAY, body: bytes = b"video") -> Path:
+    """A clip where a real pull would have staged it, so its S3 key is day-scoped."""
+    clip = tmp_path / day / name
+    clip.parent.mkdir(parents=True, exist_ok=True)
+    clip.write_bytes(body)
+    return clip
+
+
 # --------------------------------------------------------------------------- #
 # Fakes
 # --------------------------------------------------------------------------- #
@@ -398,8 +411,8 @@ def test_s3_notify_uploader_puts_to_s3_then_notifies(tmp_path, monkeypatch) -> N
 
     from ingest.discovery import s3_notify_uploader
 
-    mp4 = tmp_path / "GX010001.MP4"
-    mp4.write_bytes(b"video-bytes")
+    mp4 = _staged(tmp_path, "GX010001.MP4", body=b"video-bytes")
+    key = f"raw/1234/{STAGING_DAY}/GX010001.MP4"
 
     class _FakeS3:
         def __init__(self) -> None:
@@ -407,6 +420,9 @@ def test_s3_notify_uploader_puts_to_s3_then_notifies(tmp_path, monkeypatch) -> N
 
         def upload_file(self, filename: str, bucket: str, key: str) -> None:
             self.uploads.append((filename, bucket, key))
+
+        def head_object(self, **kwargs: object) -> dict[str, int]:
+            raise KeyError("no such key")  # nothing there yet
 
     s3 = _FakeS3()
     posted: dict[str, object] = {}
@@ -423,12 +439,13 @@ def test_s3_notify_uploader_puts_to_s3_then_notifies(tmp_path, monkeypatch) -> N
     upload = s3_notify_uploader("http://skydiveos.test/", bucket="jumps", s3_client=s3)
     upload(str(mp4), "1234", "inst-1")
 
-    # File went to s3://jumps/raw/1234/GX010001.MP4 ...
-    assert s3.uploads == [(str(mp4), "jumps", "raw/1234/GX010001.MP4")]
+    # File went to s3://jumps/raw/1234/{day}/GX010001.MP4 — day-scoped, because GoPro
+    # filenames repeat across cards (audit §3-F) ...
+    assert s3.uploads == [(str(mp4), "jumps", key)]
     # ... and SkydiveOS was notified with the key + camera + instructor (no file bytes).
     assert posted["url"] == "http://skydiveos.test/api/media/raw-upload"
     assert posted["json"] == {
-        "s3_key": "raw/1234/GX010001.MP4",
+        "s3_key": key,
         "camera_id": "1234",
         "instructor_id": "inst-1",
     }
@@ -436,7 +453,7 @@ def test_s3_notify_uploader_puts_to_s3_then_notifies(tmp_path, monkeypatch) -> N
     # No instructor → the field is simply omitted (camera unassigned).
     posted.clear()
     upload(str(mp4), "1234", None)
-    assert posted["json"] == {"s3_key": "raw/1234/GX010001.MP4", "camera_id": "1234"}
+    assert posted["json"] == {"s3_key": key, "camera_id": "1234"}
 
 
 def test_s3_notify_uploader_includes_capture_time(tmp_path, monkeypatch) -> None:
@@ -446,12 +463,14 @@ def test_s3_notify_uploader_includes_capture_time(tmp_path, monkeypatch) -> None
     from ingest import discovery
     from ingest.discovery import s3_notify_uploader
 
-    mp4 = tmp_path / "GX010001.MP4"
-    mp4.write_bytes(b"video-bytes")
+    mp4 = _staged(tmp_path, "GX010001.MP4", body=b"video-bytes")
 
     class _FakeS3:
         def upload_file(self, filename: str, bucket: str, key: str) -> None:
             pass
+
+        def head_object(self, **kwargs: object) -> dict[str, int]:
+            raise KeyError("no such key")
 
     posted: dict[str, object] = {}
 
@@ -474,7 +493,7 @@ def test_s3_notify_uploader_includes_capture_time(tmp_path, monkeypatch) -> None
     upload(str(mp4), "1234", "inst-1", "external")
 
     assert posted["json"] == {
-        "s3_key": "raw/1234/GX010001.MP4",
+        "s3_key": f"raw/1234/{STAGING_DAY}/GX010001.MP4",
         "camera_id": "1234",
         "instructor_id": "inst-1",
         "camera_role": "external",
@@ -1053,6 +1072,103 @@ def test_clip_with_no_session_hands_off_without_staff_id(tmp_path: Path) -> None
     assert kwargs == {}  # no staff_id keyword — old uploaders keep working
 
 
+def test_qr_mode_holds_handoffs_until_the_whole_card_is_staged(tmp_path: Path) -> None:
+    """With an identity resolver the marker may be the LAST clip filmed, so no clip may
+    be attributed (or handed off) before the pull finishes staging the whole card."""
+    from ingest.qr import ClipIdentity
+
+    order: list[str] = []
+    uploads = _KwargsRecordingUploader()
+    staged = tmp_path / "4313" / "2026-08-04" / "GX010002.MP4"
+
+    async def _slow_pull(camera_id: str, *, emitter=None) -> list[object]:
+        if order:  # one pull is enough
+            return []
+        emitter.emit(
+            {
+                "event": "ready_for_processing",
+                "job_id": f"{camera_id}-GX010002",
+                "camera_id": camera_id,
+                "jump_dir": str(staged.parent),
+                "files": {"mp4": str(staged), "lrv": None, "thumbnail": None},
+                "created_epoch": None,
+                "emitted_at": 0.0,
+            }
+        )
+        await asyncio.sleep(0.05)  # the rest of the card is still copying
+        order.append("pull-finished")
+        return []
+
+    def _resolver(_camera_id: str, _mp4: str) -> ClipIdentity:
+        order.append("attributed")
+        return ClipIdentity("staff-A")
+
+    service = CameraDiscoveryService(
+        scanner=StaticCameraScanner(["4313"]),
+        registry=FakeRegistry([CameraRecord(camera_id="4313", paired_at=1.0)]),
+        upload=uploads,
+        pull=_slow_pull,
+        interval=0.05,
+        identity_resolver=_resolver,
+    )
+
+    async def scenario() -> None:
+        await service.start()
+        await _wait_for(lambda: bool(uploads.calls))
+        await service.stop()
+
+    asyncio.run(scenario())
+    assert order == ["pull-finished", "attributed"]
+    ((_args, kwargs),) = uploads.calls
+    assert kwargs == {"staff_id": "staff-A"}
+
+
+def test_qr_mode_releases_held_events_after_a_partial_pull_failure(tmp_path: Path) -> None:
+    """A corrupt clip aborts the pull AFTER others staged (ingest.pull tallies then
+    raises) — the staged clips' held events must still be handed off, not stranded."""
+    from ingest.qr import ClipIdentity
+
+    uploads = _KwargsRecordingUploader()
+    staged = tmp_path / "4313" / "2026-08-04" / "GX010002.MP4"
+    pulls: list[str] = []
+
+    async def _failing_pull(camera_id: str, *, emitter=None) -> list[object]:
+        if pulls:
+            return []
+        pulls.append(camera_id)
+        emitter.emit(
+            {
+                "event": "ready_for_processing",
+                "job_id": f"{camera_id}-GX010002",
+                "camera_id": camera_id,
+                "jump_dir": str(staged.parent),
+                "files": {"mp4": str(staged), "lrv": None, "thumbnail": None},
+                "created_epoch": None,
+                "emitted_at": 0.0,
+            }
+        )
+        raise RuntimeError("one corrupt clip failed to copy")
+
+    service = CameraDiscoveryService(
+        scanner=StaticCameraScanner(["4313"]),
+        registry=FakeRegistry([CameraRecord(camera_id="4313", paired_at=1.0)]),
+        upload=uploads,
+        pull=_failing_pull,
+        interval=0.05,
+        identity_resolver=lambda _c, _m: ClipIdentity("staff-A"),
+    )
+
+    async def scenario() -> None:
+        await service.start()
+        await _wait_for(lambda: bool(uploads.calls))
+        await service.stop()
+
+    asyncio.run(scenario())
+    ((args, kwargs),) = uploads.calls
+    assert args[0] == str(staged)
+    assert kwargs == {"staff_id": "staff-A"}
+
+
 def test_unregistered_card_pulled_when_registry_bypassed(tmp_path: Path) -> None:
     """sdcard mode: an inserted card is an operator action — no registry entry needed."""
     uploads = _RecordingUploader()
@@ -1100,12 +1216,14 @@ def test_s3_notify_uploader_includes_staff_id(tmp_path, monkeypatch) -> None:
 
     from ingest.discovery import s3_notify_uploader
 
-    mp4 = tmp_path / "GX010001.MP4"
-    mp4.write_bytes(b"video-bytes")
+    mp4 = _staged(tmp_path, "GX010001.MP4", body=b"video-bytes")
 
     class _FakeS3:
         def upload_file(self, filename: str, bucket: str, key: str) -> None:
             pass
+
+        def head_object(self, **kwargs: object) -> dict[str, int]:
+            raise KeyError("no such key")
 
     posted: dict[str, object] = {}
 
@@ -1122,7 +1240,7 @@ def test_s3_notify_uploader_includes_staff_id(tmp_path, monkeypatch) -> None:
 
     upload(str(mp4), "4313", None, None, staff_id="665f1c0a2ab79c0012345678")
     assert posted["json"] == {
-        "s3_key": "raw/4313/GX010001.MP4",
+        "s3_key": f"raw/4313/{STAGING_DAY}/GX010001.MP4",
         "camera_id": "4313",
         "staff_id": "665f1c0a2ab79c0012345678",
         "staff_source": "qr",
@@ -1140,8 +1258,7 @@ def test_s3_notify_uploader_marker_key_and_no_post(tmp_path, monkeypatch) -> Non
 
     from ingest.discovery import s3_notify_uploader
 
-    mp4 = tmp_path / "GX010001.MP4"
-    mp4.write_bytes(b"qr-marker-bytes")
+    mp4 = _staged(tmp_path, "GX010001.MP4", body=b"qr-marker-bytes")
 
     class _FakeS3:
         def __init__(self) -> None:
@@ -1149,6 +1266,9 @@ def test_s3_notify_uploader_marker_key_and_no_post(tmp_path, monkeypatch) -> Non
 
         def upload_file(self, filename: str, bucket: str, key: str) -> None:
             self.uploads.append((filename, bucket, key))
+
+        def head_object(self, **kwargs: object) -> dict[str, int]:
+            raise KeyError("no such key")
 
     s3 = _FakeS3()
     monkeypatch.setattr(
@@ -1159,8 +1279,43 @@ def test_s3_notify_uploader_marker_key_and_no_post(tmp_path, monkeypatch) -> Non
     upload = s3_notify_uploader("http://skydiveos.test/", bucket="jumps", s3_client=s3)
     key = upload(str(mp4), "4313", None, None, marker=True)
 
-    assert key == "raw/4313/markers/GX010001.MP4"
-    assert s3.uploads == [(str(mp4), "jumps", "raw/4313/markers/GX010001.MP4")]
+    expected = f"raw/4313/{STAGING_DAY}/markers/GX010001.MP4"
+    assert key == expected
+    assert s3.uploads == [(str(mp4), "jumps", expected)]
+
+
+def test_raw_object_key_scopes_by_day_and_never_overwrites(tmp_path) -> None:
+    """The audit's §3-F key-collision fix, at the unit level.
+
+    Two different cards can both hold ``GX010001.MP4`` (numbering restarts on a format),
+    so the key must not be ``raw/{camera}/{name}``: that overwrote one customer's master
+    with another's, and the notify consumer then dropped the new clip as a duplicate.
+    """
+    from ingest.discovery import raw_object_key
+
+    aug10 = _staged(tmp_path, "GX010001.MP4", day="2026-08-10", body=b"yesterday")
+    aug11 = _staged(tmp_path, "GX010001.MP4", day="2026-08-11", body=b"today-longer")
+
+    # Same filename, different days → different keys.
+    assert raw_object_key(aug10, "4313") == "raw/4313/2026-08-10/GX010001.MP4"
+    assert raw_object_key(aug11, "4313") == "raw/4313/2026-08-11/GX010001.MP4"
+    # The basename stays the GoPro filename — consumers derive the staging name from it.
+    assert Path(raw_object_key(aug11, "4313")).name == "GX010001.MP4"
+
+    # Re-uploading the SAME file (a retried hand-off) is idempotent: same key.
+    same_size = len(b"today-longer")
+    assert raw_object_key(
+        aug11, "4313", exists=lambda _k: same_size
+    ) == "raw/4313/2026-08-11/GX010001.MP4"
+
+    # Same day, same name, DIFFERENT content (two cards swapped mid-day) → the existing
+    # object is not overwritten; the newcomer gets a fingerprint-scoped key.
+    scoped = raw_object_key(aug11, "4313", exists=lambda _k: 999_999)
+    assert scoped != "raw/4313/2026-08-11/GX010001.MP4"
+    assert scoped.startswith("raw/4313/2026-08-11/")
+    assert scoped.endswith("/GX010001.MP4")
+    # Deterministic, so a retry lands on that same key rather than piling up copies.
+    assert raw_object_key(aug11, "4313", exists=lambda _k: 999_999) == scoped
 
 
 # --------------------------------------------------------------------------- #

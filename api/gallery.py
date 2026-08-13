@@ -40,6 +40,15 @@ _VIDEO_META: dict[str, tuple[str, str]] = {
     "external_freefall": ("Freefall — Outside Camera", "Cameraman angle"),
     "chute_libre_selfie": ("Freefall — Selfie Camera", "Instructor angle"),
     "final": ("Your Skydive Edit", "The complete edit"),
+    # A MIXED jump's secondary product, namespaced `<role>_<name>` by
+    # `api.jobs.deliverable_name`. Named the same way round as the Ultimate product's
+    # per-camera cuts above ("Freefall — Outside Camera") so the customer reads a
+    # product, not a filename: without these the fallback yields "External Full Video".
+    "external_full_video": ("Full Video — Outside Camera", "Cameraman angle"),
+    "external_highlights": ("Highlights — Outside Camera", "Cameraman angle"),
+    "instructor_full_video": ("Full Video — Selfie Camera", "Instructor angle"),
+    "instructor_highlights": ("Highlights — Selfie Camera", "Instructor angle"),
+    "instructor_freefall": ("Freefall — Selfie Camera", "Instructor angle"),
 }
 
 #: Design-doc palette (Frame 03 notes). The accent is the only thing the lock state
@@ -97,7 +106,10 @@ def render_gallery_html(
     poll_token: str | None = None,
     photos_unlocked: bool | None = None,
     raw_videos: list[tuple[str, str]] | None = None,
+    load_videos: list[tuple[str, str]] | None = None,
     purchased_addons: Sequence[str] = (),
+    locked_videos: Sequence[str] = (),
+    group_unlocks: Sequence[tuple[str, str | None]] = (),
 ) -> str:
     """Render the customer gallery page as one self-contained HTML string.
 
@@ -130,6 +142,10 @@ def render_gallery_html(
       watermarked. ``None`` (legacy callers) keeps the old rule: photos follow the lock.
     * ``raw_videos`` — the purchased Raw Footage section: ``(label, url)`` per camera
       master, rendered under the Video tab with download links. Empty/None → no section.
+    * ``load_videos`` — the purchased spec-flight load video: ``(label, url)``, rendered
+      under the Video tab for a customer who already had a gallery and bought the load
+      video as an add-on. Empty/None → no section. (A no-media customer's *child* gallery
+      shows the load video as its main ``videos`` instead — it's the only video they have.)
     """
     e = html.escape
     brand_e = e(brand)
@@ -138,6 +154,7 @@ def render_gallery_html(
     if photos_unlocked is None:
         photos_unlocked = not locked
     raw_videos = raw_videos or []
+    load_videos = load_videos or []
 
     # Hero meta: date · product · instructor · location, skipping whatever is unknown.
     meta_bits = [
@@ -152,25 +169,50 @@ def render_gallery_html(
     ]
     subtitle = "  ·  ".join(meta_bits)
 
-    if locked:
-        badge = '<div class="pbadge">720P PREVIEW</div>'
-    elif show_downloads:
-        badge = '<div class="pbadge ok">1080P · FULL QUALITY</div>'
-    else:
-        badge = ""
-    guard = ' controlsList="nodownload"' if locked else ""
+    # Lock treatment is per CARD, not per page. On a mixed jump — the handcam edit bought,
+    # a camera-flyer edit filmed on spec — one page carries both states at once, and the
+    # customer must be able to tell at a glance which video is theirs and which is an
+    # offer. ``locked_videos`` names the locked ones; a wholly locked page passes them all
+    # (or just sets ``locked``), which is the single-product behaviour unchanged.
+    locked_set = set(locked_videos or ())
     video_cards = []
     for name, url in videos:
         label, sub = _video_label(name)
+        card_locked = locked or name in locked_set
+        if card_locked:
+            badge = '<div class="pbadge">720P PREVIEW</div>'
+        elif show_downloads:
+            badge = '<div class="pbadge ok">1080P · FULL QUALITY</div>'
+        else:
+            badge = ""
+        guard = ' controlsList="nodownload"' if card_locked else ""
         dl = (
             f'<a class="vdl" href="{e(url)}" download>Download</a>'
-            if show_downloads and not locked else ""
+            if show_downloads and not card_locked else ""
         )
         video_cards.append(f"""
         <div class="vcard">{badge}
           <video controls preload="metadata" playsinline{guard} src="{e(url)}"></video>
           <div class="vlabel">{e(label)}<span>{e(sub)}</span>{dl}</div>
         </div>""")
+
+    # One call to action PER CAMERA whose edit is still locked. Two angles are priced and
+    # sold separately, so a jump where nothing was bought shows two offers and the customer
+    # can take either — one button that bought both would be the wrong product, and on such
+    # a job the plain ``unlock`` CTA buys nothing at all (every deliverable carries an
+    # explicit per-deliverable entry, which the job-level default cannot move). Each is
+    # rendered as text when it has no URL, exactly like the unlock CTA — the page must
+    # never hand out a dead link.
+    group_unlock_html = "".join(
+        '<div class="cta">'
+        + (
+            f'<a class="ctabtn" rel="noreferrer" href="{e(url)}">{e(label)}</a>'
+            if url
+            else f'<span class="ctabtn">{e(label)} · ask at the desk</span>'
+        )
+        + '<div class="ctasub">Watermark removed. Instant download.</div></div>'
+        for label, url in group_unlocks
+    )
 
     photo_tiles = "".join(
         f'<a class="ptile" href="{e(u)}" target="_blank" rel="noopener noreferrer">'
@@ -203,8 +245,11 @@ def render_gallery_html(
     # The primary action. Locked → the paywall CTA (an anchor when SkydiveOS's
     # checkout URL is known, plain text otherwise: the page must never dead-link the
     # customer). Unlocked → the download button, when the host gave us a URL for it.
+    # Suppressed when there are per-camera offers: on a job with media refs every locked
+    # deliverable carries an explicit entry, and this CTA's ``unlock`` item moves only the
+    # job's DEFAULT — it would take the payment and open nothing.
     cta_bar = ""
-    if locked:
+    if locked and not group_unlocks:
         cta_line = f"Unlock full video — {e(price_display)}"
         cta_action = (
             f'<a class="ctabtn" rel="noreferrer" href="{e(unlock_url)}">🔒 {cta_line}</a>'
@@ -310,10 +355,30 @@ def render_gallery_html(
         if raw_videos else ""
     )
 
+    # The purchased spec-flight load video: filmed from the air on the customer's jump
+    # day, but by a flyer who exited with somebody else. Badged and captioned as the
+    # group/aerial angle so it is never mistaken for their own freefall — the one promise
+    # this product must not make (design doc Stage 7).
+    load_cards = "".join(
+        f"""
+        <div class="vcard"><div class="pbadge ok">FROM THE AIR</div>
+          <video controls preload="metadata" playsinline src="{e(url)}"></video>
+          <div class="vlabel">{e(label)}<span>Your jump day from the air</span>
+          <a class="vdl" href="{e(url)}" download>Download</a></div>
+        </div>"""
+        for label, url in load_videos
+    )
+    load_section = (
+        f"""
+      <h2>Load Video <span>({len(load_videos)})</span></h2>
+      <div class="vgrid">{load_cards}</div>"""
+        if load_videos else ""
+    )
+
     panel_cls = ' class="tab-panel"' if tabbed else ""
     videos_section = f"""<section id="tab-video"{panel_cls}>
       <h2>Videos <span>({len(videos)})</span></h2>
-      <div class="vgrid">{"".join(video_cards)}</div>{raw_section}
+      <div class="vgrid">{"".join(video_cards)}</div>{group_unlock_html}{load_section}{raw_section}
     </section>"""
     if tabbed and photos_section:
         photos_section = photos_section.replace(

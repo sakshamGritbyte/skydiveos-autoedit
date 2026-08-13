@@ -803,8 +803,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 # auto-edit base URL pointing there, so a pull would read an empty list
                 # forever while this box sits behind dropzone NAT. Push it out instead,
                 # the same direction as every other hand-off this box originates.
+                # CARD_STATUS_URL when the snapshot's consumer is not the same host that
+                # answers the raw-upload notify — on a dropzone the notify is answered by
+                # the local bridge, which has no route for this and would 404 forever.
                 app.state.card_status_publisher = asyncio.create_task(
-                    publish_card_status(card_status, settings.skydiveos_api_base)
+                    publish_card_status(
+                        card_status,
+                        settings.card_status_url or settings.skydiveos_api_base,
+                    )
                 )
         except Exception:
             # A discovery misconfig must not take the whole API down — log and serve.

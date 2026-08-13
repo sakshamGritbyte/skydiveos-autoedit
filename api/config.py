@@ -213,6 +213,14 @@ class Settings:
     #: once and later archive passes are free; turn it off on a box where even that
     #: one pass is too much I/O.
     archive_hashes: bool = True
+    #: Where the card-ingest snapshot is PUSHED (``CARD_STATUS_URL``), when that is not
+    #: the same place the raw-upload notify goes. Both default to
+    #: :attr:`skydiveos_api_base`, but they are genuinely different consumers and can live
+    #: on different hosts: the notify is answered by whatever turns a key into a job (the
+    #: local ``scripts/skydiveos_bridge.py`` on a dropzone, or the SkydiveOS backend), while
+    #: the snapshot feeds the SkydiveOS **operator UI** and only that backend has a route
+    #: for it. Pointed at the bridge, the push would 404 forever.
+    card_status_url: str | None = None
     #: Mount roots the ``sdcard`` scanner polls for inserted cards
     #: (``SDCARD_MOUNT_ROOTS``, separated by ``os.pathsep`` — ``;`` on Windows, since a
     #: drive letter contains a colon). Unset defaults to the platform's roots: Linux
@@ -324,6 +332,7 @@ def get_settings() -> Settings:
         ),
         archive_hashes=_flag("ARCHIVE_HASHES", default=True),
         gallery_rate_limit_per_min=int(os.environ.get("GALLERY_RATE_LIMIT_PER_MIN") or 300),
+        card_status_url=os.environ.get("CARD_STATUS_URL") or None,
         # Split on os.pathsep, not a literal ':' — a Windows drive letter contains a
         # colon, so `E:\` would split into ("E", "\") and find nothing. The default is
         # the platform's (drive letters on Windows), kept in one place in ingest.sdcard

@@ -1034,7 +1034,11 @@ class FootageMatcher:
         self._mongo_url = (
             mongo_url if mongo_url is not None else (os.environ.get("MONGO_URL") or None)
         )
-        self._db_name = db_name or os.environ.get("MONGO_DB") or DEFAULT_DB
+        # DB_NAME is the SkydiveOS Node backend's name for the same database, and both
+        # services share one .env — see api.config for the incident this alias closes.
+        self._db_name = (
+            db_name or os.environ.get("MONGO_DB") or os.environ.get("DB_NAME") or DEFAULT_DB
+        )
         tz_name = clock_tz if clock_tz is not None else os.environ.get("CAMERA_CLOCK_TZ")
         self._tz = ZoneInfo(tz_name) if tz_name else None
         self._client: Any | None = None

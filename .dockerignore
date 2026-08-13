@@ -10,6 +10,13 @@
 .ruff_cache
 # Local job artifacts (raw footage, renders) — never ship these in the image.
 jobs/
+# The jump archive + camera staging: a host bind mount, and by far the biggest thing
+# on the box (tens of GB of masters). Left out of .dockerignore it gets COPYed into
+# EVERY image — a ~2 GB build context per service, which is exactly how a `compose
+# build` fills the disk and dies at "exporting to image".
+raw-storage/
+# Runtime logs (deploy/mac writes them under the repo).
+logs/
 # Hardware-only Open GoPro SDK: needed only for live camera pulls, not for the
 # cloud worker (which processes uploaded footage). Excluding it keeps the image lean.
 vendor/

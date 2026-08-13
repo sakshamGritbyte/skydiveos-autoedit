@@ -1994,7 +1994,19 @@ def create_app() -> FastAPI:
             "addons": sorted(job.addons),
         }
 
-    @app.get("/j/{token}/media/{name}", include_in_schema=False, response_class=FileResponse)
+    # HEAD as well as GET. FastAPI's ``@app.get`` registers ONLY GET — unlike Starlette's
+    # plain ``Route``, it does not add HEAD — so a HEAD here answered **405**. This is a
+    # media URL: players and CDNs probe it with HEAD for duration/size before streaming,
+    # and a 405 sends them into a retry loop that looks like a video reloading forever.
+    # Starlette's FileResponse already answers a HEAD with headers and no body, so nothing
+    # else changes: the range/206 path, the entitlement choice and the S3 fallback are the
+    # same code for both methods.
+    @app.api_route(
+        "/j/{token}/media/{name}",
+        methods=["GET", "HEAD"],
+        include_in_schema=False,
+        response_class=FileResponse,
+    )
     def public_media(
         token: str, name: str, store: StoreDep, settings: SettingsDep
     ) -> FileResponse:
@@ -2026,7 +2038,17 @@ def create_app() -> FastAPI:
         else:
             path = job_dir / f"{name}.mp4"
         if path.exists() and _served_under(path, job_dir):
-            return FileResponse(path, media_type="video/mp4", filename=f"{name}.mp4")
+            # INLINE, deliberately. ``filename=`` would make Starlette send
+            # ``Content-Disposition: attachment``, and this route is a **player** source:
+            # a browser handed an attachment downloads the file instead of playing it (open
+            # the URL in a tab and the tab closes onto a download). The page's Download
+            # button doesn't need it either — it uses the HTML ``download`` attribute on a
+            # same-origin link. And on a LOCKED deliverable ``attachment`` is actively
+            # wrong: it offers the watermarked preview as a file to keep, on a player the
+            # design deliberately marks ``nodownload``.
+            return FileResponse(
+                path, media_type="video/mp4", content_disposition_type="inline"
+            )
         # Disk-retention fallback (scripts/prune_jobs.py): a pruned clean master is
         # still in S3 under deliveries/, so the never-expiring gallery link keeps
         # working — redirect to a short-lived presigned URL minted per request.
@@ -2041,7 +2063,14 @@ def create_app() -> FastAPI:
                 return RedirectResponse(url, status_code=302)  # type: ignore[return-value]
         raise HTTPException(status_code=404, detail="video not found")
 
-    @app.get("/j/{token}/photos/{filename}", include_in_schema=False, response_class=FileResponse)
+    # GET + HEAD, for the same reason as the media route above: an image URL that 405s on
+    # HEAD makes preloaders and caches retry instead of fetching once.
+    @app.api_route(
+        "/j/{token}/photos/{filename}",
+        methods=["GET", "HEAD"],
+        include_in_schema=False,
+        response_class=FileResponse,
+    )
     def public_photo(token: str, filename: str, store: StoreDep) -> FileResponse:
         """Serve one full-res still — unlocked jobs, or a locked job that bought photos."""
         job = _job_by_token(store, token)

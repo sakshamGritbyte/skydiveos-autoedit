@@ -1231,3 +1231,53 @@ def test_an_unknown_unlock_item_is_refused_and_names_the_real_ones(client) -> No
     assert r.status_code == 400
     for item in ("unlock_instructor", "unlock_external"):
         assert item in r.text
+
+
+def test_gallery_media_is_served_INLINE_not_as_a_download(client) -> None:
+    """The player route must not hand the browser an attachment.
+
+    ``FileResponse(filename=...)`` sets ``Content-Disposition: attachment``, and a browser
+    given that downloads the file instead of playing it — open such a URL in a tab and the
+    tab closes onto a download instead of showing the video. The page's Download button
+    does not need it (it uses the HTML ``download`` attribute on a same-origin link), and
+    on a LOCKED deliverable an attachment is actively wrong: it offers the watermarked
+    preview as a file to keep, from a player the design marks ``nodownload``.
+    """
+    job_id = _mixed_job_id(client)
+    token = _rendered_mixed(client, job_id=job_id)
+
+    for name in ("full_video", "external_full_video"):  # owned and locked
+        r = client.get(f"/j/{token}/media/{name}")
+        assert r.status_code == 200, name
+        disposition = r.headers.get("content-disposition", "")
+        assert "attachment" not in disposition, (name, disposition)
+        assert r.headers["content-type"] == "video/mp4"
+
+
+def test_gallery_media_answers_HEAD_not_405(client) -> None:
+    """A media URL must answer HEAD — players and CDNs probe with it before streaming.
+
+    FastAPI's ``@app.get`` registers ONLY GET (unlike Starlette's plain ``Route``, which
+    adds HEAD when GET is present), so this route used to answer **405** and send players
+    into a retry loop that looks like a video reloading forever. The body must be empty and
+    the metadata headers must still be right, since that is the whole point of the probe.
+    """
+    job_id = _mixed_job_id(client)
+    token = _rendered_mixed(client, job_id=job_id)
+
+    for name in ("full_video", "external_full_video"):  # owned and locked
+        r = client.head(f"/j/{token}/media/{name}")
+        assert r.status_code == 200, (name, r.status_code)
+        assert r.content == b"", name  # headers only
+        assert r.headers["content-type"] == "video/mp4"
+        assert r.headers["accept-ranges"] == "bytes"
+        assert int(r.headers["content-length"]) > 0, name
+        assert "attachment" not in r.headers.get("content-disposition", "")
+
+    # The locked one still reports the PREVIEW's size, never the master's — the
+    # entitlement picks the file on a HEAD exactly as it does on a GET.
+    master = int(client.head(f"/j/{token}/media/full_video").headers["content-length"])
+    preview = int(
+        client.head(f"/j/{token}/media/external_full_video").headers["content-length"]
+    )
+    assert (master, preview) == (len(b"CLEAN-MASTER"), len(b"WATERMARKED"))

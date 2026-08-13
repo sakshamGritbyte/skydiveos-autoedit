@@ -268,7 +268,13 @@ def get_settings() -> Settings:
         task_always_eager=_flag("CELERY_TASK_ALWAYS_EAGER"),
         enable_auto_discovery=_flag("ENABLE_AUTO_DISCOVERY"),
         mongo_url=os.environ.get("MONGO_URL") or None,
-        mongo_db=os.environ.get("MONGO_DB") or "skydiveos",
+        # MONGO_DB is this repo's name; DB_NAME is the SkydiveOS Node backend's for the
+        # SAME database — and both services share one .env on every box. Without the
+        # alias, an env written in the backend's vocabulary makes the matcher silently
+        # query the default-named (empty) database: every match "fails", every clip is
+        # flagged, and nothing errors. Exactly what happened on prod after the client
+        # Atlas migration.
+        mongo_db=os.environ.get("MONGO_DB") or os.environ.get("DB_NAME") or "skydiveos",
         discovery_interval=float(os.environ.get("DISCOVERY_INTERVAL_SECONDS") or 30.0),
         camera_scanner=(os.environ.get("CAMERA_SCANNER") or "ble").strip().lower(),
         delete_after_transfer=_flag("DELETE_AFTER_TRANSFER"),

@@ -86,7 +86,11 @@ class CameraRegistry:
         # The --pair CLI constructs the registry with no args, so ignoring MONGO_DB
         # here would write pairings into a different database than the discovery
         # service (which passes settings.mongo_db) reads its allow-list from.
-        self._db_name = db_name or os.environ.get("MONGO_DB") or DEFAULT_DB
+        # DB_NAME: the Node backend's alias for the same database (shared .env) —
+        # see api.config for the incident the fallback closes.
+        self._db_name = (
+            db_name or os.environ.get("MONGO_DB") or os.environ.get("DB_NAME") or DEFAULT_DB
+        )
         self._clock = clock
         self._client: Any | None = None
         self._coll: Any | None = None

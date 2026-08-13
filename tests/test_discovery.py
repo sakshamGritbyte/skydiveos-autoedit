@@ -953,10 +953,20 @@ def test_handoff_gives_up_after_max_attempts(tmp_path: Path) -> None:
 
 def test_registry_db_name_resolves_like_the_url(monkeypatch) -> None:
     """The --pair CLI builds CameraRegistry() bare; it must honor $MONGO_DB or the
-    pairing lands in a different database than the service's allow-list reads."""
+    pairing lands in a different database than the service's allow-list reads.
+
+    ``DB_NAME`` is the fallback: it is the SkydiveOS Node backend's name for the SAME
+    database, and both services share one ``.env`` on every box. Without the alias, an
+    env written in the backend's vocabulary made the matcher query the default-named
+    (empty) database — every clip flagged, nothing errored (the prod incident after the
+    client Atlas migration).
+    """
     monkeypatch.setenv("MONGO_DB", "skydivingos")
-    assert CameraRegistry(mongo_url=None)._db_name == "skydivingos"
+    monkeypatch.setenv("DB_NAME", "backend-name")
+    assert CameraRegistry(mongo_url=None)._db_name == "skydivingos"  # MONGO_DB wins
     monkeypatch.delenv("MONGO_DB")
+    assert CameraRegistry(mongo_url=None)._db_name == "backend-name"  # the alias
+    monkeypatch.delenv("DB_NAME")
     assert CameraRegistry(mongo_url=None)._db_name == "skydiveos"
     assert CameraRegistry(mongo_url=None, db_name="explicit")._db_name == "explicit"
 

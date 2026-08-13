@@ -409,7 +409,10 @@ Two runtime media roots, with different audiences:
   softens (an assigned cameraman's card is his customer's product, never a master).
 
 ## Bash Commands
-- `pip install -r requirements.txt` — install Python deps
+- `uv sync` — install Python deps into `.venv`. **There is no `requirements.txt`** —
+  dependencies live in `pyproject.toml` + `uv.lock`. On a box that also needs real-camera
+  pulls, install the hardware SDK *after* this and launch with `uv run --no-sync`
+  thereafter: a re-sync strips the SDK back out (`deploy/mac/run.sh` does exactly that)
 - `python -m ingest.pull --camera <id>` — pull a camera's jumps into raw-storage and enqueue them
 - `python -m ingest.pull --camera <id> --pair [--name "<label>"]` — one-time BLE pairing for a camera; also records it in the MongoDB camera registry so auto-discovery will recognise it
 - `uv pip install ./vendor/OpenGoPro/demos/python/sdk_wireless_camera_control` — install the hardware-only Open GoPro SDK (needed only for live ingest)
@@ -582,7 +585,21 @@ Two runtime media roots, with different audiences:
   manifests, idempotency, retention sweep all unchanged — `DELETE_AFTER_TRANSFER`
   frees inserted cards too). Card identity = the camera serial in `MISC/version.txt`
   (last 4 digits, same id a wireless pull would use → shared staging tree + ledger),
-  else an `sd-<label>` fallback. **Who the footage belongs to comes from the filmed QR
+  else an `sd-<label>` fallback.
+  **A card mounts differently per platform, and all three differences are load-bearing.**
+  POSIX mounts it INSIDE a container (`/media/<user>/<vol>/DCIM`); Windows mounts it AS a
+  drive (`E:\DCIM`), one level shallower. So `_mounts_with_dcim` searches depth 0 under a
+  root that is itself a volume (`_is_volume_root`: a filesystem root is its own parent) and
+  depth 1–2 under a container — and never the other way round, because `C:/*/DCIM` would
+  claim any stray DCIM folder on the system drive as an inserted card. `SDCARD_MOUNT_ROOTS`
+  splits on **`os.pathsep`** (`;` on Windows — a drive letter contains a colon, so a literal
+  `':'` split turned `E:\` into `("E", "\")`), and unset defaults to the platform's roots
+  including the Windows drive letters, which are **probed rather than configured**: a reader
+  is `E:` today and `F:` after another device is plugged in, so an env var would make
+  "insert the card" a two-step job. The id fallback uses the **drive letter** on Windows
+  because `Path("E:/").name` is empty — without it every unlabelled Windows card derives
+  the same id, and a shared id means a shared staging tree and retention ledger (§3-F's
+  collision). **Who the footage belongs to comes from the filmed QR
   session marker**: the instructor records a short clip of their printed QR
   (`scripts/make_instructor_qr.py`, payload `skydiveos-staff:<staffs._id>` — the
   SkydiveOS staff id, NOT the registry's `instructor_id`) **once per session — start,

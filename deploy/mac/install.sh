@@ -5,7 +5,8 @@
 # What it does (idempotent — safe to re-run):
 #   1. Installs Homebrew (if missing) + python@3.11, ffmpeg, git
 #   2. Installs `uv`
-#   3. Installs Python deps from requirements.txt
+#   3. Installs Python deps with `uv sync` (pyproject.toml + uv.lock — there is no
+#      requirements.txt in this repo)
 #   4. Installs the Open GoPro hardware SDK (real cameras: BLE + WiFi)
 #   5. Scaffolds a .env from .env.example if one doesn't exist yet
 #

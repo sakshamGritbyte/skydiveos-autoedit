@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 from collections.abc import Sequence
@@ -37,10 +38,30 @@ from .camera import Camera, CameraError, RemoteMedia
 
 logger = logging.getLogger(__name__)
 
-#: Where removable media typically mounts: Linux desktop (``/media/<user>/<vol>``
-#: or ``/media/<vol>``), systemd/udisks (``/run/media/<user>/<vol>``), macOS
-#: (``/Volumes/<vol>``). Overridable with ``SDCARD_MOUNT_ROOTS``.
-DEFAULT_MOUNT_ROOTS: tuple[str, ...] = ("/media", "/run/media", "/Volumes")
+def _default_mount_roots() -> tuple[str, ...]:
+    """Where removable media appears, per platform.
+
+    POSIX mounts a card INSIDE a container directory — Linux desktop
+    (``/media/<user>/<vol>``, ``/media/<vol>``), systemd/udisks
+    (``/run/media/<user>/<vol>``), macOS (``/Volumes/<vol>``).
+
+    Windows mounts it AS a drive (``E:\\DCIM``), and the letter a reader gets is not
+    stable — the same card is ``E:`` today and ``F:`` after another device is plugged in.
+    So the drive letters are probed rather than configured: asking an operator to keep
+    ``SDCARD_MOUNT_ROOTS`` in step with whatever letter Windows handed out today would
+    make "insert the card" a two-step job, which is the one thing this flow exists to
+    avoid. ``A:``/``B:`` are skipped — they are the legacy floppy letters, and probing
+    them can stall on hardware that still claims them.
+    """
+    if os.name == "nt":
+        return tuple(f"{chr(letter)}:\\" for letter in range(ord("C"), ord("Z") + 1))
+    return ("/media", "/run/media", "/Volumes")
+
+
+#: Where removable media typically mounts. Platform-dependent (see
+#: :func:`_default_mount_roots`); overridable with ``SDCARD_MOUNT_ROOTS``, which is split
+#: on ``os.pathsep`` (``;`` on Windows, because a drive letter contains a colon).
+DEFAULT_MOUNT_ROOTS: tuple[str, ...] = _default_mount_roots()
 
 #: GoPro writes card/camera info here; the JSON carries "camera serial number".
 _VERSION_TXT = Path("MISC") / "version.txt"
@@ -86,13 +107,20 @@ def card_id_for_mount(mount: Path) -> str:
     back to the sanitized volume label prefixed ``sd-`` (which can never collide
     with a 4-digit serial id); the label is only as stable as the card's name,
     so the fallback logs a warning.
+
+    On Windows the label is not in the path at all — a card mounts as ``E:\\`` whose
+    ``name`` is empty — so the drive letter stands in. Without that every unlabelled
+    Windows card would derive the SAME id, and two cards sharing an id share a staging
+    tree and a retention ledger: the exact collision that makes a filename an unsafe
+    delete signal (``AUDIT_MEDIA_MATCH_ISOLATION.md`` §3-F).
     """
     serial = _serial_from_version_txt(mount)
     if serial:
         digits = re.sub(r"\D", "", serial)
         if len(digits) >= 4:
             return digits[-4:]
-    label = re.sub(r"[^A-Za-z0-9_-]+", "-", mount.name).strip("-") or "card"
+    raw = mount.name or mount.drive.rstrip(":\\/") or "card"
+    label = re.sub(r"[^A-Za-z0-9_-]+", "-", raw).strip("-") or "card"
     camera_id = f"sd-{label}"
     logger.warning(
         "card at %s has no readable camera serial (MISC/version.txt); using "
@@ -102,15 +130,29 @@ def card_id_for_mount(mount: Path) -> str:
     return camera_id
 
 
+def _is_volume_root(path: Path) -> bool:
+    """Whether this root IS a volume, rather than a directory holding several.
+
+    A Windows card mounts as its own drive (``E:\\DCIM``); a POSIX card mounts inside a
+    container (``/media/<user>/<vol>/DCIM``). A filesystem root is its own parent, which is
+    exactly that distinction — and getting it wrong matters in one direction: searching a
+    volume root one level down (``C:/*/DCIM``) would happily claim any stray ``DCIM``
+    folder on the system drive as an inserted camera card.
+    """
+    return path.parent == path
+
+
 def _mounts_with_dcim(roots: Sequence[str | Path]) -> list[Path]:
-    """Mounted volumes containing ``DCIM/``, at ``<root>/<vol>`` or ``<root>/<user>/<vol>``."""
+    """Mounted volumes containing ``DCIM/``, under each root at its platform's depth."""
     found: list[Path] = []
     for root in roots:
         base = Path(root)
         if not base.is_dir():
             continue
-        # <root>/<vol>/DCIM plus one extra level for /run/media/<user>/<vol>/DCIM.
-        for pattern in ("*/DCIM", "*/*/DCIM"):
+        # A volume root holds DCIM directly; a container root holds <vol>/DCIM, plus one
+        # extra level for /run/media/<user>/<vol>/DCIM.
+        patterns = ("DCIM",) if _is_volume_root(base) else ("*/DCIM", "*/*/DCIM")
+        for pattern in patterns:
             for dcim in base.glob(pattern):
                 if dcim.is_dir() and dcim.parent not in found:
                     found.append(dcim.parent)

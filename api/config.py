@@ -214,8 +214,9 @@ class Settings:
     #: one pass is too much I/O.
     archive_hashes: bool = True
     #: Mount roots the ``sdcard`` scanner polls for inserted cards
-    #: (``SDCARD_MOUNT_ROOTS``, colon-separated). Defaults cover Linux desktop,
-    #: systemd/udisks and macOS.
+    #: (``SDCARD_MOUNT_ROOTS``, separated by ``os.pathsep`` — ``;`` on Windows, since a
+    #: drive letter contains a colon). Unset defaults to the platform's roots: Linux
+    #: desktop / systemd-udisks / macOS containers, or the Windows drive letters.
     sdcard_mount_roots: tuple[str, ...] = ("/media", "/run/media", "/Volumes")
     #: Only clips shorter than this are probed for a QR session marker
     #: (``SDCARD_QR_MAX_CLIP_SECONDS``) — a deliberate marker clip is seconds long,
@@ -224,6 +225,17 @@ class Settings:
     #: How much of a candidate clip's head is sampled for the QR
     #: (``SDCARD_QR_SCAN_SECONDS``).
     sdcard_qr_scan_seconds: float = 8.0
+
+
+def _default_sdcard_roots() -> tuple[str, ...]:
+    """The platform's removable-media roots, from the module that owns the knowledge.
+
+    Imported lazily: ``api.config`` is imported by nearly everything, and this is only
+    needed when ``SDCARD_MOUNT_ROOTS`` is unset.
+    """
+    from ingest.sdcard import DEFAULT_MOUNT_ROOTS
+
+    return DEFAULT_MOUNT_ROOTS
 
 
 def _flag(name: str, *, default: bool = False) -> bool:
@@ -312,12 +324,16 @@ def get_settings() -> Settings:
         ),
         archive_hashes=_flag("ARCHIVE_HASHES", default=True),
         gallery_rate_limit_per_min=int(os.environ.get("GALLERY_RATE_LIMIT_PER_MIN") or 300),
+        # Split on os.pathsep, not a literal ':' — a Windows drive letter contains a
+        # colon, so `E:\` would split into ("E", "\") and find nothing. The default is
+        # the platform's (drive letters on Windows), kept in one place in ingest.sdcard
+        # and imported lazily so api.config stays import-light.
         sdcard_mount_roots=tuple(
             p.strip()
-            for p in (os.environ.get("SDCARD_MOUNT_ROOTS") or "").split(":")
+            for p in (os.environ.get("SDCARD_MOUNT_ROOTS") or "").split(os.pathsep)
             if p.strip()
         )
-        or ("/media", "/run/media", "/Volumes"),
+        or _default_sdcard_roots(),
         sdcard_qr_max_clip_seconds=float(os.environ.get("SDCARD_QR_MAX_CLIP_SECONDS") or 60.0),
         sdcard_qr_scan_seconds=float(os.environ.get("SDCARD_QR_SCAN_SECONDS") or 8.0),
     )

@@ -28,6 +28,7 @@ from pathlib import Path
 
 import pytest
 
+from api.catalogue import clear_cache as clear_price_cache
 from api.config import get_settings
 
 
@@ -44,6 +45,14 @@ def pinned_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Itera
     # test-job settle checks crashing the dropzone worker). Dead port → a test that
     # reaches an unmocked .apply_async fails loudly instead of polluting the broker.
     monkeypatch.setenv("REDIS_URL", "redis://127.0.0.1:1/0")
+    # Same rule as Redis, for the shared MongoDB: a dev box's ``MONGO_URL`` points at the
+    # dropzone's LIVE Atlas cluster, and the suite must neither depend on it nor read from
+    # it. This was latent until the gallery began reading the operator's price catalogue
+    # (:mod:`api.catalogue`) — a test then asserted against whatever prices the client
+    # happened to have configured that morning, and failed when they changed. Tests that
+    # want a matcher or a catalogue inject one; nothing in the suite dials out.
+    for var in ("MONGO_URL", "MONGO_DB", "DB_NAME"):
+        monkeypatch.delenv(var, raising=False)
     # A dev box with the service-token gate configured would 401 every TestClient
     # request; the tests that assert the gate itself set a token explicitly.
     for var in ("AUTO_EDIT_API_KEY", "AI_BACKEND_API_KEY", "AUTO_EDIT_SERVICE_TOKEN"):
@@ -54,5 +63,7 @@ def pinned_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Itera
     # configuration; the tests that assert the gate itself unset it explicitly.
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://gallery.test")
     get_settings.cache_clear()
+    clear_price_cache()
     yield
     get_settings.cache_clear()
+    clear_price_cache()

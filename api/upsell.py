@@ -18,6 +18,11 @@ straight from the design notes:
   it can contain a colon). Unset → :data:`DEFAULT_TILES` (the three in the design).
   ``off`` / ``none`` → no row at all.
 
+  The *price* on a tile, and whether the tile is offered at all, come from the
+  operator's admin catalogue when one is reachable (:func:`priced_tiles`); the
+  spec above then supplies only the key, title and blurb. Two copies of one price
+  is how a live gallery came to advertise $29 for a $15 item.
+
 Tiles link through the same ``CHECKOUT_URL_TEMPLATE`` as the unlock CTA, with an
 extra ``{item}`` placeholder carrying the tile's key (:func:`link_tiles`). As with
 the unlock CTA, an unset template renders the tile as plain text — the page must
@@ -32,6 +37,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +131,59 @@ def parse_tiles(spec: str | None) -> tuple[UpsellTile, ...]:
             continue
         tiles.append(UpsellTile(key=key, title=title, blurb=blurb, price=price))
     return tuple(tiles)
+
+
+def priced_tiles(
+    tiles: Sequence[UpsellTile], catalogue: Any | None
+) -> tuple[UpsellTile, ...]:
+    """Re-price ``tiles`` from the operator's admin catalogue, dropping the unpriced.
+
+    **The catalogue owns price and existence; code owns the copy.** A dropzone sets
+    prices in one admin screen, and until this function the page carried a second,
+    unreconciled copy of them: a live gallery advertised raw footage at ``$29`` while
+    the catalogue charged ``$15``, and offered two tiles the catalogue had no price for
+    at all, each of which dead-ended the customer on "No price is configured…"
+    (2026-08-13). Both failures are the same mistake — offering something this page
+    cannot know the price of — so both are fixed the same way: the price is read from
+    the catalogue, and a tile the operator has not priced is **not offered**.
+
+    That is the ``never dead-link a customer`` rule of :func:`link_tiles` applied one
+    level earlier. :func:`link_tiles` can only tell whether *this* box knows how to
+    build a checkout URL; only the catalogue knows whether that checkout will accept
+    the item.
+
+    ``catalogue`` is a :class:`api.catalogue.PriceCatalogue` (typed loosely so this
+    module stays import-free and pure). ``None`` — no shared database configured, or it
+    didn't answer — returns ``tiles`` unchanged, which is the pre-catalogue behaviour
+    every existing deployment keeps.
+    """
+    if catalogue is None:
+        return tuple(tiles)
+    repriced: list[UpsellTile] = []
+    for tile in tiles:
+        price = catalogue.display(tile.key)
+        if price is None:
+            logger.info(
+                "upsell: dropping tile %r — the operator has not priced it", tile.key
+            )
+            continue
+        title = catalogue.label(tile.key) or tile.title
+        repriced.append(replace(tile, title=title, price=price))
+    return tuple(repriced)
+
+
+def repriced_from(tile: UpsellTile, catalogue: Any | None) -> UpsellTile:
+    """``tile`` with the catalogue's price when it has one, otherwise unchanged.
+
+    For the per-job load-video tile, which is *generated* rather than operator-listed:
+    an unpriced one keeps its configured price instead of vanishing, because dropping
+    it would silently remove a feature nobody asked to remove. Its price still comes
+    from the admin screen the moment ``load_video`` appears there.
+    """
+    if catalogue is None:
+        return tile
+    price = catalogue.display(tile.key)
+    return tile if price is None else replace(tile, price=price)
 
 
 def link_tiles(

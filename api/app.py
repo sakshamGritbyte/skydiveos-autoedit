@@ -58,6 +58,7 @@ from ingest.registry import CameraRegistry
 
 from . import archive
 from .auth import PUBLIC_PATH_PREFIX, AdminDep, PrincipalDep, service_token_allows
+from .catalogue import PriceCatalogue, load_price_catalogue
 from .config import Settings, get_settings
 from .gallery import render_gallery_html
 from .jobs import (
@@ -101,7 +102,14 @@ from .schemas import (
     UnlockRequest,
     UploadResponse,
 )
-from .upsell import LOAD_VIDEO_KEY, UpsellTile, link_tiles, load_video_tile
+from .upsell import (
+    LOAD_VIDEO_KEY,
+    UpsellTile,
+    link_tiles,
+    load_video_tile,
+    priced_tiles,
+    repriced_from,
+)
 
 if TYPE_CHECKING:
     from ingest.cardstatus import CardStatusRegistry
@@ -270,11 +278,16 @@ UNLOCK_GROUP_ITEM_BY_ROLE = {
     CAMERA_ROLE_INSTRUCTOR: "unlock_instructor",
     CAMERA_ROLE_EXTERNAL: "unlock_external",
 }
+#: The legacy whole-job unlock item — the default an ``item``-less request means, the
+#: CTA a plain Path-B page links, and the key its price is read under.
+UNLOCK_ITEM = "unlock"
 #: The reverse map the unlock endpoint resolves an incoming ``item`` through.
 UNLOCK_GROUP_ITEMS = {item: role for role, item in UNLOCK_GROUP_ITEM_BY_ROLE.items()}
 
-#: Customer-facing CTA text per camera. No price: SkydiveOS prices each item, and a single
-#: ``PREVIEW_PRICE_DISPLAY`` cannot speak for two independently-priced angles.
+#: Customer-facing CTA text per camera. Priceless *as written*: SkydiveOS prices each
+#: item, and a single ``PREVIEW_PRICE_DISPLAY`` cannot speak for two independently-priced
+#: angles. The gallery route appends each angle's own price when the operator's admin
+#: catalogue has one (:mod:`api.catalogue`), which is the only source that can.
 UNLOCK_GROUP_LABEL_BY_ROLE = {
     CAMERA_ROLE_INSTRUCTOR: "🔒 Unlock the handcam video",
     CAMERA_ROLE_EXTERNAL: "🔒 Unlock the outside-camera video",
@@ -1411,8 +1424,8 @@ def create_app() -> FastAPI:
         An unknown item is rejected, mirroring SkydiveOS's fail-loud pricing rule.
         """
         job = _load_or_404(store, job_id)
-        item = body.item.strip().lower() or "unlock"
-        if item == "unlock":
+        item = body.item.strip().lower() or UNLOCK_ITEM
+        if item == UNLOCK_ITEM:
             if job.entitlement is Entitlement.edited_download:
                 return JobResponse.from_job(job)  # already unlocked — idempotent
             updated = store.update(
@@ -1760,17 +1773,27 @@ def create_app() -> FastAPI:
             return LOAD_CHILD_PRODUCT_LABEL
         return job.package.display_label
 
-    def _load_video_tiles(job: Job, settings: Settings) -> tuple[UpsellTile, ...]:
+    def _load_video_tiles(
+        job: Job, settings: Settings, catalogue: PriceCatalogue | None
+    ) -> tuple[UpsellTile, ...]:
         """The load-video upsell tile for a media buyer on a spec-flight load, if any.
 
         Only for a ``jump`` job carrying a ``source_job_id``: a child gallery already *is*
         the load video (its unlock CTA sells it), so offering it a tile would sell the same
         customer the same file twice. Unlinked (plain text) when there's no checkout
         template — the page never dead-links, same rule as the unlock CTA.
+
+        Priced from the operator's admin catalogue when ``load_video`` is listed there,
+        else from ``PREVIEW_PRICE_DISPLAY``. Unlike an operator-listed tile this one is
+        never *dropped* for being unpriced (:func:`api.upsell.repriced_from`) — it is
+        generated per job, and silently removing it would take away a feature nobody
+        asked to remove.
         """
         if job.job_kind is not JobKind.jump or not job.source_job_id:
             return ()
-        tile = load_video_tile(job.load_label, settings.preview_price_display)
+        tile = repriced_from(
+            load_video_tile(job.load_label, settings.preview_price_display), catalogue
+        )
         return link_tiles(
             [tile],
             template=settings.checkout_url_template,
@@ -1853,6 +1876,14 @@ def create_app() -> FastAPI:
         never auth. Lock state is computed per request, never from the URL.
         """
         job = _job_by_token(store, token)
+        # Every price on this page comes from the operator's admin catalogue, so the
+        # figure the customer reads is the figure the checkout charges. Cached and
+        # never-raising: ``None`` (no shared DB, or it didn't answer) falls back to the
+        # configured prices, which is how this page behaved before the catalogue existed.
+        catalogue = load_price_catalogue(settings)
+        unlock_price = (
+            catalogue.display(UNLOCK_ITEM) if catalogue else None
+        ) or settings.preview_price_display
         # Wholly locked (Path B) drives the page's own treatment — badges, the unlock CTA
         # as the primary action, the photo teaser. A MIXED job is not that: the customer
         # owns something, so the page is the unlocked layout with the spec deliverables
@@ -1891,7 +1922,7 @@ def create_app() -> FastAPI:
         unlock_url = None
         if locked and settings.checkout_url_template:
             unlock_url = settings.checkout_url_template.format(
-                job_id=job.job_id, booking_id=job.booking_id or "", item="unlock"
+                job_id=job.job_id, booking_id=job.booking_id or "", item=UNLOCK_ITEM
             )
         # Which deliverables are still locked, and one checkout PER CAMERA that buys that
         # camera's group. Per camera because the two angles are priced and sold separately
@@ -1903,14 +1934,21 @@ def create_app() -> FastAPI:
         for role in MEDIA_REF_ROLES:
             if not unlockable_group(job, role=role):
                 continue
+            item = UNLOCK_GROUP_ITEM_BY_ROLE[role]
             url = None
             if settings.checkout_url_template:
                 url = settings.checkout_url_template.format(
                     job_id=job.job_id,
                     booking_id=job.booking_id or "",
-                    item=UNLOCK_GROUP_ITEM_BY_ROLE[role],
+                    item=item,
                 )
-            group_unlocks.append((UNLOCK_GROUP_LABEL_BY_ROLE[role], url))
+            # Each angle carries its OWN price, which is why the label constant has none
+            # baked in: two cameras sell separately and the operator prices them
+            # separately. Silent when the catalogue is unreachable — a CTA with no figure
+            # still works; one with the wrong figure is a mis-sold product.
+            price = catalogue.display(item) if catalogue else None
+            label = UNLOCK_GROUP_LABEL_BY_ROLE[role]
+            group_unlocks.append((f"{label} — {price}" if price else label, url))
         # The primary action is a download whenever the customer owns SOMETHING — on a
         # mixed page that is their own edit, not the offer.
         dl_url, dl_note = (None, None) if locked else _primary_download(
@@ -1934,7 +1972,7 @@ def create_app() -> FastAPI:
             locked_videos=locked_names,
             group_unlocks=group_unlocks,
             unlock_url=unlock_url,
-            price_display=settings.preview_price_display,
+            price_display=unlock_price,
             photo_count_teaser=len(photo_names),
             tabbed=True,
             show_downloads=not locked,
@@ -1949,12 +1987,12 @@ def create_app() -> FastAPI:
             upsells=[
                 t for t in (
                     *link_tiles(
-                        settings.upsell_tiles,
+                        priced_tiles(settings.upsell_tiles, catalogue),
                         template=settings.checkout_url_template,
                         job_id=job.job_id,
                         booking_id=job.booking_id,
                     ),
-                    *_load_video_tiles(job, settings),
+                    *_load_video_tiles(job, settings, catalogue),
                 )
                 if t.key not in job.addons
             ],

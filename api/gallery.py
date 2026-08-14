@@ -302,7 +302,17 @@ def render_gallery_html(
     # already-unlocked page too — and it reads state, never the media.
     # Must reproduce /j/{code}/state's shape exactly (lock + sorted addon keys) or a
     # stale-looking signature would reload the page in a loop.
-    init_sig = ("locked" if locked else "open") + "|" + ",".join(sorted(purchased_addons))
+    #
+    # And "exactly" means the same PREDICATE, not just the same shape. ``/state``
+    # reports ``any_locked`` — a mixed jump whose speculative half is unpaid is still
+    # "locked" for the purpose of re-rendering when that half is bought. This page's
+    # ``locked`` flag is ``all_locked``, because it drives the *treatment* (badges,
+    # download suppression, the primary action). On a mixed jump the two disagree, and
+    # a baseline built from the treatment flag can NEVER match what /state answers: the
+    # page reloaded every 6 s, forever, the moment a spec camera's locked edit joined a
+    # paid one (observed live 2026-08-13). ``locked or locked_set`` is any-locked here.
+    poll_locked = bool(locked or locked_set)
+    init_sig = ("locked" if poll_locked else "open") + "|" + ",".join(sorted(purchased_addons))
     flip_js = (
         "<script>(function(){var n=0;"
         f"var init='{{sig}}';"

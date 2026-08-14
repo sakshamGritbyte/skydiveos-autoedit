@@ -354,6 +354,29 @@ Two runtime media roots, with different audiences:
   revenue line whether or not the video was pre-purchased, so it renders on both pages
   and on the legacy S3 fallback. A malformed tile is dropped, and a tile with no
   checkout URL renders as **text** — same rule as the unlock CTA, never a dead link.
+- **Every price on the gallery comes from the operator's ADMIN catalogue, never from a
+  second copy of it here** (`api/catalogue.py` → SkydiveOS's `mediaconfigs.pricing`,
+  `{items: {<checkout item>: <minor units>}, currency, labels}`, the document its Media
+  settings screen writes). This service still **prices nothing**; it *reads* the prices,
+  because a figure shown here and a figure charged there must be one number. Two copies
+  is how a live gallery advertised raw footage at `$29` while the checkout charged `$15`,
+  and offered a Photo Pack and a rebook tile the catalogue had no price for at all —
+  each dead-ending the customer on "No price is configured for media item …"
+  (2026-08-13). So the catalogue owns **price and existence**: `upsell.priced_tiles`
+  drops an operator-listed tile that isn't priced (the `never dead-link` rule applied one
+  level earlier — `link_tiles` only knows whether *this* box can build a URL, only the
+  catalogue knows whether the checkout will accept the item), the whole-job CTA reads
+  `unlock`, and each per-camera CTA reads its **own** item (`unlock_instructor` /
+  `unlock_external`) — the reason `UNLOCK_GROUP_LABEL_BY_ROLE` carries no price is that
+  one `PREVIEW_PRICE_DISPLAY` cannot speak for two independently-priced angles, and the
+  catalogue can. `$UPSELL_TILES` (or `DEFAULT_TILES`) then supplies only key/title/blurb;
+  a `labels` entry overrides the title when an operator sets one. Three rules, the usual
+  ones: it **never raises** (a price lookup must not take a customer's page down), it is
+  **cached** (`CACHE_TTL_S`, 60 s — `GET /j/{code}` is anonymous and polled, so Atlas must
+  not sit on its hot path), and it is **off unless `MONGO_URL` is set** → `None` → the
+  configured prices, byte-identical to before. The per-job `load_video` tile is repriced
+  but **never dropped** (`upsell.repriced_from`): it is generated, so an unpriced one
+  keeping `PREVIEW_PRICE_DISPLAY` beats silently removing a feature.
 - **`media_state` is a DERIVED view, not a status** (`api/lifecycle.py`). The design
   doc's Frame 02 machine (`PENDING_CAPTURE → … → READY →` `DELIVERED` |
   `LOCKED_PREVIEW → UNLOCKED`, `FAILED`) is offered to SkydiveOS as a *projection* of
@@ -698,7 +721,8 @@ Two runtime media roots, with different audiences:
   gallery), `PREVIEW_PRICE_DISPLAY` (CTA text only), `CHECKOUT_URL_TEMPLATE`
   (SkydiveOS's checkout page, with `{job_id}`/`{booking_id}`/`{item}`; unset → the CTA
   and the upsell tiles are text, never dead links), `UPSELL_TILES` (the landing page's
-  "Add to your day" row, `key:title:blurb:price|…`; unset → the design's three
+  "Add to your day" row, `key:title:blurb:price|…` — key/title/blurb only, since the
+  admin catalogue owns the price and which tiles exist; unset → the design's three
   defaults, `off` → no row)
 - Under Docker the archive is a **host bind mount** (`./raw-storage:/data/raw-storage`),
   not a named volume: the container layer is wiped by `up --build`, and a bind mount can

@@ -24,6 +24,8 @@ Four contracts are pinned here, and the first is the most important:
 
 from __future__ import annotations
 
+import re
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -1281,3 +1283,124 @@ def test_gallery_media_answers_HEAD_not_405(client) -> None:
         client.head(f"/j/{token}/media/external_full_video").headers["content-length"]
     )
     assert (master, preview) == (len(b"CLEAN-MASTER"), len(b"WATERMARKED"))
+
+
+def _poll_baseline(page: str) -> str:
+    """The lock/addons signature the page's re-render poller starts from."""
+    m = re.search(r"var init='([^']*)'", page)
+    assert m is not None, "the gallery page carries no re-render poller"
+    return m.group(1)
+
+
+def test_mixed_page_poll_baseline_agrees_with_the_state_endpoint(client) -> None:
+    """The page must not reload itself forever on a MIXED jump.
+
+    The poller compares a baseline rendered into the page against what ``/state``
+    answers, and reloads when they differ. ``/state`` reports ``any_locked`` — the spec
+    half being unpaid keeps the jump "locked", which is what makes the page re-render
+    when that half is bought. The page's own ``locked`` flag is ``all_locked``, because
+    it drives the treatment. Building the baseline from the treatment flag made the two
+    permanently disagree on exactly the jump this feature exists for: a paid edit beside
+    a locked one reloaded every 6 s, forever (observed live 2026-08-13).
+    """
+    job_id = _mixed_job_id(client)
+    token = _rendered_mixed(client, job_id=job_id)
+
+    page = client.get(f"/j/{token}").text
+    state = client.get(f"/j/{token}/state").json()
+
+    # Half locked, half owned: the treatment flag and /state's answer genuinely differ.
+    assert "720P PREVIEW" in page and "1080P · FULL QUALITY" in page
+    assert state["locked"] is True
+
+    live = ("locked" if state["locked"] else "open") + "|" + ",".join(state["addons"])
+    assert _poll_baseline(page) == live
+
+
+def test_wholly_owned_page_poll_baseline_is_open(client) -> None:
+    """The unlocked single-product page keeps its old signature — no spurious reload."""
+    job_id = _mixed_job_id(client)
+    token = _rendered_mixed(client, job_id=job_id)
+    client.post(
+        f"/jobs/{job_id}/unlock",
+        json={"item": "unlock_external", "payment_reference": "clover_txn_poll"},
+    )
+
+    page = client.get(f"/j/{token}").text
+    state = client.get(f"/j/{token}/state").json()
+
+    assert state["locked"] is False
+    assert _poll_baseline(page) == "open|"
+
+
+# --------------------------------------------------------------------------- #
+# Prices on the page come from the operator's admin catalogue, not from a second
+# copy of it on this box (see tests/test_catalogue.py for the unit-level rules).
+# --------------------------------------------------------------------------- #
+
+
+def _patch_catalogue(monkeypatch, catalogue) -> None:
+    """Swap the gallery route's price-catalogue reader.
+
+    Via ``sys.modules`` because ``api/__init__.py`` re-exports the FastAPI *instance*
+    as ``api.app``, so monkeypatch's dotted lookup finds the app, not the module.
+    """
+    monkeypatch.setattr(
+        sys.modules["api.app"], "load_price_catalogue", lambda settings: catalogue
+    )
+
+
+def test_gallery_prices_come_from_the_admin_catalogue(client, monkeypatch) -> None:
+    """One price, one place — the figure shown is the figure the checkout charges.
+
+    Live on 2026-08-13 the page advertised raw footage at ``$29`` (this box's default
+    tile) while SkydiveOS charged ``$15``, and offered a Photo Pack and a rebook tile
+    the catalogue had no price for, each of which dead-ended the customer on "No price
+    is configured for media item …".
+    """
+    from api.catalogue import PriceCatalogue
+
+    _patch_catalogue(
+        monkeypatch,
+        PriceCatalogue(items={"unlock": 3900, "unlock_external": 2900, "raw": 1500}),
+    )
+    job_id = _mixed_job_id(client)
+    token = _rendered_mixed(client, job_id=job_id)
+
+    page = client.get(f"/j/{token}").text
+
+    assert "$15" in page  # the catalogue's raw price…
+    assert "$29" in page  # …and the outside-camera unlock, on its own CTA
+    # The tiles the operator never priced are not offered at all.
+    assert "item=photos" not in page
+    assert "item=rebook" not in page
+    assert "item=raw" in page
+
+
+def test_the_per_camera_cta_carries_that_cameras_own_price(client, monkeypatch) -> None:
+    """Two angles sell separately, so each CTA names its own price — only the
+    catalogue can do that; a single ``PREVIEW_PRICE_DISPLAY`` cannot."""
+    from api.catalogue import PriceCatalogue
+
+    _patch_catalogue(monkeypatch, PriceCatalogue(items={"unlock_external": 2900}))
+    job_id = _mixed_job_id(client)
+    token = _rendered_mixed(client, job_id=job_id)
+
+    page = client.get(f"/j/{token}").text
+
+    m = re.search(r"item=unlock_external[^>]*>(.*?)</a>", page, re.S)
+    assert m is not None, "the mixed page carries no per-camera unlock CTA"
+    assert "$29" in m.group(1)
+
+
+def test_without_a_catalogue_the_page_is_unchanged(client, monkeypatch) -> None:
+    """No shared database, or it didn't answer: the configured row, exactly as before."""
+    _patch_catalogue(monkeypatch, None)
+    job_id = _mixed_job_id(client)
+    token = _rendered_mixed(client, job_id=job_id)
+
+    page = client.get(f"/j/{token}").text
+
+    for key in ("raw", "photos", "rebook"):
+        assert f"item={key}" in page, key
+    assert "$29" in page and "$19" in page  # the DEFAULT_TILES figures

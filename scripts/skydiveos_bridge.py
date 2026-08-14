@@ -70,6 +70,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -94,6 +95,11 @@ PRODUCTION_DEBOUNCE_S = 900.0
 
 #: Dev-only escape hatch for the settle window (see ``resolve_debounce``).
 DEV_DEBOUNCE_ENV = "BRIDGE_DEV_DEBOUNCE_SECONDS"
+
+#: How long a pushed card-status snapshot stays servable (see the route). Five missed
+#: pushes at ``ingest.discovery.CARD_STATUS_INTERVAL`` (2 s), so a brief network blip
+#: doesn't blank the operator's screen but a dead ingest box clears it quickly.
+CARD_STATUS_TTL_S = 10.0
 
 
 # -- state file: shared with scripts/unflag_bridge_key.py ------------------- #
@@ -673,6 +679,33 @@ def create_app(bridge: Bridge) -> Any:
     @app.post("/api/media/raw-upload")
     async def raw_upload(notice: dict[str, Any]) -> dict[str, Any]:
         return await bridge.raw_upload(notice)
+
+    # The ingest box pushes its card-status snapshot here every 2 s while any card is
+    # tracked (``ingest.discovery.publish_card_status``) — it cannot be polled, because
+    # the registry is per-process and that box sits behind NAT. In production SkydiveOS
+    # receives this and proxies it to the operator's screen; the bridge stands in for
+    # that consumer, so it implements the contract the real one owes: keep only the LAST
+    # snapshot, behind a short TTL, and degrade to empty once stale. A TTL-less cache
+    # would freeze "DO NOT REMOVE THE CARD" on screen if the ingest box died mid-pull.
+    # Without the route the push 404s every 2 s, burying the pull's own log lines.
+    latest_cards: dict[str, Any] = {"cards": [], "at": 0.0}
+
+    @app.post("/api/media/ingest-cards/status")
+    async def ingest_cards_status(snapshot: dict[str, Any]) -> dict[str, Any]:
+        cards = snapshot.get("cards")
+        latest_cards["cards"] = cards if isinstance(cards, list) else []
+        latest_cards["at"] = time.monotonic()
+        return {"ok": True, "cards": len(latest_cards["cards"])}
+
+    @app.get("/api/media/ingest-cards")
+    async def ingest_cards() -> dict[str, Any]:
+        age = time.monotonic() - float(latest_cards["at"])
+        fresh = bool(latest_cards["at"]) and age <= CARD_STATUS_TTL_S
+        return {
+            "cards": latest_cards["cards"] if fresh else [],
+            "stale": not fresh,
+            "age_s": round(age, 1) if latest_cards["at"] else None,
+        }
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:

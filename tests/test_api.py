@@ -1139,14 +1139,17 @@ def test_photos_addon_opens_the_grid_while_the_video_stays_locked(client: TestCl
     (photos_dir / "index.json").write_text('[{"filename": "photo_001.jpg"}]')
     token = _token(client, job_id)
 
+    # Locked: the clean bytes are unreachable. This fake "JPEG" can't be watermarked,
+    # and the refusal must be a 404 — never a fallback to the full-res file.
     assert client.get(f"/j/{token}/photos/photo_001.jpg").status_code == 404
-    assert "unlock to see them all" in client.get(f"/j/{token}").text
+    locked_page = client.get(f"/j/{token}").text
+    assert "pgrid" in locked_page and "Unlock your photos" in locked_page
 
     client.post(f"/jobs/{job_id}/unlock", json={**_PAYMENT_BODY, "item": "photos"})
 
     assert client.get(f"/j/{token}/photos/photo_001.jpg").content == b"JPEG"
     page = client.get(f"/j/{token}").text
-    assert "pgrid" in page and "unlock to see them all" not in page
+    assert "pgrid" in page and "Unlock your photos" not in page
     # The video half of the page is still Path B: watermarked preview + unlock CTA.
     assert "720P PREVIEW" in page and "Unlock full video" in page
     resp = client.get(f"/j/{token}/media/full_video")
@@ -1216,22 +1219,76 @@ def test_unlock_makes_the_gallery_serve_the_clean_master(client: TestClient) -> 
     assert "Unlock full video" not in client.get(f"/j/{token}").text
 
 
-def test_locked_gallery_hides_the_photos(client: TestClient) -> None:
+def _real_jpeg(path: Path, *, size: tuple[int, int] = (64, 48)) -> bytes:
+    """Write a real (tiny) JPEG so the watermark pass can actually run; return its bytes."""
+    from PIL import Image
+
+    Image.new("RGB", size, (200, 40, 40)).save(path, format="JPEG", quality=90)
+    return path.read_bytes()
+
+
+def test_locked_gallery_serves_watermarked_photo_previews(client: TestClient) -> None:
+    """BUG 350: a locked job's Photos tab shows WORKING watermarked previews.
+
+    The grid renders while locked, every tile URL answers 200 with preview bytes
+    (never the clean file), and the whole-job unlock flips the same URL to the
+    full-res still with no regeneration.
+    """
     job_id = _create(client, entitlement="preview_only")
     _rendered(client, job_id, locked=True)
     store = JobStore(client.jobs_root)
     photos = store.dir(job_id) / "photos"
     photos.mkdir(parents=True, exist_ok=True)
-    (photos / "a.jpg").write_bytes(b"jpeg")
+    clean = _real_jpeg(photos / "a.jpg")
     (photos / "index.json").write_text(json.dumps([{"filename": "a.jpg"}]))
     token = _token(client, job_id)
 
-    page = client.get(f"/j/{token}")
-    assert "1 photos included" in page.text  # a teaser, not the grid
-    assert client.get(f"/j/{token}/photos/a.jpg").status_code == 404
+    page = client.get(f"/j/{token}").text
+    assert f"/j/{token}/photos/a.jpg" in page and "pgrid" in page  # the grid, no teaser
+    assert "Unlock your photos" in page  # the photo set's own offer
+    assert "Download all photos" not in page  # no zip escape hatch while locked
+
+    resp = client.get(f"/j/{token}/photos/a.jpg")
+    assert resp.status_code == 200
+    assert resp.content != clean  # watermarked preview bytes, not the product
+    # Cached beside the job's video previews, outside photos/ (zip/S3/archive safety).
+    assert (store.dir(job_id) / "preview_photos" / "a.jpg").is_file()
 
     client.post(f"/jobs/{job_id}/unlock", json=_PAYMENT_BODY)
-    assert client.get(f"/j/{token}/photos/a.jpg").status_code == 200
+    assert client.get(f"/j/{token}/photos/a.jpg").content == clean
+
+
+def test_partially_unlocked_job_photo_tiles_still_answer(client: TestClient) -> None:
+    """BUG 350's broken-image regression, exactly.
+
+    The page and the photo route must ask the SAME lock question. A job whose
+    entitlement is still ``preview_only`` but with one video deliverable already
+    bought (a per-camera group unlock never touches ``entitlement``) used to render
+    the full photo grid — ``all_locked`` said "not locked" — while the route's
+    ``job.entitlement`` test 404'd every tile: a Photos tab of broken images.
+    """
+    from api.jobs import DeliverableAccess, Entitlement
+
+    job_id = _create(client, entitlement="preview_only")
+    _rendered(client, job_id, locked=True)
+    store = JobStore(client.jobs_root)
+    photos = store.dir(job_id) / "photos"
+    photos.mkdir(parents=True, exist_ok=True)
+    clean = _real_jpeg(photos / "a.jpg")
+    (photos / "index.json").write_text(json.dumps([{"filename": "a.jpg"}]))
+    # One video bought (as a per-camera unlock records it); the job default — and the
+    # photo set with it — stays locked.
+    store.set_deliverable_access(
+        job_id,
+        {"full_video": DeliverableAccess(entitlement=Entitlement.edited_download, born_locked=True)},
+    )
+    token = _token(client, job_id)
+
+    page = client.get(f"/j/{token}").text
+    assert f"/j/{token}/photos/a.jpg" in page  # the grid renders…
+    resp = client.get(f"/j/{token}/photos/a.jpg")
+    assert resp.status_code == 200  # …and every tile answers: no broken images
+    assert resp.content != clean  # with preview bytes — the still isn't bought
 
 
 def test_gallery_media_route_rejects_traversal_and_unknown_names(

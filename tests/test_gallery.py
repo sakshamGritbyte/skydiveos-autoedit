@@ -343,3 +343,43 @@ def test_a_jump_with_no_stills_shows_no_photos_tab_in_either_state() -> None:
     for html in (locked, unlocked):
         assert 'id="tab-photos"' not in html
     assert "Photos unlock with the full video" not in locked
+
+
+# --------------------------------------------------------------------------- #
+# The locked photo-preview grid (BUG 350)
+# --------------------------------------------------------------------------- #
+
+
+def test_locked_page_with_photo_urls_renders_the_grid_not_the_teaser() -> None:
+    """Locked + preview URLs → the watermarked grid and the photo set's own offer."""
+    html = _page(
+        locked=True,
+        tabbed=True,
+        photos=["/j/tok/photos/a.jpg", "/j/tok/photos/b.jpg"],
+        photos_unlocked=False,
+        photos_unlock_url="https://dz.example/checkout?item=photos",
+        photos_unlock_price="$19",
+    )
+    assert "/j/tok/photos/a.jpg" in html and 'class="pgrid"' in html
+    assert "unlock to see them all" not in html  # the teaser is the no-URLs fallback
+    assert "Unlock your photos — $19" in html
+    assert "item=photos" in html
+    assert "Download all photos" not in html  # still no zip escape hatch
+    assert "Photos <span>(2)</span>" in html  # count comes from the URLs
+
+
+def test_locked_photo_offer_without_checkout_url_is_text_not_a_dead_link() -> None:
+    html = _page(
+        locked=True,
+        photos=["/j/tok/photos/a.jpg"],
+        photos_unlocked=False,
+    )
+    assert "Unlock your photos · ask at the desk" in html
+    assert 'href=""' not in html
+
+
+def test_locked_page_without_photo_urls_keeps_the_teaser() -> None:
+    """Legacy callers (no preview URLs) still get the count line, not an empty grid."""
+    html = _page(locked=True, photos=[], photo_count_teaser=32, tabbed=True)
+    assert "32 photos included — unlock to see them all." in html
+    assert "Unlock your photos" not in html

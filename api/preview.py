@@ -11,6 +11,13 @@ deployed FFmpeg lacks libfreetype).
 Preview files live beside the clean masters as ``<job_dir>/preview_<name>.mp4`` and
 are deliberately **not** recorded in ``Job.outputs`` — they'd leak into the S3
 delivery set. The gallery route derives them from the ``preview_`` convention.
+
+Locked **photos** get the same treatment per still (BUG 350): the gallery's Photos
+tab shows a watermarked, downscaled preview of every image behind an "unlock your
+photos" offer, produced lazily by :func:`ensure_photo_preview` on first request and
+cached in ``<job_dir>/preview_photos/``. Deliberately OUTSIDE ``photos/``: the paid
+zip archives that directory recursively, delivery's per-photo S3 uploads glob it, and
+the jump archive mirrors it — a preview inside would leak into all three.
 """
 
 from __future__ import annotations
@@ -18,6 +25,7 @@ from __future__ import annotations
 import logging
 import subprocess
 import tempfile
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
@@ -43,9 +51,79 @@ class PreviewError(RuntimeError):
     """Raised when a preview transcode cannot be produced."""
 
 
+#: Where a job's watermarked photo previews live (a sibling of ``photos/``, never
+#: inside it — see the module docstring).
+PHOTO_PREVIEW_DIRNAME = "preview_photos"
+#: Longest edge of a photo preview. Big enough to sell the moment in the grid and
+#: lightbox, far from the full-res still the customer is buying.
+PHOTO_PREVIEW_MAX_EDGE = 1280
+#: JPEG quality of a photo preview — a teaser, not the product.
+_PHOTO_PREVIEW_QUALITY = 72
+
+
 def preview_path(job_dir: Path, name: str) -> Path:
     """Where deliverable ``name``'s watermarked preview lives in the job dir."""
     return job_dir / f"{PREVIEW_PREFIX}{name}.mp4"
+
+
+def photo_preview_path(job_dir: Path, filename: str) -> Path:
+    """Where the watermarked preview of still ``filename`` lives in the job dir."""
+    return job_dir / PHOTO_PREVIEW_DIRNAME / filename
+
+
+def ensure_photo_preview(job_dir: Path, filename: str, settings: Settings) -> Path | None:
+    """Return the watermarked preview of one still, rendering it on first request.
+
+    Lazy + disk-cached (re-rendered if the source still is newer), so unlock stays a
+    one-field state change, previews exist for jobs rendered before this feature, and
+    a 50-image grid costs its Pillow pass exactly once per photo.
+
+    **Never raises, and never falls back to the clean file**: ``None`` tells the
+    caller no preview could be produced, and the caller must refuse the request — a
+    watermark failure that served the full-res still would be a paywall bypass.
+    """
+    src = job_dir / "photos" / filename
+    out = photo_preview_path(job_dir, filename)
+    try:
+        if not src.is_file():
+            return None
+        if out.is_file() and out.stat().st_mtime >= src.stat().st_mtime:
+            return out
+
+        from PIL import Image
+
+        with Image.open(src) as raw:
+            im = raw.convert("RGB")
+        im.thumbnail((PHOTO_PREVIEW_MAX_EDGE, PHOTO_PREVIEW_MAX_EDGE))
+
+        logo = Path(settings.watermark_logo) if settings.watermark_logo else None
+        if logo is not None and not logo.is_file():
+            logo = None  # text-only mark, never a failed preview
+        with tempfile.TemporaryDirectory(prefix="photo-watermark-") as tmp:
+            png = render_watermark(
+                Path(tmp) / "watermark.png",
+                width=im.width,
+                height=im.height,
+                brand=settings.delivery_brand_name,
+                message="Preview — unlock your photos",
+                logo_path=logo,
+            )
+            with Image.open(png) as overlay:
+                marked = Image.alpha_composite(im.convert("RGBA"), overlay).convert("RGB")
+
+        out.parent.mkdir(parents=True, exist_ok=True)
+        # Write-then-replace so a concurrent request for the same still never reads a
+        # half-written file (FastAPI serves these from a thread pool).
+        part = out.with_name(f".{uuid.uuid4().hex}.part")
+        marked.save(part, format="JPEG", quality=_PHOTO_PREVIEW_QUALITY)
+        part.replace(out)
+        return out
+    except Exception:
+        logger.warning(
+            "photo preview failed for %s/%s; refusing (never the clean file)",
+            job_dir.name, filename, exc_info=True,
+        )
+        return None
 
 
 def _run_ffmpeg(cmd: list[str]) -> None:

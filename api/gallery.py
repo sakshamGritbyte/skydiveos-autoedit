@@ -10,7 +10,8 @@ action, and the "Add to your day" upsell row. Two hosts use it:
 * the live ``GET /j/{code}`` route (:mod:`api.app`), which re-renders per request —
   ``tabbed=True`` for the Video/Photos tabs, and ``locked=True`` for a
   ``preview_only`` job (design doc Path B): watermarked players, a
-  "Unlock full video" CTA, and a photo teaser instead of the grid.
+  "Unlock full video" CTA, and a watermarked photo-preview grid with its own
+  "unlock your photos" offer.
 
 Two rules from the design notes shape the layout:
 
@@ -105,6 +106,8 @@ def render_gallery_html(
     upsells: Sequence[UpsellTile] = (),
     poll_token: str | None = None,
     photos_unlocked: bool | None = None,
+    photos_unlock_url: str | None = None,
+    photos_unlock_price: str | None = None,
     raw_videos: list[tuple[str, str]] | None = None,
     load_videos: list[tuple[str, str]] | None = None,
     purchased_addons: Sequence[str] = (),
@@ -140,6 +143,11 @@ def render_gallery_html(
     * ``photos_unlocked`` — decouples the photo grid from the paywall: a locked job
       that bought the ``photos`` add-on shows the grid while the videos stay
       watermarked. ``None`` (legacy callers) keeps the old rule: photos follow the lock.
+      When ``photos`` URLs are passed while NOT unlocked, the grid renders anyway —
+      the host serves watermarked preview bytes at those URLs (BUG 350) — followed by
+      its own unlock offer (``photos_unlock_url`` / ``photos_unlock_price``, text when
+      no checkout URL exists: never a dead link). Only a locked page with NO photo
+      URLs falls back to the old ``photo_count_teaser`` line.
     * ``raw_videos`` — the purchased Raw Footage section: ``(label, url)`` per camera
       master, rendered under the Video tab with download links. Empty/None → no section.
     * ``load_videos`` — the purchased spec-flight load video: ``(label, url)``, rendered
@@ -224,12 +232,29 @@ def render_gallery_html(
         f'<a class="btn" href="{e(download_all_url)}" download>Download all photos (.zip)</a>'
         if download_all_url and photos_unlocked else ""
     )
-    n_photos = len(photos) if photos_unlocked else photo_count_teaser
-    photo_body = (
-        f'<div class="pgrid">{photo_tiles}</div>'
-        if photos_unlocked
-        else f'<p class="teaser">{n_photos} photos included — unlock to see them all.</p>'
-    )
+    n_photos = len(photos) if photos else photo_count_teaser
+    if photos_unlocked:
+        photo_body = f'<div class="pgrid">{photo_tiles}</div>'
+    elif photos:
+        # Locked, with previewable stills: the watermarked grid (the host serves
+        # preview bytes at these URLs) and the photo set's OWN unlock offer — a photos
+        # purchase is an add-on, separate from the video paywall. Same dead-link rule
+        # as every CTA: text when there is no checkout URL.
+        line = "Unlock your photos" + (
+            f" — {e(photos_unlock_price)}" if photos_unlock_price else ""
+        )
+        action = (
+            f'<a class="ctabtn" rel="noreferrer" href="{e(photos_unlock_url)}">🔒 {line}</a>'
+            if photos_unlock_url
+            else f'<span class="ctabtn">{line} · ask at the desk</span>'
+        )
+        photo_body = (
+            f'<div class="pgrid">{photo_tiles}</div>'
+            f'<div class="cta">{action}'
+            '<div class="ctasub">Full resolution, watermark-free. Instant download.</div></div>'
+        )
+    else:
+        photo_body = f'<p class="teaser">{n_photos} photos included — unlock to see them all.</p>'
     # The section appears when this jump HAS stills — locked or not, so the two states
     # keep one layout (Frame 03). A package that shot none (video_only) gets no Photos
     # tab in either state: a locked page must not advertise photos that don't exist.

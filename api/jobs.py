@@ -658,6 +658,24 @@ def locked_deliverables(job: Job) -> frozenset[str]:
     )
 
 
+def photos_locked(job: Job) -> bool:
+    """Whether the photo set is behind the paywall — the ONLY way to ask it.
+
+    The photo twin of :func:`entitlement_for`: ``photos`` is one ``outputs`` key with
+    one lock state, so an explicit :class:`DeliverableAccess` entry (seeded from the
+    paid ref on a mixed job) wins, else the set inherits the job's own entitlement —
+    and the purchased ``photos`` add-on opens it on an otherwise-locked job. The
+    gallery page and the photo route MUST both ask this: when the page decided from
+    ``all_locked`` (a video-only aggregate) and the route from ``job.entitlement``,
+    the two disagreed on any partially-unlocked job and every tile 404'd (BUG 350's
+    broken images).
+    """
+    return (
+        entitlement_for(job, "photos") is Entitlement.preview_only
+        and "photos" not in job.addons
+    )
+
+
 def any_locked(job: Job) -> bool:
     """Whether ANY video deliverable is behind the paywall.
 

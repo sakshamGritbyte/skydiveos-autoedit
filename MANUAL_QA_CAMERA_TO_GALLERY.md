@@ -361,7 +361,9 @@ echo $GAL
 **Path B (`preview_only`):**
 - [ ] Amber accent, `720P PREVIEW`, watermark visible, no download control.
 - [ ] Primary action is `🔒 Unlock full video — <price>`.
-- [ ] Photos are **hidden behind a count teaser**; a direct photo URL returns **404**.
+- [ ] Photos show as **watermarked previews** behind an `Unlock your photos` CTA; a
+      direct photo URL returns the **watermarked bytes** (smaller than the original,
+      mark visible), never the clean full-res still.
 - [ ] **The master is unreachable at any URL** — same name, still the preview:
       ```bash
       curl -sI "$GAL/media/full_video" | head -3     # size = the 720p preview

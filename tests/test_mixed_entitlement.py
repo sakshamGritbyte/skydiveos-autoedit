@@ -1360,6 +1360,8 @@ def test_gallery_prices_come_from_the_admin_catalogue(client, monkeypatch) -> No
     """
     from api.catalogue import PriceCatalogue
 
+    monkeypatch.setenv("CHECKOUT_URL_TEMPLATE", "https://pay.test/c?j={job_id}&item={item}")
+    get_settings.cache_clear()
     _patch_catalogue(
         monkeypatch,
         PriceCatalogue(items={"unlock": 3900, "unlock_external": 2900, "raw": 1500}),
@@ -1382,6 +1384,8 @@ def test_the_per_camera_cta_carries_that_cameras_own_price(client, monkeypatch) 
     catalogue can do that; a single ``PREVIEW_PRICE_DISPLAY`` cannot."""
     from api.catalogue import PriceCatalogue
 
+    monkeypatch.setenv("CHECKOUT_URL_TEMPLATE", "https://pay.test/c?j={job_id}&item={item}")
+    get_settings.cache_clear()
     _patch_catalogue(monkeypatch, PriceCatalogue(items={"unlock_external": 2900}))
     job_id = _mixed_job_id(client)
     token = _rendered_mixed(client, job_id=job_id)
@@ -1395,6 +1399,8 @@ def test_the_per_camera_cta_carries_that_cameras_own_price(client, monkeypatch) 
 
 def test_without_a_catalogue_the_page_is_unchanged(client, monkeypatch) -> None:
     """No shared database, or it didn't answer: the configured row, exactly as before."""
+    monkeypatch.setenv("CHECKOUT_URL_TEMPLATE", "https://pay.test/c?j={job_id}&item={item}")
+    get_settings.cache_clear()
     _patch_catalogue(monkeypatch, None)
     job_id = _mixed_job_id(client)
     token = _rendered_mixed(client, job_id=job_id)

@@ -231,7 +231,14 @@ Two runtime media roots, with different audiences:
   not the customer paid; `Job.entitlement` decides what their gallery shows:
   `edited_download` (Path A — media purchased: the clean 1080p deliverables, downloads
   enabled) or `preview_only` (Path B — speculative capture: watermarked 720p previews
-  behind an unlock CTA, photos hidden behind a count teaser). SkydiveOS sends it on
+  behind an unlock CTA; photos show as **watermarked, downscaled previews** behind a
+  `photos`-add-on CTA — `api.preview.ensure_photo_preview`, rendered lazily per still on
+  first request and cached in `jobs/<id>/preview_photos/`, deliberately OUTSIDE
+  `photos/` so the paid zip, the per-photo S3 uploads and the archive mirror never pick
+  them up. The photo lock is its own question, `api.jobs.photos_locked` —
+  `entitlement_for(job, "photos")` + the `photos` addon — asked identically by the
+  gallery page and `GET /j/{code}/photos/{f}`; asking two different questions there is
+  what rendered a grid of 404ing tiles, BUG 350). SkydiveOS sends it on
   `POST /jobs`; `ingest.match.package_and_entitlement_for` derives it for our own
   matcher (no purchase → the role-default package + `preview_only`, instead of the old
   "no job at all"). Four rules:

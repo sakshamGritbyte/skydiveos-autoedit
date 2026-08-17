@@ -323,3 +323,54 @@ def test_render_previews_seam_is_a_no_op_for_path_a(
     tasks._render_previews(store, "j1")  # must not raise, must not write
 
     assert not list(jd.glob(f"{PREVIEW_PREFIX}*"))
+
+
+# --------------------------------------------------------------------------- #
+# Watermarked photo previews (BUG 350)
+# --------------------------------------------------------------------------- #
+
+
+def _still(path: Path, *, size: tuple[int, int] = (1920, 1080)) -> bytes:
+    from PIL import Image
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", size, (10, 120, 200)).save(path, format="JPEG", quality=90)
+    return path.read_bytes()
+
+
+def test_photo_preview_is_watermarked_downscaled_and_cached(tmp_path: Path) -> None:
+    from PIL import Image
+
+    from api.preview import (
+        PHOTO_PREVIEW_MAX_EDGE,
+        ensure_photo_preview,
+        photo_preview_path,
+    )
+
+    clean = _still(tmp_path / "photos" / "f_42.jpg")
+    out = ensure_photo_preview(tmp_path, "f_42.jpg", _settings())
+
+    assert out == photo_preview_path(tmp_path, "f_42.jpg")
+    assert out is not None and out.is_file()
+    assert out.parent.name == "preview_photos"  # NEVER inside photos/ (zip/S3/archive)
+    assert out.read_bytes() != clean
+    with Image.open(out) as img:
+        assert max(img.size) <= PHOTO_PREVIEW_MAX_EDGE  # a teaser, not the product
+        assert img.size[0] * 1080 == img.size[1] * 1920  # aspect kept, no pad/crop
+
+    # Cached: a second ask returns the same file without re-rendering it.
+    stamp = out.stat().st_mtime_ns
+    assert ensure_photo_preview(tmp_path, "f_42.jpg", _settings()) == out
+    assert out.stat().st_mtime_ns == stamp
+
+
+def test_photo_preview_never_falls_back_to_the_clean_file(tmp_path: Path) -> None:
+    """An unreadable still yields None — the caller must refuse, not serve clean."""
+    from api.preview import ensure_photo_preview
+
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    (photos / "junk.jpg").write_bytes(b"not a jpeg at all")
+
+    assert ensure_photo_preview(tmp_path, "junk.jpg", _settings()) is None
+    assert ensure_photo_preview(tmp_path, "missing.jpg", _settings()) is None

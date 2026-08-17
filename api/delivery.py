@@ -507,7 +507,7 @@ def deliver_to_customer(
     )
 
     # Photos zip → durable copy + "download all" (locked: no link; the gallery
-    # shows a count teaser instead of the stills). The photo set is produced from the
+    # shows watermarked previews instead of the stills). The photo set is produced from the
     # PAID ref on a mixed job, so it inherits the job's own entitlement unless an
     # explicit access entry says otherwise.
     zip_url: str | None = None

@@ -278,7 +278,7 @@ served **live** by this API — so it never expires and flips state without a re
 | When | The booking bought media | Speculative capture — nothing bought |
 | Gallery streams | The clean 1080p deliverables | Watermarked **720p previews** |
 | Downloads | Enabled | Locked, behind the unlock CTA |
-| Photos | The full grid | Hidden (a "N photos included" teaser) |
+| Photos | The full grid, full res | Watermarked downscaled previews + an "Unlock your photos" (`item=photos`) CTA |
 
 Both paths render and store the **clean masters** up front. So when payment lands, the
 unlock is instant — no re-render, no re-delivery, same link.

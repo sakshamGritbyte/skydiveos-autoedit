@@ -76,9 +76,10 @@ from .jobs import (
     any_locked,
     entitlement_for,
     locked_deliverables,
+    photos_locked,
     unlockable_group,
 )
-from .preview import preview_path
+from .preview import ensure_photo_preview, preview_path
 from .queue import CeleryJobQueue, JobQueue
 from .ratelimit import FixedWindowLimiter, caller_key
 from .schemas import (
@@ -1889,10 +1890,13 @@ def create_app() -> FastAPI:
         # owns something, so the page is the unlocked layout with the spec deliverables
         # locked card-by-card and their own group CTA.
         locked = all_locked(job)
-        # Purchased add-ons unlock their own section independently of the paywall:
-        # a photos purchase opens the grid on a still-locked page, and a raw purchase
-        # adds the camera-master players to either state.
-        photos_purchased = "photos" in job.addons
+        # The photo set's lock is its OWN question (api.jobs.photos_locked), never the
+        # page's video-derived `locked`: asking two different questions here and in
+        # `public_photo` is what rendered a grid of 404ing tiles on any partially
+        # unlocked job (BUG 350). While locked the grid still renders — the route
+        # serves watermarked preview bytes at the same URLs — behind a photos-add-on
+        # unlock offer; a raw purchase adds the camera-master players to either state.
+        locked_photos = photos_locked(job)
         raw_clips = (
             [(label, f"/j/{token}/raw/{rel}") for label, rel in _gallery_raw_clips(store, job)]
             if "raw" in job.addons else []
@@ -1954,17 +1958,24 @@ def create_app() -> FastAPI:
         dl_url, dl_note = (None, None) if locked else _primary_download(
             store, job, token, [n for n in video_names if n not in locked_names]
         )
+        # The locked photo grid's own offer — the `photos` add-on item, priced by the
+        # operator's catalogue like every other figure on this page. Same dead-link
+        # rule as the unlock CTA: no checkout template → rendered as text.
+        photos_unlock_url = None
+        if locked_photos and settings.checkout_url_template:
+            photos_unlock_url = settings.checkout_url_template.format(
+                job_id=job.job_id, booking_id=job.booking_id or "", item="photos"
+            )
         html_page = render_gallery_html(
             brand=settings.delivery_brand_name,
             customer_name=job.customer_name,
             jump_date=job.jump_date,
             location=settings.delivery_location,
             videos=[(n, f"/j/{token}/media/{n}") for n in video_names],
-            photos=(
-                [f"/j/{token}/photos/{n}" for n in photo_names]
-                if (not locked or photos_purchased) else []
-            ),
-            photos_unlocked=not locked or photos_purchased,
+            photos=[f"/j/{token}/photos/{n}" for n in photo_names],
+            photos_unlocked=not locked_photos,
+            photos_unlock_url=photos_unlock_url,
+            photos_unlock_price=catalogue.display("photos") if catalogue else None,
             raw_videos=raw_clips,
             load_videos=load_clips,
             download_all_url=None,
@@ -2109,17 +2120,34 @@ def create_app() -> FastAPI:
         include_in_schema=False,
         response_class=FileResponse,
     )
-    def public_photo(token: str, filename: str, store: StoreDep) -> FileResponse:
-        """Serve one full-res still — unlocked jobs, or a locked job that bought photos."""
+    def public_photo(
+        token: str, filename: str, store: StoreDep, settings: SettingsDep
+    ) -> FileResponse:
+        """Serve one still — full-res when the set is owned, watermarked while locked.
+
+        The photo twin of ``public_media``'s rule: the **entitlement**, never the URL,
+        picks the file. The lock is asked through :func:`api.jobs.photos_locked` — the
+        same question the gallery page asks when it renders the grid, which is the
+        BUG 350 fix: two different predicates here and there meant the page could emit
+        a grid this route then 404'd tile by tile. While locked, the bytes served are
+        the lazily-rendered watermarked preview (:func:`api.preview.ensure_photo_preview`);
+        a preview that cannot be produced refuses the request rather than falling back
+        to the clean file.
+        """
         job = _job_by_token(store, token)
-        if job.entitlement is Entitlement.preview_only and "photos" not in job.addons:
-            raise HTTPException(status_code=404, detail="photos unlock with the full video")
         if not _is_safe_segment(filename):
             raise HTTPException(status_code=400, detail="invalid photo filename")
-        photos_dir = store.dir(_media_job(store, job).job_id) / "photos"
+        owner_dir = store.dir(_media_job(store, job).job_id)
+        photos_dir = owner_dir / "photos"
         path = photos_dir / filename
         if not path.exists() or not _served_under(path, photos_dir):
             raise HTTPException(status_code=404, detail="photo not found")
+        if photos_locked(job):
+            preview = ensure_photo_preview(owner_dir, filename, settings)
+            if preview is None:
+                raise HTTPException(status_code=404, detail="photo preview unavailable")
+            # Inline and unnamed: a locked preview is a look, not a file to keep.
+            return FileResponse(preview, media_type="image/jpeg")
         return FileResponse(path, media_type="image/jpeg", filename=filename)
 
     @app.get("/j/{token}/load/{name}", include_in_schema=False, response_class=FileResponse)

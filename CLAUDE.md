@@ -361,6 +361,35 @@ Two runtime media roots, with different audiences:
   revenue line whether or not the video was pre-purchased, so it renders on both pages
   and on the legacy S3 fallback. A malformed tile is dropped, and a tile with no
   checkout URL renders as **text** — same rule as the unlock CTA, never a dead link.
+- **Every video card opens on a frame from that very video** (`api/thumbnail.py` →
+  `GET /j/{code}/poster/{name}`). A `<video>` with no `poster` is drawn by the browser
+  — a grey box or iOS's generic cloud tile — so five cards read as one stock page, on
+  the surface whose whole job is to make a locked edit worth buying. So each card gets
+  a still **selected out of its own deliverable**: one FFmpeg pass dumps ~24 small
+  candidates across the middle of the file (the head/tail skip is what excludes the
+  intro/outro title cards — the black frames a poster must never be), each is measured
+  for sharpness/exposure/colour and, *if the FaceLandmarker bundle is already on disk*
+  (`analysis.models.cached_model` — never a 30 MB download inside a customer's page
+  request), scored for smile/eye-contact/framing by the same `analysis.score` the
+  pipeline runs; the winner is re-cut at full res and cropped to the card's 16:9.
+  `select_frame`/`profile_for` are **pure** and per-deliverable: a `freefall` cut is
+  judged mid-clip and face-first, `highlights` on its peak moment, `full_video` past
+  the middle where the jump is (`external_freefall` etc. resolve to the same profiles,
+  so a mixed job's namespaced cuts are judged as what they are). Four rules:
+  * **The entitlement, never the URL, picks the source** — as everywhere else. A locked
+    deliverable's poster is cut from its **watermarked** `preview_<name>.mp4`, so a
+    paywalled card can't leak a clean frame, and the still carries the same mark as the
+    video it teases. Unlock swaps it to the clean still with no regeneration: the two
+    are separate cached files (`posters/full_video.jpg` vs `posters/preview_full_video.jpg`).
+  * **It never fails anything.** Pre-built at each render seam beside the archive mirror
+    (`api.tasks._render_posters`) and lazily on first request; every failure path returns
+    `None` → the route 404s → the card renders exactly as it did before. No ffmpeg, no
+    model, an all-black video: same outcome. `GALLERY_THUMBNAILS=0` turns it off wholesale.
+  * **Posters live in `<job_dir>/posters/`, never in `Job.outputs`** — same reasoning as
+    `preview_photos/`: the paid photo zip, delivery's per-photo S3 uploads and the
+    archive mirror all sweep directories, and a decorative JPEG must not ride along.
+  * The **legacy S3 gallery passes no posters** and is byte-identical to before; the
+    stills stream from this API, which the presigned-page fallback by definition can't.
 - **Every price on the gallery comes from the operator's ADMIN catalogue, never from a
   second copy of it here** (`api/catalogue.py` → SkydiveOS's `mediaconfigs.pricing`,
   `{items: {<checkout item>: <minor units>}, currency, labels}`, the document its Media
@@ -730,7 +759,8 @@ Two runtime media roots, with different audiences:
   and the upsell tiles are text, never dead links), `UPSELL_TILES` (the landing page's
   "Add to your day" row, `key:title:blurb:price|…` — key/title/blurb only, since the
   admin catalogue owns the price and which tiles exist; unset → the design's three
-  defaults, `off` → no row)
+  defaults, `off` → no row), `GALLERY_THUMBNAILS` (per-card poster frames, on by
+  default — off falls back to the browser's placeholder tile)
 - Under Docker the archive is a **host bind mount** (`./raw-storage:/data/raw-storage`),
   not a named volume: the container layer is wiped by `up --build`, and a bind mount can
   be rsync'd off the box without `docker exec`. Being a separate mount from the `jobs`
@@ -849,6 +879,11 @@ Two runtime media roots, with different audiences:
 - Don't let the gallery emit a dead link: an upsell tile or unlock CTA with no
   `CHECKOUT_URL_TEMPLATE` renders as text. And don't gate the upsell row on entitlement
   — the row is the same on the locked and unlocked page
+- Don't cut a card's poster from a file the request's entitlement wouldn't serve, don't
+  put posters in `Job.outputs` or inside `photos/`, and don't let a poster failure raise:
+  a card with no still is the pre-feature card, which is a perfectly good outcome. And
+  don't reach for `analysis.models.resolve_model` on a request path — it downloads;
+  `cached_model()` is the "only if it's already here" question the poster picker asks
 
 ## Workflow Rules
 - Before writing new code, read related modules to understand existing patterns

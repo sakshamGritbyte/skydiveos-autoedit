@@ -13,6 +13,7 @@ tests; here we only verify the API drives them correctly.
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -1154,6 +1155,63 @@ def test_photos_addon_opens_the_grid_while_the_video_stays_locked(client: TestCl
     assert "720P PREVIEW" in page and "Unlock full video" in page
     resp = client.get(f"/j/{token}/media/full_video")
     assert resp.content == b"WATERMARKED"  # the clean master stays unreachable
+
+
+def test_every_video_card_points_at_its_own_poster(client: TestClient) -> None:
+    """No generic placeholder tile: each card asks for a still cut from its own edit."""
+    job_id = _create(client, customer_name="Sophie Lavoie")
+    _rendered(client, job_id, locked=False)
+    token = _token(client, job_id)
+    page = client.get(f"/j/{token}").text
+    assert f'poster="/j/{token}/poster/full_video"' in page
+
+
+def test_a_locked_cards_poster_is_cut_from_the_watermarked_preview(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The paywall's rule holds for the still too: the entitlement picks the source."""
+    # `api.app` the attribute is the FastAPI instance (api/__init__ re-exports it),
+    # so reach the module through sys.modules to patch its poster seam.
+    app_module = sys.modules["api.app"]
+
+    seen: list[Path] = []
+
+    def _fake(source: Path, **kwargs: object) -> Path:
+        seen.append(source)
+        out = source.parent / "posters" / f"{source.stem}.jpg"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"POSTER")
+        return out
+
+    monkeypatch.setattr(app_module, "ensure_poster", _fake)
+
+    job_id = _create(client, entitlement="preview_only")
+    _rendered(client, job_id, locked=True)
+    token = _token(client, job_id)
+
+    resp = client.get(f"/j/{token}/poster/full_video")
+    assert resp.status_code == 200 and resp.content == b"POSTER"
+    assert seen[-1].name == "preview_full_video.mp4"  # never the clean master
+
+    # Paying flips the source with no regeneration of anything else.
+    client.post(f"/jobs/{job_id}/unlock", json=_PAYMENT_BODY)
+    assert client.get(f"/j/{token}/poster/full_video").status_code == 200
+    assert seen[-1].name == "full_video.mp4"
+
+
+def test_a_poster_that_cannot_be_made_is_a_404_not_a_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rule 9: the card falls back to the browser's own placeholder, page intact."""
+    monkeypatch.setattr(sys.modules["api.app"], "ensure_poster", lambda source, **kw: None)
+    job_id = _create(client)
+    _rendered(client, job_id, locked=False)
+    token = _token(client, job_id)
+    assert client.get(f"/j/{token}/poster/full_video").status_code == 404
+    # An unknown/traversing deliverable never reaches the thumbnailer at all.
+    assert client.get(f"/j/{token}/poster/nope").status_code == 404
+    assert client.get(f"/j/{token}/poster/..%2Fjob").status_code in (400, 404)
+    assert client.get(f"/j/{token}").status_code == 200
 
 
 def test_gallery_page_carries_the_flip_poll_in_both_states(client: TestClient) -> None:

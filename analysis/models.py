@@ -71,6 +71,22 @@ def resolve_model(model_path: str | Path | None = None) -> Path:
     return _download_model(_REPO_CACHE)
 
 
+def cached_model() -> Path | None:
+    """The bundle if one is **already** on disk, else ``None``. Never downloads.
+
+    For callers that want face signals as an *enhancement* rather than a requirement —
+    the gallery poster picker (:mod:`api.thumbnail`) runs inside a customer's page
+    request, where a 30 MB one-time download would trade a nicer thumbnail for a
+    stalled page. They ask this first and degrade to image-quality-only when it is
+    ``None``; the pipeline keeps calling :func:`resolve_model`, which still fetches.
+    """
+    env = os.environ.get(MODEL_ENV_VAR)
+    if env:
+        path = Path(env)
+        return path if path.exists() else None
+    return _REPO_CACHE if _REPO_CACHE.exists() else None
+
+
 def _download_model(dest: Path) -> Path:
     """Fetch the pinned bundle to ``dest`` atomically (temp file + rename)."""
     dest.parent.mkdir(parents=True, exist_ok=True)

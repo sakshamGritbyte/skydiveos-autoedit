@@ -206,6 +206,21 @@ def _render_previews(store: JobStore, job_id: str) -> None:
     render_job_previews(store.load(job_id), store, get_settings())
 
 
+def _render_posters(store: JobStore, job_id: str) -> None:
+    """Pre-build each deliverable's gallery poster frame (:mod:`api.thumbnail`).
+
+    Called at every "render finished" seam, *beside* the archive mirror and outside the
+    task's ``try`` — and, like the archive, it **never raises**: a card with no poster
+    falls back to the browser's placeholder, which is not worth failing a customer's
+    edit over. Doing it here (rather than only lazily on first request) means the
+    customer's first page load is already warm, and the previews it posters for a
+    locked job have just been rendered.
+    """
+    from .thumbnail import render_job_posters
+
+    render_job_posters(store.load(job_id), store, get_settings())
+
+
 def _auto_deliver_block(store: JobStore, job: Job) -> str | None:
     """Why this job must NOT be auto-delivered, or ``None`` when it's safe to send.
 
@@ -319,6 +334,7 @@ def process_job(job_id: str) -> str:
     updated = store.update(job_id, status=JobStatus.ready_for_review)
     _notify_skydiveos(updated)
     _archive_deliverables(store, job_id)
+    _render_posters(store, job_id)
     _maybe_auto_deliver(store, job_id)
     return job_id
 
@@ -348,6 +364,7 @@ def process_selfie_package(job_id: str) -> str:
 
     _notify_skydiveos(store.load(job_id))
     _archive_deliverables(store, job_id)
+    _render_posters(store, job_id)
     _maybe_auto_deliver(store, job_id)
     return job_id
 
@@ -379,6 +396,7 @@ def process_media_ref_job(job_id: str, role: str) -> str:
 
     _notify_skydiveos(store.load(job_id))
     _archive_deliverables(store, job_id)
+    _render_posters(store, job_id)
     _maybe_auto_deliver(store, job_id)
     return job_id
 
@@ -417,6 +435,7 @@ def rerender_job(job_id: str) -> str:
     updated = store.update(job_id, status=JobStatus.ready_for_review)
     _notify_skydiveos(updated)
     _archive_deliverables(store, job_id)
+    _render_posters(store, job_id)
     _maybe_auto_deliver(store, job_id)
     return job_id
 

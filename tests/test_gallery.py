@@ -313,6 +313,26 @@ def test_frame03_states_share_one_layout_skeleton() -> None:
         assert marker in locked, marker
 
 
+def test_posters_are_per_card_and_optional() -> None:
+    """A still from that video on that card — and no attribute at all without one."""
+    html = _page(
+        videos=[("full_video", "/j/tok/media/full_video"), ("highlights", "/j/tok/m/h")],
+        posters={"full_video": "/j/tok/poster/full_video"},
+    )
+    assert (
+        '<video controls preload="metadata" playsinline'
+        ' poster="/j/tok/poster/full_video"'
+    ) in html
+    # The card with no poster keeps exactly the markup it had before the feature: an
+    # empty poster="" reads as a failed image in some browsers, which is worse than none.
+    assert 'poster=""' not in html
+    assert html.count("poster=") == 1
+
+
+def test_a_page_with_no_posters_is_byte_identical_to_before() -> None:
+    assert _page(posters={}) == _page()
+
+
 def test_locked_page_flips_itself_when_payment_lands() -> None:
     """Frame 03: "on payment the page re-renders in place"."""
     html = _state_2_locked()

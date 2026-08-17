@@ -28,7 +28,7 @@ it stays trivially testable; hosting lives in :mod:`api.delivery` / :mod:`api.ap
 from __future__ import annotations
 
 import html
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date
 
 from .upsell import UpsellTile
@@ -113,6 +113,7 @@ def render_gallery_html(
     purchased_addons: Sequence[str] = (),
     locked_videos: Sequence[str] = (),
     group_unlocks: Sequence[tuple[str, str | None]] = (),
+    posters: Mapping[str, str] | None = None,
 ) -> str:
     """Render the customer gallery page as one self-contained HTML string.
 
@@ -150,6 +151,12 @@ def render_gallery_html(
       URLs falls back to the old ``photo_count_teaser`` line.
     * ``raw_videos`` — the purchased Raw Footage section: ``(label, url)`` per camera
       master, rendered under the Video tab with download links. Empty/None → no section.
+    * ``posters`` — ``{deliverable or label: poster image URL}``. A card whose video has
+      one opens on a real frame of that edit instead of the browser's generic
+      placeholder tile (:mod:`api.thumbnail`); a card with no entry is rendered exactly
+      as before, which is the whole fallback story. Keyed by deliverable name for the
+      main grid and by *label* for the load/raw sections, since those cards have no
+      deliverable name of their own on this page.
     * ``load_videos`` — the purchased spec-flight load video: ``(label, url)``, rendered
       under the Video tab for a customer who already had a gallery and bought the load
       video as an add-on. Empty/None → no section. (A no-media customer's *child* gallery
@@ -163,6 +170,17 @@ def render_gallery_html(
         photos_unlocked = not locked
     raw_videos = raw_videos or []
     load_videos = load_videos or []
+    posters = posters or {}
+
+    def poster_attr(key: str) -> str:
+        """``poster="…"`` for a card, or nothing at all.
+
+        Emitting an empty ``poster=""`` would be worse than omitting it — some
+        browsers treat it as a failed image and paint a broken tile — so a card with
+        no still keeps the exact markup it had before posters existed.
+        """
+        url = posters.get(key)
+        return f' poster="{e(url)}"' if url else ""
 
     # Hero meta: date · product · instructor · location, skipping whatever is unknown.
     meta_bits = [
@@ -200,7 +218,7 @@ def render_gallery_html(
         )
         video_cards.append(f"""
         <div class="vcard">{badge}
-          <video controls preload="metadata" playsinline{guard} src="{e(url)}"></video>
+          <video controls preload="metadata" playsinline{guard}{poster_attr(name)} src="{e(url)}"></video>
           <div class="vlabel">{e(label)}<span>{e(sub)}</span>{dl}</div>
         </div>""")
 
@@ -397,7 +415,7 @@ def render_gallery_html(
     load_cards = "".join(
         f"""
         <div class="vcard"><div class="pbadge ok">FROM THE AIR</div>
-          <video controls preload="metadata" playsinline src="{e(url)}"></video>
+          <video controls preload="metadata" playsinline{poster_attr(label)} src="{e(url)}"></video>
           <div class="vlabel">{e(label)}<span>Your jump day from the air</span>
           <a class="vdl" href="{e(url)}" download>Download</a></div>
         </div>"""

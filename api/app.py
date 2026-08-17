@@ -28,6 +28,7 @@ Endpoints (all under the OpenAPI docs at ``/docs``):
 ``GET  /j/{code}``          the customer gallery landing page (token-authed)
 ``GET  /j/{code}/media/{name}``   stream a deliverable (preview while locked)
 ``GET  /j/{code}/photos/{filename}`` fetch one photo (unlocked only)
+``GET  /j/{code}/poster/{name}``  a card's poster frame, cut from that video
 ``GET  /ingest/cards``      live SD-card pull progress (safe-to-remove signal)
 ==========================  ===============================================
 
@@ -42,7 +43,7 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager, suppress
 from html import escape as html_escape
 from pathlib import Path
@@ -103,6 +104,7 @@ from .schemas import (
     UnlockRequest,
     UploadResponse,
 )
+from .thumbnail import ensure_poster
 from .upsell import (
     LOAD_VIDEO_KEY,
     UpsellTile,
@@ -1866,6 +1868,50 @@ def create_app() -> FastAPI:
         bits.append("yours to keep")
         return f"/j/{token}/media/{name}", "  ·  ".join(bits)
 
+    def _poster_source(store: JobStore, job: Job, name: str) -> Path | None:
+        """The video file this card's poster must be cut from, or ``None``.
+
+        The **entitlement picks the file**, exactly as in :func:`public_media`: a locked
+        deliverable's poster comes from its watermarked ``preview_<name>.mp4``, so a
+        paywalled card can never show a clean frame of the edit that hasn't been bought
+        — and the still it teases with carries the same watermark as the video behind
+        it. Files resolve through :func:`_media_job` (a child gallery posters its load
+        master's renders) while the lock stays **this** job's, the same pairing every
+        public media route evaluates per request.
+
+        A purchased load video is answered too: it is the customer's most valuable
+        upsell card and its bytes are the master's clean render, because that is
+        precisely what was bought (same gate as :func:`public_load_video`).
+        """
+        owner = _media_job(store, job)
+        if name in _gallery_videos(store, job):
+            job_dir = store.dir(owner.job_id)
+            if entitlement_for(job, name) is Entitlement.preview_only:
+                return preview_path(job_dir, name)
+            return job_dir / f"{name}.mp4"
+        if (
+            job.job_kind is JobKind.jump
+            and LOAD_VIDEO_KEY in job.addons
+            and job.source_job_id
+            and name in {n for _, n in _gallery_load_video(store, job)}
+        ):
+            return store.dir(str(job.source_job_id)) / f"{name}.mp4"
+        return None
+
+    def _gallery_posters(
+        settings: Settings, token: str, cards: Sequence[tuple[str, str]]
+    ) -> dict[str, str]:
+        """``{card key: poster URL}`` for ``(card key, deliverable name)`` pairs.
+
+        Emitted for every card without stat'ing anything: the route builds the still on
+        first request and 404s when it can't, and a ``poster`` that 404s leaves the card
+        exactly as it was before this feature. Checking here instead would cost a page
+        of file stats and still show nothing on the first view of an older job.
+        """
+        if not settings.gallery_thumbnails:
+            return {}
+        return {key: f"/j/{token}/poster/{name}" for key, name in cards}
+
     @app.get("/j/{token}", response_class=HTMLResponse, include_in_schema=False)
     def public_gallery(
         token: str, store: StoreDep, settings: SettingsDep
@@ -1911,6 +1957,19 @@ def create_app() -> FastAPI:
         )
         video_names = _gallery_videos(store, job)
         photo_names = _gallery_photo_names(store, job)
+        # A real frame from each edit on each card (api.thumbnail): the locked ones are
+        # cut from the watermarked preview, so the paywall holds and the card still
+        # sells the moment behind it. Keyed by deliverable for the main grid and by
+        # label for the load-video card, which is how the page addresses that one.
+        posters = _gallery_posters(
+            settings,
+            token,
+            [(n, n) for n in video_names]
+            # The load-video card is addressed by its label on the page, but its poster
+            # is still that deliverable's.
+            + ([(label, n) for label, n in _gallery_load_video(store, job)] if load_clips
+               else []),
+        )
         if not video_names and not photo_names:
             brand = html_escape(settings.delivery_brand_name)
             return HTMLResponse(
@@ -1972,6 +2031,7 @@ def create_app() -> FastAPI:
             jump_date=job.jump_date,
             location=settings.delivery_location,
             videos=[(n, f"/j/{token}/media/{n}") for n in video_names],
+            posters=posters,
             photos=[f"/j/{token}/photos/{n}" for n in photo_names],
             photos_unlocked=not locked_photos,
             photos_unlock_url=photos_unlock_url,
@@ -2114,6 +2174,45 @@ def create_app() -> FastAPI:
 
     # GET + HEAD, for the same reason as the media route above: an image URL that 405s on
     # HEAD makes preloaders and caches retry instead of fetching once.
+    @app.api_route(
+        "/j/{token}/poster/{name}",
+        methods=["GET", "HEAD"],
+        include_in_schema=False,
+        response_class=FileResponse,
+    )
+    def public_poster(
+        token: str, name: str, store: StoreDep, settings: SettingsDep
+    ) -> FileResponse:
+        """The card's poster: one frame chosen out of that very deliverable.
+
+        Built on first request and cached on disk (:func:`api.thumbnail.ensure_poster`),
+        so a job rendered before this feature — or one whose pre-render pass didn't run
+        — grows posters the moment somebody opens the page.
+
+        **404 is a supported answer.** Thumbnails are decoration: if FFmpeg is missing,
+        the deliverable has no usable frame, or the feature is switched off, the card
+        falls back to the browser's own placeholder, which is exactly where it was
+        before. Nothing here may 500 a customer's gallery.
+
+        Cached only briefly by the client: unlocking swaps the *source* from the
+        watermarked preview to the clean master at the same URL, and a customer who
+        just paid must not keep looking at a watermark.
+        """
+        job = _job_by_token(store, token)
+        if not _is_safe_segment(name):
+            raise HTTPException(status_code=400, detail="invalid deliverable")
+        source = _poster_source(store, job, name)
+        if source is None:
+            raise HTTPException(status_code=404, detail="no such video")
+        poster = ensure_poster(source, settings=settings)
+        if poster is None:
+            raise HTTPException(status_code=404, detail="no poster for this video")
+        return FileResponse(
+            poster,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "private, max-age=60"},
+        )
+
     @app.api_route(
         "/j/{token}/photos/{filename}",
         methods=["GET", "HEAD"],

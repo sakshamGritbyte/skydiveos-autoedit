@@ -233,6 +233,11 @@ class Settings:
     #: How much of a candidate clip's head is sampled for the QR
     #: (``SDCARD_QR_SCAN_SECONDS``).
     sdcard_qr_scan_seconds: float = 8.0
+    #: Give every gallery video card a poster frame lifted from that deliverable
+    #: (``GALLERY_THUMBNAILS``, on by default — see :mod:`api.thumbnail`). Off falls
+    #: back to the browser's own placeholder tile, which is where the cards were
+    #: before the feature; nothing else changes.
+    gallery_thumbnails: bool = True
 
 
 def _default_sdcard_roots() -> tuple[str, ...]:
@@ -351,4 +356,5 @@ def get_settings() -> Settings:
         or _default_sdcard_roots(),
         sdcard_qr_max_clip_seconds=float(os.environ.get("SDCARD_QR_MAX_CLIP_SECONDS") or 60.0),
         sdcard_qr_scan_seconds=float(os.environ.get("SDCARD_QR_SCAN_SECONDS") or 8.0),
+        gallery_thumbnails=_flag("GALLERY_THUMBNAILS", default=True),
     )

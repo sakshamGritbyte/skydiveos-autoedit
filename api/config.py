@@ -124,6 +124,21 @@ class Settings:
     #: From address on delivery emails (``DELIVERY_FROM_EMAIL``; falls back to
     #: ``SMTP_USER``).
     delivery_from_email: str | None = None
+    #: Hand the customer delivery email over to SkydiveOS
+    #: (``CUSTOMER_EMAIL_SENDER=skydiveos``; default ``pipeline`` = this service
+    #: sends it, i.e. today's behaviour).
+    #:
+    #: SkydiveOS grew a branded HTML delivery email with a configurable dropzone
+    #: Cc (MediaConfig) — neither of which this service can reach without a new
+    #: cross-repo config channel. When that path is verified in production, flip
+    #: this to ``skydiveos`` and :func:`api.delivery.send_gallery_email_once`
+    #: becomes a no-op that still reports "the customer has their link" (the
+    #: status callback carries the gallery URL, so SkydiveOS can send).
+    #:
+    #: DEPLOY ORDER IS NOT OPTIONAL: ship SkydiveOS's email first and verify it,
+    #: THEN flip this. Flipping first means zero customer emails, silently — two
+    #: emails for one window is tolerable, zero is not. Hence the default.
+    customer_email_sender: str = "pipeline"
     #: Lifetime of the presigned download links, in days (``DELIVERY_LINK_TTL_DAYS``).
     #: Capped at 7 — the S3 SigV4 maximum for IAM-key presigning.
     delivery_link_ttl_days: float = 7.0
@@ -306,6 +321,9 @@ def get_settings() -> Settings:
         smtp_password=os.environ.get("SMTP_PASSWORD") or None,
         smtp_starttls=_flag("SMTP_STARTTLS", default=True),
         delivery_from_email=os.environ.get("DELIVERY_FROM_EMAIL") or None,
+        customer_email_sender=(
+            (os.environ.get("CUSTOMER_EMAIL_SENDER") or "pipeline").strip().lower()
+        ),
         delivery_link_ttl_days=min(
             7.0, float(os.environ.get("DELIVERY_LINK_TTL_DAYS") or 7.0)
         ),

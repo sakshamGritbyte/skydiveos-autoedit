@@ -295,6 +295,18 @@ def send_gallery_email_once(
     Returns False only in the pre-existing skip cases (no ``customer_email``, no SMTP),
     and releases the claim then so configuring SMTP and re-queueing still sends.
     """
+    if settings.customer_email_sender == "skydiveos":
+        # SkydiveOS owns the customer email (branded HTML + the dropzone Cc from
+        # MediaConfig, neither reachable from here). It learns the gallery URL
+        # from the status callback, which `deliver_job` fires either way — so the
+        # customer IS reachable and this must report True, not fail the job.
+        # Nothing is stamped: `email_sent_at` means "THIS service emailed them",
+        # and flipping the flag back must not look like an email already went.
+        logger.info(
+            "job %s: customer email delegated to SkydiveOS (CUSTOMER_EMAIL_SENDER=skydiveos)",
+            job.job_id,
+        )
+        return True
     if job.email_sent_at is not None:
         logger.info(
             "job %s was already emailed (at %.0f) — not sending a second time",

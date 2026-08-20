@@ -979,14 +979,23 @@ def test_gallery_page_shows_the_hero_meta_and_download_action(client: TestClient
 
 
 def test_gallery_shows_the_upsell_row_in_both_states(client: TestClient) -> None:
-    """The row is entitlement-independent — the operator's second revenue line."""
+    """The row keeps one TREATMENT on the locked and unlocked page — the operator's
+    second revenue line — offering every tile the job can actually fulfil."""
+    store = JobStore(client.jobs_root)
     for locked in (False, True):
         job_id = _create(client, entitlement="preview_only" if locked else "edited_download")
         _rendered(client, job_id, locked=locked)
+        # Stage what the media tiles sell: raw masters, and (locked) extractable stills.
+        raw = store.raw_dir(job_id)
+        raw.mkdir(parents=True, exist_ok=True)
+        (raw / "GH010001.MP4").write_bytes(b"MASTER")
         page = client.get(f"/j/{_token(client, job_id)}").text
         assert "Add to your day" in page
-        for title in ("Raw Footage", "Photo Pack", "Book Again"):
-            assert title in page
+        assert "Raw Footage" in page
+        assert "Book Again" in page  # a non-media tile is never fulfillability-gated
+        # The Photo Pack is offered only for stills that exist and aren't already the
+        # customer's — this job extracted none, so its tile would sell nothing.
+        assert "Photo Pack" not in page
 
 
 def test_upsell_tiles_link_through_the_checkout_template(
@@ -998,6 +1007,9 @@ def test_upsell_tiles_link_through_the_checkout_template(
     try:
         job_id = _create(client, entitlement="preview_only")
         _rendered(client, job_id, locked=True)
+        raw = JobStore(client.jobs_root).raw_dir(job_id)  # the tile's own product
+        raw.mkdir(parents=True, exist_ok=True)
+        (raw / "GH010001.MP4").write_bytes(b"MASTER")
         page = client.get(f"/j/{_token(client, job_id)}").text
         # {item} resolves per tile, and the unlock CTA still resolves with it present.
         assert f'href="https://pay.test/c?j={job_id}&amp;i=raw"' in page

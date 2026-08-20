@@ -1368,6 +1368,10 @@ def test_gallery_prices_come_from_the_admin_catalogue(client, monkeypatch) -> No
     )
     job_id = _mixed_job_id(client)
     token = _rendered_mixed(client, job_id=job_id)
+    # The raw tile is offered only when there are masters to stream (offerable_tiles).
+    raw = JobStore(client.jobs_root).raw_dir(job_id)
+    raw.mkdir(parents=True, exist_ok=True)
+    (raw / "GH010001.MP4").write_bytes(b"MASTER")
 
     page = client.get(f"/j/{token}").text
 
@@ -1398,15 +1402,24 @@ def test_the_per_camera_cta_carries_that_cameras_own_price(client, monkeypatch) 
 
 
 def test_without_a_catalogue_the_page_is_unchanged(client, monkeypatch) -> None:
-    """No shared database, or it didn't answer: the configured row, exactly as before."""
+    """No shared database, or it didn't answer: the configured prices, as before.
+
+    Fulfillability gating still applies either way — it is a property of the JOB, not
+    of the catalogue: raw is offered because masters exist to stream, and the Photo
+    Pack is absent because this job extracted no stills to sell.
+    """
     monkeypatch.setenv("CHECKOUT_URL_TEMPLATE", "https://pay.test/c?j={job_id}&item={item}")
     get_settings.cache_clear()
     _patch_catalogue(monkeypatch, None)
     job_id = _mixed_job_id(client)
     token = _rendered_mixed(client, job_id=job_id)
+    raw = JobStore(client.jobs_root).raw_dir(job_id)
+    raw.mkdir(parents=True, exist_ok=True)
+    (raw / "GH010001.MP4").write_bytes(b"MASTER")
 
     page = client.get(f"/j/{token}").text
 
-    for key in ("raw", "photos", "rebook"):
+    for key in ("raw", "rebook"):
         assert f"item={key}" in page, key
-    assert "$29" in page and "$19" in page  # the DEFAULT_TILES figures
+    assert "item=photos" not in page  # no stills on this job — nothing to sell
+    assert "$29" in page  # the DEFAULT_TILES raw figure, uncorrected

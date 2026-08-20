@@ -106,6 +106,56 @@ def test_sdcard_scanner_reports_cards(tmp_path: Path) -> None:
     assert asyncio.run(SdCardScanner(roots=[tmp_path / "nope"]).scan()) == []
 
 
+def test_find_cards_skips_a_zombie_volume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card yanked without ejecting leaves a mountpoint the OS refuses to read
+    (EIO). One such volume must cost only itself: the healthy card is still
+    found, and — the 2026-08-18 incident — the scan still RETURNS, so removed
+    cards' safe_to_remove rows are still dropped from the status registry."""
+    _make_card(tmp_path, "GOOD", serial="C0000000001111")
+    zombie = tmp_path / "ZOMBIE"  # no DCIM at depth 1, so the walk descends into it
+    zombie.mkdir()
+
+    real_iterdir = Path.iterdir
+
+    def raising_iterdir(self: Path):  # type: ignore[no-untyped-def]
+        if self == zombie:
+            raise OSError(5, "Input/output error")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", raising_iterdir)
+    assert {c.camera_id for c in find_cards([tmp_path])} == {"1111"}
+
+
+def test_find_cards_skips_an_unreadable_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even the mount root itself failing to list must not raise out of a scan."""
+    _make_card(tmp_path, "GOOD", serial="C0000000001111")
+
+    def raising_iterdir(self: Path):  # type: ignore[no-untyped-def]
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(Path, "iterdir", raising_iterdir)
+    assert find_cards([tmp_path]) == []
+
+
+def test_sdcard_scanner_degrades_a_failing_scan_to_no_cards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raising scan freezes the card-status registry (observe never runs while
+    the publisher rebroadcasts its last snapshot), so any residual failure mode
+    must degrade to an empty result instead of propagating."""
+    import ingest.sdcard as sdcard_mod
+
+    def boom(roots):  # type: ignore[no-untyped-def]
+        raise RuntimeError("unforeseen scan failure")
+
+    monkeypatch.setattr(sdcard_mod, "find_cards", boom)
+    assert asyncio.run(SdCardScanner(roots=[tmp_path]).scan()) == []
+
+
 def test_mount_for_raises_when_card_removed(tmp_path: Path) -> None:
     mount = _make_card(tmp_path)
     assert mount_for("4313", [tmp_path]) == mount

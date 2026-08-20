@@ -110,6 +110,7 @@ from .upsell import (
     UpsellTile,
     link_tiles,
     load_video_tile,
+    offerable_tiles,
     priced_tiles,
     repriced_from,
 )
@@ -1943,8 +1944,9 @@ def create_app() -> FastAPI:
         # serves watermarked preview bytes at the same URLs — behind a photos-add-on
         # unlock offer; a raw purchase adds the camera-master players to either state.
         locked_photos = photos_locked(job)
+        raw_files = _gallery_raw_clips(store, job)
         raw_clips = (
-            [(label, f"/j/{token}/raw/{rel}") for label, rel in _gallery_raw_clips(store, job)]
+            [(label, f"/j/{token}/raw/{rel}") for label, rel in raw_files]
             if "raw" in job.addons else []
         )
         # A media buyer on a spec-flight load who bought the load video: their OWN
@@ -2051,14 +2053,27 @@ def create_app() -> FastAPI:
             product_label=_product_label(job),
             primary_download_url=dl_url,
             primary_download_note=dl_note,
-            # Entitlement-independent: the same row on the locked and unlocked page —
-            # minus tiles already purchased, which have become fulfilled sections. A media
-            # buyer on a spec-flight load additionally gets the load-video tile, which is
-            # per-job (it names their load) rather than an operator-configured one.
+            # Entitlement-independent in TREATMENT (the same row on the locked and
+            # unlocked page) — minus tiles already purchased, which have become
+            # fulfilled sections, and minus tiles this job cannot FULFIL: a media tile
+            # is offered only when the bytes behind it exist and aren't already the
+            # customer's. `raw` needs staged camera masters (a pruned or load-child job
+            # has none to stream); `photos` needs extracted stills that are still
+            # locked (a `video_only` job made no stills — its checkout would take $19
+            # and deliver nothing — and a customer who owns the photo set must not be
+            # sold it again). A media buyer on a spec-flight load additionally gets the
+            # load-video tile, which is per-job (it names their load) rather than
+            # operator-configured.
             upsells=[
                 t for t in (
                     *link_tiles(
-                        priced_tiles(settings.upsell_tiles, catalogue),
+                        offerable_tiles(
+                            priced_tiles(settings.upsell_tiles, catalogue),
+                            {
+                                "raw": bool(raw_files),
+                                "photos": bool(photo_names) and locked_photos,
+                            },
+                        ),
                         template=settings.checkout_url_template,
                         job_id=job.job_id,
                         booking_id=job.booking_id,

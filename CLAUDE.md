@@ -355,12 +355,23 @@ Two runtime media roots, with different audiences:
   `⬇ Download video` + "1080p MP4 · 214 MB · yours to keep" vs amber `🔒 Unlock full
   video — $39`) change — so the paid path never feels like a different product. The
   accent colour is the state (`#5bbd84` unlocked / `#e2a13f` locked) on the `#0c1218`
-  base. The **"Add to your day" upsell row is entitlement-independent** (`api/upsell.py`,
-  `$UPSELL_TILES` → `key:title:blurb:price|…`, linked through
+  base. The **"Add to your day" upsell row is entitlement-independent in treatment**
+  (`api/upsell.py`, `$UPSELL_TILES` → `key:title:blurb:price|…`, linked through
   `CHECKOUT_URL_TEMPLATE`'s extra `{item}` placeholder): it's the operator's second
   revenue line whether or not the video was pre-purchased, so it renders on both pages
   and on the legacy S3 fallback. A malformed tile is dropped, and a tile with no
   checkout URL renders as **text** — same rule as the unlock CTA, never a dead link.
+  A **media tile is offered only when this JOB can fulfil it**
+  (`upsell.offerable_tiles`, the served gallery only): `photos` needs extracted stills
+  that are still locked (a `video_only` job made none — its checkout took $19 and
+  delivered nothing — and a customer who owns the set must not be re-sold it), `raw`
+  needs staged masters to stream (a pruned or `load_child` job has none, and
+  `/j/{code}/raw/…` has no S3 fallback). Existence-in-the-job is the third leg of the
+  never-dead-link rule, after existence-in-the-catalogue (`priced_tiles`) and
+  URL-buildability (`link_tiles`); non-media keys (`rebook`, operator-custom) are never
+  gated — they're fulfilled outside this system. The pruner correspondingly **never
+  sweeps a purchased job's `raw/`** (`"raw" in Job.addons` — the gallery streams those
+  masters locally, from a link that never expires).
 - **Every video card opens on a frame from that very video** (`api/thumbnail.py` →
   `GET /j/{code}/poster/{name}`). A `<video>` with no `poster` is drawn by the browser
   — a grey box or iOS's generic cloud tile — so five cards read as one stock page, on
@@ -539,6 +550,19 @@ Two runtime media roots, with different audiences:
   job, since a presigned master URL is the paywall bypass); photos are never pruned
   (the grid serves stills locally). Pair with an S3 lifecycle rule (`raw/…` → Glacier
   after 30–60 d) and a disk alarm
+- `bash deploy/ec2/install-prune-cron.sh [uninstall|show]` — put that sweep on a timer
+  (default weekly, Sun 03:30; `SCHEDULE='30 3 * * *'` for the daily cadence production
+  actually wants, `ARGS='--raw-days 1'` to tighten). Idempotent — reinstalling replaces
+  the entry rather than stacking a second one — and it **refuses to install** when no
+  `S3_BUCKET`/`AWS_S3_BUCKET_NAME` is configured, because the sweep can only delete what
+  S3 confirms and would otherwise be a silent weekly no-op. It schedules
+  `deploy/ec2/prune-jobs.sh`, the wrapper that makes the sweep survive cron: cron has
+  no environment (so `.env` is loaded), starts in `$HOME` (and `RAW_STORAGE_ROOT`
+  defaults to the **relative** `./raw-storage`, so the repo must be cwd or nothing is
+  found to prune), can overlap a long sweep (`flock -n`, with `-E 99` so "lock busy"
+  stays distinguishable from a real failure and exits 0 instead of mailing an error),
+  and discards output (everything is timestamped into `logs/prune-jobs.log` with the
+  disk's before/after). Run the wrapper by hand with `--dry-run` first
 - `python scripts/restamp_footage.py --at <local-time> --out-dir <dir> <masters…>` —
   write re-stamped COPIES of GoPro masters so an old card can be demoed against a load
   manifested for today (prefer manifesting the load for the footage's real date — then
@@ -689,6 +713,21 @@ Two runtime media roots, with different audiences:
   (same never-fail rule as archiving), nothing in the pipeline reads the registry,
   and the SkydiveOS front end polls it via its backend proxy (the service token
   stays server-side). Empty list when sdcard ingest is off.
+  **A removed card's row must not outlive the card**, and no single mechanism is
+  trusted with that: `observe` (the scan tick) drops a terminal row the moment the
+  scanner stops seeing its card; a card scan **degrades instead of raising** (one
+  zombie mountpoint — a card yanked without ejecting — skips only itself in
+  `ingest.sdcard._mounts_with_dcim`, and `SdCardScanner.scan` returns `[]` on any
+  residual failure, because a scan that raises every tick silently stops `observe`
+  forever); and `snapshot()` **ages out terminal rows** not refreshed in 15 min
+  (`_TERMINAL_LINGER_S` — a still-inserted card's row is refreshed every discovery
+  tick by the idempotent re-pull, so that stale means the card is gone). The
+  SkydiveOS consumer applies the same age filter read-side (`autoEditService.
+  withoutStaleTerminalCards`). Without these, one wedged scan loop rebroadcast two
+  removed cards' "safe to remove" banners every 2 s for hours (2026-08-18). Never
+  age-prune a NON-terminal row anywhere: a single multi-GB copy legitimately
+  updates nothing for many minutes, and hiding "do not remove the card" mid-copy
+  invites the yank the banner exists to prevent.
   **The registry is per-process, so production reaches it by PUSH, not pull**
   (`ingest.discovery.publish_card_status`, wired as a lifespan task beside the registry).
   Production splits the pipeline on purpose: the dropzone box has the reader, the cloud
@@ -705,7 +744,13 @@ Two runtime media roots, with different audiences:
   cache would freeze "DO NOT REMOVE THE CARD" on the operator's screen if the ingest box
   died mid-pull. The push carries the service token, and that is load-bearing rather than
   hygienic: a spoofed `safe_to_remove` during a retention sweep (the one moment the card is
-  being *written* to) invites a yank that corrupts it.
+  being *written* to) invites a yank that corrupts it. **The receiver lives in SkydiveOS**
+  (`backend/src/routes/mediaRoutes.js` → `mediaController.receiveIngestCardStatus` →
+  `autoEditService.recordIngestCards`, TTL `AUTO_EDIT_CARD_STATUS_TTL_MS`, default 10 s):
+  a fresh pushed snapshot answers its `GET /api/media/ingest-cards`, and past the TTL that
+  route falls back to pulling this API — so a single-box deployment works either way.
+  `CARD_STATUS_URL` overrides the target when the raw-upload notify is answered by the
+  local `scripts/skydiveos_bridge.py`, which has no route for this and would 404 forever.
 - `python scripts/watch_cards.py [--api http://host:8000] [--once]` — the operator display
   for the person standing at the card reader: polls that box's own `GET /ingest/cards` and
   goes loud (bell + banner) on `safe_to_remove`, with a progress bar while copying. Needs
@@ -877,8 +922,12 @@ Two runtime media roots, with different audiences:
   `public_media` deliberately refuses the presigned-S3 fallback for a locked job. Deleting
   them blacks out a live paywall
 - Don't let the gallery emit a dead link: an upsell tile or unlock CTA with no
-  `CHECKOUT_URL_TEMPLATE` renders as text. And don't gate the upsell row on entitlement
-  — the row is the same on the locked and unlocked page
+  `CHECKOUT_URL_TEMPLATE` renders as text. And don't gate the upsell ROW on entitlement
+  — the row keeps one treatment on the locked and unlocked page. (Gating an individual
+  media TILE on fulfillability is the opposite rule and correct:
+  `upsell.offerable_tiles` drops a Photo Pack the job has no stills for, or one selling
+  the customer photos they already own — a checkout that delivers nothing is worse than
+  a dead link, because it fails *after* the payment)
 - Don't cut a card's poster from a file the request's entitlement wouldn't serve, don't
   put posters in `Job.outputs` or inside `photos/`, and don't let a poster failure raise:
   a card with no still is the pre-feature card, which is a perfectly good outcome. And

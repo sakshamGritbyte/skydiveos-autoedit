@@ -35,7 +35,7 @@ beyond nothing at all) so :mod:`api.gallery` can stay a pure renderer.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -170,6 +170,35 @@ def priced_tiles(
         title = catalogue.label(tile.key) or tile.title
         repriced.append(replace(tile, title=title, price=price))
     return tuple(repriced)
+
+
+def offerable_tiles(
+    tiles: Sequence[UpsellTile], availability: Mapping[str, bool]
+) -> tuple[UpsellTile, ...]:
+    """Drop each tile whose key THIS job cannot fulfil — offer only what can be served.
+
+    :func:`priced_tiles` asks the catalogue "will the checkout accept this item?";
+    this asks the job "do the bytes behind this item exist?" — the third leg of the
+    ``never dead-link a customer`` rule, one level deeper than a link. A ``video_only``
+    job extracted no stills, so a Photo Pack tile on its gallery is a checkout that
+    takes $19 and delivers nothing; a pruned or child job has no ``raw/`` masters to
+    stream. Selling media the page cannot serve is worse than a dead link — the link at
+    least fails *before* the payment.
+
+    ``availability`` maps a tile key to whether this job can fulfil it. Keys absent
+    from the map pass through untouched: only the caller knows the media tiles it can
+    reason about, and a non-media tile (``rebook``) or an operator's custom key is
+    fulfilled outside this system entirely.
+    """
+    kept: list[UpsellTile] = []
+    for tile in tiles:
+        if availability.get(tile.key) is False:
+            logger.info(
+                "upsell: dropping tile %r — this job cannot fulfil it", tile.key
+            )
+            continue
+        kept.append(tile)
+    return tuple(kept)
 
 
 def repriced_from(tile: UpsellTile, catalogue: Any | None) -> UpsellTile:

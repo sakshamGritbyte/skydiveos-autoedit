@@ -28,3 +28,7 @@ __pycache__/
 templates/*.mp4
 templates/*.MP4
 qr-codes/
+
+# Runtime logs and lock files from the scheduled tasks (deploy/mac launchd agents,
+# deploy/ec2/prune-jobs.sh). Machine-local operational output, not source.
+logs/

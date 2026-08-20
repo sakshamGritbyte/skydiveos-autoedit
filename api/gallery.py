@@ -506,5 +506,5 @@ def render_gallery_html(
     {videos_section}{photos_section}
   </main>
   {upsell_section}
-  <footer>Powered by {brand_e} · Blue skies! 🪂</footer>
+  <footer>Powered by {brand_e}</footer>
 {tab_js}{flip_js}</body></html>"""

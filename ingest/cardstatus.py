@@ -59,10 +59,19 @@ STATE_ERROR = "error"
 
 _TERMINAL_STATES = frozenset({STATE_SAFE_TO_REMOVE, STATE_ERROR})
 
-#: How long an ``error`` entry outlives its card's removal. A yanked or failed
+#: How long a terminal entry survives without being refreshed. Two jobs: an
+#: ``error`` entry outlives its card's removal by this much (a yanked or failed
 #: card should stay visible to the operator for a while, not vanish with the
-#: mount — but not forever, or the board fills with stale failures.
-_ERROR_LINGER_S = 900.0
+#: mount — but not forever, or the board fills with stale failures), and
+#: :meth:`CardStatusRegistry.snapshot` drops ANY terminal entry this stale as a
+#: backstop for a wedged scan loop. While a card is actually in the reader its
+#: entry is refreshed every discovery tick (the idempotent re-pull calls
+#: ``pull_started``), so a terminal entry this old means no scan has seen the
+#: card in 15 minutes — the card is gone, and only the drop-on-removal path
+#: (``observe``) failing kept the row alive. Without the backstop, one scan
+#: loop wedged by a zombie mount rebroadcast two removed cards' "safe to
+#: remove" banners to the operator screen for hours (2026-08-18).
+_TERMINAL_LINGER_S = 900.0
 
 
 @dataclass
@@ -192,7 +201,7 @@ class CardStatusRegistry:
 
         A new id becomes ``detected``; a ``safe_to_remove`` entry whose card is
         gone is dropped (removal was the goal state); an ``error`` entry
-        lingers ``_ERROR_LINGER_S`` after removal so the operator sees the
+        lingers ``_TERMINAL_LINGER_S`` after removal so the operator sees the
         failure. Entries mid-pull are left alone — the pull itself will land
         them in a terminal state.
         """
@@ -210,14 +219,34 @@ class CardStatusRegistry:
                     continue
                 if entry.state == STATE_SAFE_TO_REMOVE:
                     del self._cards[camera_id]
-                elif now - entry.updated_at > _ERROR_LINGER_S:
+                elif now - entry.updated_at > _TERMINAL_LINGER_S:
                     del self._cards[camera_id]
 
     # --- read side ------------------------------------------------------------ #
 
     def snapshot(self) -> list[dict[str, Any]]:
-        """Every tracked card as plain dicts (JSON-ready), ordered by id."""
+        """Every tracked card as plain dicts (JSON-ready), ordered by id.
+
+        Also the backstop that keeps a wedged scan loop from freezing the
+        operator screen: a TERMINAL entry that hasn't been refreshed in
+        ``_TERMINAL_LINGER_S`` is dropped here, because both readers of the
+        registry (the ``GET /ingest/cards`` route and ``publish_card_status``)
+        come through this method — so even when ``observe`` has stopped
+        running, a removed card's row ages out instead of being rebroadcast
+        forever. Mid-pull entries are NEVER age-pruned: a single multi-GB copy
+        can legitimately go this long without a counter update, and hiding its
+        "do not remove the card" line invites the yank this whole module exists
+        to prevent.
+        """
+        now = self._now()
         with self._lock:
+            for camera_id in list(self._cards):
+                entry = self._cards[camera_id]
+                if (
+                    entry.state in _TERMINAL_STATES
+                    and now - entry.updated_at > _TERMINAL_LINGER_S
+                ):
+                    del self._cards[camera_id]
             return [asdict(self._cards[cid]) for cid in sorted(self._cards)]
 
     def _ensure(self, camera_id: str) -> CardStatus:

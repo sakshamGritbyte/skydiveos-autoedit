@@ -18,6 +18,13 @@
 #                      consumer and to send Authorization: Bearer $AUTO_EDIT_API_KEY
 #                      on its calls to this API.
 #
+# The operator's "copying… / safe to remove" banner is a SECOND consumer, and not the
+# same one: only the real SkydiveOS backend renders it. So in bridge mode the card
+# status is pushed to $SKYDIVEOS_URL (the real backend) while the raw-upload notify
+# still goes to the bridge — the bridge has a route for the snapshot too, so pointing
+# both at it would be accepted and land somewhere no operator can see. Override with
+# CARD_STATUS_URL when the operator screen is on another host.
+#
 # Needs .env configured: MONGO_URL + MONGO_DB (the matcher — MONGO_DB, not just the
 # Node backend's DB_NAME), S3_BUCKET, CAMERA_CLOCK_TZ, SMTP_* (the delivery email),
 # REDIS_URL (the worker).
@@ -32,7 +39,7 @@ while [ $# -gt 0 ]; do
       MODE="skydiveos"
       case "${2-}" in -*|"") ;; *) SKYDIVEOS_URL="$2"; shift ;; esac
       ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1 (try --help)" >&2; exit 2 ;;
   esac
   shift
@@ -48,6 +55,10 @@ if [ "$MODE" = "skydiveos" ]; then
   export SKYDIVEOS_API_BASE="$SKYDIVEOS_URL"
 else
   export SKYDIVEOS_API_BASE="http://localhost:9000"
+  # The card-ingest snapshot's consumer is the operator's screen, which only the real
+  # SkydiveOS backend serves — so it does NOT follow the notify to the bridge. Left to
+  # default, the push would be 200-accepted by the bridge and never reach an operator.
+  [ -n "${CARD_STATUS_URL-}" ] || export CARD_STATUS_URL="$SKYDIVEOS_URL"
 fi
 
 PY="${PY:-.venv/bin/python}"
@@ -72,6 +83,7 @@ else
   fi
 fi
 
+echo "[stack] card-status banner pushed to ${CARD_STATUS_URL:-$SKYDIVEOS_API_BASE}/api/media/ingest-cards/status"
 echo "[stack] auto-edit API on :8000 (discovery: CAMERA_SCANNER=sdcard)"
 "$PY" -m uvicorn api.app:app --host 127.0.0.1 --port 8000 &
 pids+=($!)

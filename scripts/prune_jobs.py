@@ -102,6 +102,16 @@ def prune_job_raw(
     raw_dir = store.dir(job.job_id) / "raw"
     if not raw_dir.is_dir():
         return 0
+    if "raw" in job.addons:
+        # The customer BOUGHT the raw footage, and the gallery's Raw Footage section
+        # streams these files locally (`GET /j/{code}/raw/…` has no S3 fallback) from a
+        # link that never expires. Same rule as a load master's previews: never prune
+        # a live paywall product out from under its page.
+        logger.info(
+            "job %s: raw footage was purchased — keeping raw/ (the gallery streams it)",
+            job.job_id,
+        )
+        return 0
     if not job.raw_s3_keys and not job.camera_id:
         logger.info("job %s: no recorded raw keys and no camera_id — keeping raw/", job.job_id)
         return 0

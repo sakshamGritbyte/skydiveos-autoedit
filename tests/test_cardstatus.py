@@ -142,6 +142,132 @@ def test_observe_leaves_inflight_pull_alone() -> None:
     assert reg.snapshot()[0]["state"] == STATE_PULLING
 
 
+def test_snapshot_ages_out_terminal_entries_when_scans_stop() -> None:
+    """The wedged-scan backstop: a stale terminal row must not outlive its card.
+
+    If the scan loop stops completing (a zombie mountpoint made every scan
+    raise, 2026-08-18), ``observe`` never runs again — but the publisher keeps
+    calling ``snapshot`` every 2s and rebroadcasting whatever it returns. So
+    ``snapshot`` itself must age out terminal entries, or a removed card's
+    "safe to remove" banner stays on the operator screen forever.
+    """
+    clock = _Clock()
+    reg = CardStatusRegistry(now=clock)
+    reg.pull_started("4313")
+    reg.safe_to_remove("4313")
+    reg.error("9999", "boom")
+
+    clock.t += 300.0  # stale, but within the linger window: still served
+    assert {c["camera_id"] for c in reg.snapshot()} == {"4313", "9999"}
+
+    clock.t += 700.0  # past the linger window, and no observe() ever ran
+    assert reg.snapshot() == []
+
+
+def test_operator_card_swap_cycle(tmp_path: Path) -> None:
+    """The whole operator loop at one reader, with the REAL wiring end to end
+    (SdCardScanner → ObservingScanner → discovery → the sdcard pull → registry):
+    insert a card → its ingest completes and the row says SAFE TO REMOVE; take
+    the card out → the row leaves the screen; insert the NEXT card → it is
+    tracked and lands on SAFE TO REMOVE too. This is what lets staff feed cards
+    through the reader all day on the strength of the banner alone."""
+    import dataclasses
+    import json
+    import shutil
+
+    from api.app import _build_pull
+    from api.config import get_settings
+    from ingest.discovery import CameraDiscoveryService
+    from ingest.scanner import SdCardScanner
+
+    reader = tmp_path / "reader"
+    reader.mkdir()
+
+    def insert_card(name: str, serial: str) -> Path:
+        mount = reader / name
+        (mount / "DCIM" / "100GOPRO").mkdir(parents=True)
+        (mount / "MISC").mkdir()
+        (mount / "MISC" / "version.txt").write_text(
+            json.dumps({"camera serial number": serial})
+        )
+        (mount / "DCIM" / "100GOPRO" / "GX010001.MP4").write_bytes(b"\x00\x11" * 128)
+        return mount
+
+    class _NoRegistry:
+        """sdcard mode bypasses the allow-list; the registry is only consulted."""
+
+        def known_active_ids(self) -> set[str]:
+            return set()
+
+        def instructor_for(self, camera_id: str) -> None:
+            return None
+
+        def role_for(self, camera_id: str) -> None:
+            return None
+
+        def close(self) -> None:
+            pass
+
+    class _DropEmitter:
+        """Hand-offs are not under test (and the pinned REDIS_URL points nowhere)."""
+
+        def emit(self, event: dict) -> None:
+            pass
+
+    reg = CardStatusRegistry()
+    settings = dataclasses.replace(
+        get_settings(), camera_scanner="sdcard", sdcard_mount_roots=(str(reader),)
+    )
+    service = CameraDiscoveryService(
+        scanner=ObservingScanner(SdCardScanner(roots=[reader]), reg),
+        registry=_NoRegistry(),
+        upload=lambda *a, **k: None,
+        pull=_build_pull(settings, reg),
+        interval=999.0,  # ticks are driven by hand below, so removal never races a re-pull
+        require_registered=False,
+    )
+
+    async def tick_and_settle() -> None:
+        await service._scan_once()
+        for _ in range(250):  # let the enqueued pull task reach a terminal state
+            if not service._inflight:
+                return
+            await asyncio.sleep(0.02)
+        raise AssertionError("pull never settled")
+
+    async def scenario() -> None:
+        # start() would set this; the materialize loop is deliberately not running.
+        service._emitter = _DropEmitter()
+
+        card_a = insert_card("CARD-A", "C0000000001111")
+        await tick_and_settle()
+        [row] = reg.snapshot()
+        assert (row["camera_id"], row["state"]) == ("1111", STATE_SAFE_TO_REMOVE)
+
+        shutil.rmtree(card_a)  # the operator takes the finished card out...
+        await tick_and_settle()
+        assert reg.snapshot() == []
+
+        insert_card("CARD-B", "C0000000002222")  # ...and feeds in the next one
+        await tick_and_settle()
+        [row] = reg.snapshot()
+        assert (row["camera_id"], row["state"]) == ("2222", STATE_SAFE_TO_REMOVE)
+
+    asyncio.run(scenario())
+
+
+def test_snapshot_never_ages_out_a_mid_pull_entry() -> None:
+    """A single multi-GB copy updates no counters for a long time; its
+    "do not remove the card" line must survive that, however stale."""
+    clock = _Clock()
+    reg = CardStatusRegistry(now=clock)
+    reg.pull_started("4313")
+    reg.file_started("4313", "GX010001.MP4")
+
+    clock.t += 100_000.0
+    assert reg.snapshot()[0]["state"] == STATE_PULLING
+
+
 # --------------------------------------------------------------------------- #
 # TrackedCamera
 # --------------------------------------------------------------------------- #

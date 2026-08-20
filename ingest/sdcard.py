@@ -142,8 +142,31 @@ def _is_volume_root(path: Path) -> bool:
     return path.parent == path
 
 
+def _safe_children(base: Path) -> list[Path]:
+    """``base``'s subdirectories, skipping anything the OS refuses to stat.
+
+    A card yanked without ejecting can leave a ZOMBIE mountpoint behind (stat
+    returns EIO until the OS gives up on it); a dead network volume does the
+    same. ``Path.is_dir()`` swallows those per entry, and the listing itself is
+    guarded so one unreadable container never aborts the scan — a raising scan
+    is what freezes the card-status registry (``observe`` stops running) while
+    the publisher keeps rebroadcasting its last snapshot.
+    """
+    try:
+        return [p for p in base.iterdir() if p.is_dir()]
+    except OSError as e:
+        logger.warning("cannot list %s during card scan (%r) — skipped this tick", base, e)
+        return []
+
+
 def _mounts_with_dcim(roots: Sequence[str | Path]) -> list[Path]:
-    """Mounted volumes containing ``DCIM/``, under each root at its platform's depth."""
+    """Mounted volumes containing ``DCIM/``, under each root at its platform's depth.
+
+    Walked per entry rather than with one ``glob`` so a single zombie
+    mountpoint (see :func:`_safe_children`) skips only itself: the other cards
+    in the reader are still found, and — critically — the scan still *returns*,
+    so a removed card's ``safe_to_remove`` banner is still dropped.
+    """
     found: list[Path] = []
     for root in roots:
         base = Path(root)
@@ -151,11 +174,18 @@ def _mounts_with_dcim(roots: Sequence[str | Path]) -> list[Path]:
             continue
         # A volume root holds DCIM directly; a container root holds <vol>/DCIM, plus one
         # extra level for /run/media/<user>/<vol>/DCIM.
-        patterns = ("DCIM",) if _is_volume_root(base) else ("*/DCIM", "*/*/DCIM")
-        for pattern in patterns:
-            for dcim in base.glob(pattern):
-                if dcim.is_dir() and dcim.parent not in found:
-                    found.append(dcim.parent)
+        if _is_volume_root(base):
+            if (base / "DCIM").is_dir() and base not in found:
+                found.append(base)
+            continue
+        for child in _safe_children(base):
+            if (child / "DCIM").is_dir():
+                if child not in found:
+                    found.append(child)
+                continue
+            for grandchild in _safe_children(child):
+                if (grandchild / "DCIM").is_dir() and grandchild not in found:
+                    found.append(grandchild)
     return sorted(found)
 
 

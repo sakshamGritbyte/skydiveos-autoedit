@@ -153,5 +153,15 @@ class SdCardScanner(CameraScanner):
     async def scan(self) -> list[str]:
         from .sdcard import find_cards
 
-        cards = await asyncio.to_thread(find_cards, self._roots)
+        try:
+            cards = await asyncio.to_thread(find_cards, self._roots)
+        except Exception as e:  # noqa: BLE001 - a raising scan freezes the status registry
+            # Degrade to "saw nothing" instead of raising: ObservingScanner only
+            # reconciles the card-status registry when scan() RETURNS, so a scan
+            # that raises every tick (a zombie mountpoint, a permissions change)
+            # leaves removed cards' "safe to remove" rows frozen on the operator
+            # screen while publish_card_status rebroadcasts them forever. An
+            # empty result drops terminal rows and leaves mid-pull ones alone.
+            logger.warning("SD-card scan failed (%r) — treating as no cards this tick", e)
+            return []
         return [card.camera_id for card in cards]

@@ -208,9 +208,14 @@ def test_list_deliverables_returns_urls(client: TestClient) -> None:
     assert by_name["full_video"] == {
         "name": "full_video", "kind": "video",
         "url": f"/jobs/{job_id}/deliverables/full_video", "media_type": "video/mp4",
+        # Advertised so SkydiveOS can copy S3→S3 instead of streaming the master;
+        # advisory — the object exists only once deliver_job has run.
+        "s3_key": f"deliveries/{job_id}/full_video.mp4",
     }
     assert by_name["photos"]["kind"] == "photos"
     assert by_name["photos"]["url"] == f"/jobs/{job_id}/photos"
+    # The photo-set entry advertises no key (each still carries its own).
+    assert by_name["photos"]["s3_key"] is None
 
 
 def test_get_video_deliverable_streams_file(client: TestClient) -> None:
@@ -243,6 +248,7 @@ def test_list_and_fetch_photos(client: TestClient) -> None:
     assert photo["filename"] == "freefall_42.jpg"
     assert photo["url"] == f"/jobs/{job_id}/photos/freefall_42.jpg"
     assert photo["scene"] == "freefall"
+    assert photo["s3_key"] == f"deliveries/{job_id}/photos/freefall_42.jpg"
 
     img = client.get(f"/jobs/{job_id}/photos/freefall_42.jpg")
     assert img.status_code == 200

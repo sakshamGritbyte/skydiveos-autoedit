@@ -296,6 +296,13 @@ class DeliverableInfo(BaseModel):
     kind: str = Field(examples=["video"])
     #: Relative URL to fetch it (an MP4 stream, or the photo-list endpoint).
     url: str = Field(examples=["/jobs/abc123/deliverables/full_video"])
+    #: Where delivery uploads (or will upload) this file in S3
+    #: (``deliveries/{job_id}/{filename}``), so a server-side consumer can copy
+    #: object-to-object instead of streaming the bytes through HTTP. The object
+    #: exists only once ``deliver_job`` has run — HeadObject before use. ``None``
+    #: for the ``photos`` set entry (each still carries its own key, see
+    #: ``PhotoInfo.s3_key``; the zip's key is not advertised).
+    s3_key: str | None = Field(default=None, examples=["deliveries/abc123/full_video.mp4"])
     #: MIME type for a video deliverable (``None`` for the photo set).
     media_type: str | None = Field(default=None, examples=["video/mp4"])
 
@@ -320,6 +327,12 @@ class PhotoInfo(BaseModel):
     scene: str | None = None
     ts: float | None = None
     score: float | None = None
+    #: Where delivery uploads (or will upload) this still in S3
+    #: (``deliveries/{job_id}/photos/{filename}``) — same contract as
+    #: ``DeliverableInfo.s3_key``: exists only after ``deliver_job``, HeadObject first.
+    s3_key: str | None = Field(
+        default=None, examples=["deliveries/abc123/photos/freefall_42.jpg"]
+    )
 
 
 class PhotosResponse(BaseModel):

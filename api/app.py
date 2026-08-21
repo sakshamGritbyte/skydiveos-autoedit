@@ -1590,9 +1590,11 @@ def create_app() -> FastAPI:
         URLs — one per video, plus a ``photos`` entry pointing at the photo list. Empty
         until the job is ``ready``.
         """
+        from .delivery import delivery_s3_key  # noqa: PLC0415 - keep app import light
+
         job = _load_or_404(store, job_id)
         items: list[DeliverableInfo] = []
-        for name in (job.outputs or {}):
+        for name, raw in (job.outputs or {}).items():
             if name == "photos":
                 items.append(
                     DeliverableInfo(
@@ -1605,6 +1607,10 @@ def create_app() -> FastAPI:
                     DeliverableInfo(
                         name=name, kind="video",
                         url=f"/jobs/{job_id}/deliverables/{name}", media_type="video/mp4",
+                        # Where delivery puts (or will put) this file, so SkydiveOS
+                        # can copy S3→S3 instead of streaming the master through
+                        # HTTP. Advisory: exists only after deliver_job ran.
+                        s3_key=delivery_s3_key(job_id, Path(raw).name),
                     )
                 )
         return DeliverablesResponse(job_id=job_id, status=job.status, deliverables=items)
@@ -1648,12 +1654,15 @@ def create_app() -> FastAPI:
         index = store.dir(job_id) / "photos" / "index.json"
         if not index.exists():
             raise HTTPException(status_code=404, detail="no photos for this job")
+        from .delivery import delivery_s3_key  # noqa: PLC0415 - keep app import light
+
         entries = json.loads(index.read_text())
         photos = [
             PhotoInfo(
                 filename=e["filename"],
                 url=f"/jobs/{job_id}/photos/{e['filename']}",
                 scene=e.get("scene"), ts=e.get("ts"), score=e.get("score"),
+                s3_key=delivery_s3_key(job_id, f"photos/{e['filename']}"),
             )
             for e in entries
         ]

@@ -62,6 +62,21 @@ def _label(name: str) -> str:
     return _LABELS.get(name, name.replace("_", " ").capitalize())
 
 
+def delivery_s3_key(job_id: str, filename: str) -> str:
+    """The S3 key ``deliver_job`` uses (or will use) for one deliverable file.
+
+    The ONE authority on the ``deliveries/{job_id}/{filename}`` convention, so
+    consumers (notably ``GET /jobs/{id}/deliverables``, which advertises the key
+    to SkydiveOS for server-side S3→S3 copies) can never drift from what
+    ``upload_and_link`` actually writes. A photo belongs under the ``photos/``
+    sub-prefix — pass ``photos/<name>`` as the filename.
+
+    The key names where the object *lands at delivery*; before ``deliver_job``
+    has run it may not exist yet, so consumers must HeadObject before use.
+    """
+    return f"{DELIVERY_KEY_PREFIX}/{job_id}/{filename}"
+
+
 def collect_deliverables(job: Job, store: JobStore) -> dict[str, Path]:
     """The files to hand to the customer, keyed by deliverable name.
 
@@ -137,7 +152,7 @@ def upload_and_link(
     allowed: Collection[str] | None = None if isinstance(presign, bool) else presign
     links: dict[str, str] = {}
     for name, path in files.items():
-        key = f"{DELIVERY_KEY_PREFIX}/{job_id}/{path.name}"
+        key = delivery_s3_key(job_id, path.name)
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         client.upload_file(
             str(path), settings.s3_bucket, key, ExtraArgs={"ContentType": content_type}
@@ -162,7 +177,7 @@ def _upload_photos_individually(
     """
     urls: list[str] = []
     for p in sorted(photos_dir.glob("*.jpg")):
-        key = f"{DELIVERY_KEY_PREFIX}/{job_id}/photos/{p.name}"
+        key = delivery_s3_key(job_id, f"photos/{p.name}")
         client.upload_file(str(p), settings.s3_bucket, key, ExtraArgs={"ContentType": "image/jpeg"})
         urls.append(
             client.generate_presigned_url(

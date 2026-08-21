@@ -28,7 +28,7 @@ Built as a module inside SkydiveOS. Replaces our current dependency on Shred.
 /render          — FFmpeg command builder, intro/outro templates, music mixer
 /api             — REST endpoints SkydiveOS calls (upload, status, approve)
 /review-ui       — React components for instructor review screen
-/templates       — Intro/outro PSDs, music tracks, brand overlays
+/templates       — Intro/outro PSDs, music tracks, brand overlays, brand/ (gallery logo)
 /tests           — pytest for pipeline, jest for API/UI
 /scripts         — One-off tools (test with sample jump, replay an EDL, etc.)
 ```
@@ -351,11 +351,18 @@ Two runtime media roots, with different audiences:
 - **The landing page's two states share ONE layout** (design doc Frame 03): the hero
   (`eyebrow · customer · "14 AUG 2026 · Tandem · Handcam · Instructor Marc Tremblay"`),
   the players, and the upsell row are identical; only the **player treatment** (`1080P ·
-  FULL QUALITY` vs `720P PREVIEW` + `nodownload`) and the **primary action** (green
-  `⬇ Download video` + "1080p MP4 · 214 MB · yours to keep" vs amber `🔒 Unlock full
+  FULL QUALITY` vs `720P PREVIEW` + `nodownload`) and the **primary action**
+  (`⬇ Download video` + "1080p MP4 · 214 MB · yours to keep" vs `🔒 Unlock full
   video — $39`) change — so the paid path never feels like a different product. The
-  accent colour is the state (`#5bbd84` unlocked / `#e2a13f` locked) on the `#0c1218`
-  base. The **"Add to your day" upsell row is entitlement-independent in treatment**
+  **Parachute Montréal skin** (2026-08 mockup) takes that further: near-black
+  (`#0a0a0a`/`#141414`) with the brand red `#d50000` as the ONE accent in *both* states,
+  the operator's logo inlined in a sticky header (`GALLERY_LOGO` → the pure
+  `gallery.brand_logo_data_uri`; missing file → the brand in text, the pre-logo header),
+  underlined tabs, a two-up card grid and wide upsell cards. So the lock now reads from
+  the badge and CTA copy, not a page-wide colour swap — amber (`#e2a13f`) survives only
+  as the `720P PREVIEW` badge, the at-a-glance signal on a mixed jump where clean and
+  watermarked cards sit side by side. The **"Add to your day" upsell row is
+  entitlement-independent in treatment**
   (`api/upsell.py`, `$UPSELL_TILES` → `key:title:blurb:price|…`, linked through
   `CHECKOUT_URL_TEMPLATE`'s extra `{item}` placeholder): it's the operator's second
   revenue line whether or not the video was pre-purchased, so it renders on both pages

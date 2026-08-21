@@ -27,9 +27,13 @@ it stays trivially testable; hosting lives in :mod:`api.delivery` / :mod:`api.ap
 
 from __future__ import annotations
 
+import base64
 import html
+import mimetypes
 from collections.abc import Mapping, Sequence
 from datetime import date
+from functools import lru_cache
+from pathlib import Path
 
 from .upsell import UpsellTile
 
@@ -52,12 +56,47 @@ _VIDEO_META: dict[str, tuple[str, str]] = {
     "instructor_freefall": ("Freefall — Selfie Camera", "Instructor angle"),
 }
 
-#: Design-doc palette (Frame 03 notes). The accent is the only thing the lock state
-#: changes: green when the customer owns the edit, amber while it's behind the paywall.
-_BG = "#0c1218"
-_SURFACE = "#131b24"
-_ACCENT_UNLOCKED = "#5bbd84"
-_ACCENT_LOCKED = "#e2a13f"
+#: Parachute Montréal redesign palette (2026-08 mockup): near-black base, the brand
+#: red as the ONE accent in both entitlement states — the design keeps the paid and
+#: locked page visually identical (Frame 03's "one layout" rule taken further), so the
+#: lock now reads from the badge/CTA copy, not from a page-wide colour swap. Amber
+#: survives only as the ``720P PREVIEW`` badge text, the at-a-glance lock signal on a
+#: mixed jump where clean and watermarked cards sit side by side.
+_BG = "#0a0a0a"
+_SURFACE = "#141414"
+_SURFACE_2 = "#1c1c1c"
+_RED = "#d50000"
+_RED_DIM = "#9e0000"
+_LOCKED_BADGE = "#e2a13f"
+
+#: The platform mark in the footer ("Powered by UltimateDZM · <dropzone brand>").
+_PLATFORM_MARK = "UltimateDZM"
+
+#: Header tagline (the redesign's top-right line).
+_TAGLINE = "Your souvenir is ready"
+
+
+@lru_cache(maxsize=4)
+def brand_logo_data_uri(path_str: str | None) -> str | None:
+    """The header logo as a ``data:`` URI, or ``None`` for the text-brand fallback.
+
+    The gallery must stay a single self-contained document (it is uploaded to S3
+    verbatim on the legacy path), so the logo is inlined rather than linked. Cached —
+    the file is read once per process; swap the logo, restart the API. Never raises:
+    a missing/unreadable file simply renders the brand name as text, exactly the
+    pre-logo page. Kept OUT of :func:`render_gallery_html` so that stays pure.
+    """
+    if not path_str:
+        return None
+    p = Path(path_str)
+    try:
+        data = p.read_bytes()
+    except OSError:
+        return None
+    if not data:
+        return None
+    mime = mimetypes.guess_type(p.name)[0] or "image/png"
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
 
 #: How the locked page notices it has been paid for (Frame 03's "re-renders in
 #: place"). Slow enough to be free at dropzone volume, bounded so a page left open
@@ -114,6 +153,7 @@ def render_gallery_html(
     locked_videos: Sequence[str] = (),
     group_unlocks: Sequence[tuple[str, str | None]] = (),
     posters: Mapping[str, str] | None = None,
+    logo_data_uri: str | None = None,
 ) -> str:
     """Render the customer gallery page as one self-contained HTML string.
 
@@ -157,6 +197,10 @@ def render_gallery_html(
       as before, which is the whole fallback story. Keyed by deliverable name for the
       main grid and by *label* for the load/raw sections, since those cards have no
       deliverable name of their own on this page.
+    * ``logo_data_uri`` — the dropzone logo for the header, already inlined as a
+      ``data:`` URI by :func:`brand_logo_data_uri` (the I/O is the caller's, so this
+      function stays pure). ``None`` → the brand name in letter-spaced caps, which is
+      the header this page had before the logo existed.
     * ``load_videos`` — the purchased spec-flight load video: ``(label, url)``, rendered
       under the Video tab for a customer who already had a gallery and bought the load
       video as an add-on. Empty/None → no section. (A no-media customer's *child* gallery
@@ -165,12 +209,21 @@ def render_gallery_html(
     e = html.escape
     brand_e = e(brand)
     title = e(customer_name)
-    accent = _ACCENT_LOCKED if locked else _ACCENT_UNLOCKED
     if photos_unlocked is None:
         photos_unlocked = not locked
     raw_videos = raw_videos or []
     load_videos = load_videos or []
     posters = posters or {}
+
+    # The header shows the dropzone's logo when the host inlined one, and the brand set
+    # in letter-spaced caps otherwise — the pre-logo header, unchanged, so a deployment
+    # with no logo configured still gets a finished-looking page. The image carries the
+    # brand as its alt text for the same reason.
+    brand_mark = (
+        f'<div class="logo"><img src="{e(logo_data_uri)}" alt="{brand_e}"></div>'
+        if logo_data_uri
+        else f'<div class="logo"><span class="brand">{brand_e}</span></div>'
+    )
 
     def poster_attr(key: str) -> str:
         """``poster="…"`` for a card, or nothing at all.
@@ -183,10 +236,11 @@ def render_gallery_html(
         return f' poster="{e(url)}"' if url else ""
 
     # Hero meta: date · product · instructor · location, skipping whatever is unknown.
+    # The date is set in <strong> — the redesign's meta line leads with a bold date.
     meta_bits = [
         b
         for b in (
-            e(_display_date(jump_date)) if jump_date else None,
+            f"<strong>{e(_display_date(jump_date))}</strong>" if jump_date else None,
             e(product_label) if product_label else None,
             f"Instructor {e(instructor_name)}" if instructor_name else None,
             e(location) if location else None,
@@ -219,7 +273,7 @@ def render_gallery_html(
         video_cards.append(f"""
         <div class="vcard">{badge}
           <video controls preload="metadata" playsinline{guard}{poster_attr(name)} src="{e(url)}"></video>
-          <div class="vlabel">{e(label)}<span>{e(sub)}</span>{dl}</div>
+          <div class="vlabel"><div class="titles">{e(label)}<span>{e(sub)}</span></div>{dl}</div>
         </div>""")
 
     # One call to action PER CAMERA whose edit is still locked. Two angles are priced and
@@ -315,6 +369,10 @@ def render_gallery_html(
         )
 
     # "Add to your day" — the same row in both entitlement states (design notes).
+    # The redesign renders each tile as a wide card: label/title/blurb on the left, a red
+    # "Add $15" button on the right. The DOM order stays title → blurb → price (a
+    # two-column grid places the price, and CSS supplies the word "Add") so the markup
+    # keeps its shape and the price text stays exactly the catalogue's string.
     if upsells:
         tiles = []
         for t in upsells:
@@ -396,7 +454,7 @@ def render_gallery_html(
         f"""
         <div class="vcard"><div class="pbadge ok">RAW · AS FILMED</div>
           <video controls preload="metadata" playsinline src="{e(url)}"></video>
-          <div class="vlabel">{e(label)}<span>Camera master</span>
+          <div class="vlabel"><div class="titles">{e(label)}<span>Camera master</span></div>
           <a class="vdl" href="{e(url)}" download>Download</a></div>
         </div>"""
         for label, url in raw_videos
@@ -416,7 +474,7 @@ def render_gallery_html(
         f"""
         <div class="vcard"><div class="pbadge ok">FROM THE AIR</div>
           <video controls preload="metadata" playsinline{poster_attr(label)} src="{e(url)}"></video>
-          <div class="vlabel">{e(label)}<span>Your jump day from the air</span>
+          <div class="vlabel"><div class="titles">{e(label)}<span>Your jump day from the air</span></div>
           <a class="vdl" href="{e(url)}" download>Download</a></div>
         </div>"""
         for label, url in load_videos
@@ -452,59 +510,137 @@ def render_gallery_html(
 <title>{title} — {brand_e}</title>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  :root {{ --accent:{accent}; --bg:{_BG}; --surface:{_SURFACE}; --line:#22303d; --muted:#8fa0b0; }}
-  body {{ background:var(--bg); color:#eef3f7; font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }}
-  header {{ background:var(--surface); padding:16px; text-align:center; border-bottom:1px solid var(--line); }}
+  :root {{
+    --bg:{_BG}; --surface:{_SURFACE}; --surface-2:{_SURFACE_2};
+    --red:{_RED}; --red-dim:{_RED_DIM}; --locked:{_LOCKED_BADGE};
+    --white:#f5f5f5; --gray:#9a9a9a; --line:#2a2a2a;
+  }}
+  body {{
+    background:var(--bg); color:var(--white); line-height:1.5;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+  }}
+  a {{ color:inherit; text-decoration:none; }}
+
+  header {{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:14px 32px; border-bottom:1px solid var(--line);
+    position:sticky; top:0; z-index:10;
+    background:rgba(10,10,10,.9); backdrop-filter:blur(8px);
+  }}
+  header .logo {{ display:flex; align-items:center; }}
+  header .logo img {{ height:100px; width:auto; display:block; }}
   header .brand {{ font-weight:800; letter-spacing:3px; font-size:15px; color:#fff; text-transform:uppercase; }}
-  .hero {{ padding:28px 20px 6px; text-align:center; }}
-  .hero h1 {{ font-size:34px; font-weight:800; letter-spacing:-.5px; }}
-  .hero .sub {{ color:var(--muted); margin-top:8px; font-size:12px; letter-spacing:1.5px; text-transform:uppercase; }}
-  .hero .eyebrow {{ color:var(--accent); font-size:12px; letter-spacing:2px; text-transform:uppercase; font-weight:700; margin-bottom:8px; }}
-  main {{ max-width:1100px; margin:0 auto; padding:14px 20px 20px; }}
-  h2 {{ font-size:15px; letter-spacing:2px; text-transform:uppercase; margin:24px 0 14px; border-left:3px solid var(--accent); padding-left:10px; }}
-  h2 span {{ color:var(--accent); }}
-  .vgrid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:16px; }}
-  .vcard {{ background:var(--surface); border-radius:10px; overflow:hidden; position:relative; border:1px solid var(--line); }}
-  .vcard video {{ width:100%; display:block; background:#000; aspect-ratio:16/9; }}
-  .vlabel {{ padding:12px 14px; font-weight:700; }}
-  .vlabel span {{ display:block; font-weight:400; color:var(--muted); font-size:12px; margin-top:3px; }}
-  .vdl {{ display:inline-block; margin-top:8px; color:#0c1218; background:{_ACCENT_UNLOCKED}; text-decoration:none; padding:7px 14px; border-radius:7px; font-size:12px; font-weight:800; }}
-  .pbadge {{ position:absolute; top:10px; left:10px; z-index:2; background:rgba(0,0,0,.72); color:{_ACCENT_LOCKED}; font-size:10px; font-weight:800; letter-spacing:1px; padding:5px 9px; border-radius:5px; }}
-  .pbadge.ok {{ color:{_ACCENT_UNLOCKED}; }}
-  .shead {{ display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; }}
-  .btn {{ background:var(--accent); color:#0c1218; text-decoration:none; padding:10px 18px; border-radius:8px; font-weight:800; font-size:13px; }}
-  .pgrid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:8px; }}
-  .ptile {{ display:block; aspect-ratio:1/1; overflow:hidden; border-radius:6px; background:var(--surface); }}
-  .ptile img {{ width:100%; height:100%; object-fit:cover; transition:transform .2s; }}
-  .ptile:hover img {{ transform:scale(1.05); }}
-  .teaser {{ color:var(--muted); padding:14px 0; }}
-  .tabs {{ display:flex; gap:8px; justify-content:center; padding:14px 20px 0; }}
-  .tabbtn {{ color:var(--muted); text-decoration:none; padding:9px 22px; border-radius:8px; background:var(--surface); font-weight:700; font-size:12px; letter-spacing:1px; text-transform:uppercase; }}
-  .tabbtn.active {{ background:var(--accent); color:#0c1218; }}
+  header .tagline {{ color:var(--gray); font-size:13px; }}
+
+  .hero {{ max-width:980px; margin:0 auto; padding:56px 32px 30px; }}
+  .hero .eyebrow {{ color:var(--red); font-weight:700; font-size:12px; letter-spacing:1.5px; text-transform:uppercase; margin-bottom:14px; }}
+  .hero h1 {{ font-size:clamp(32px,5vw,52px); font-weight:800; letter-spacing:-.5px; margin-bottom:12px; }}
+  .hero .sub {{ color:var(--gray); font-size:15px; }}
+  .hero .sub strong {{ color:var(--white); font-weight:600; }}
+
+  main {{ max-width:980px; margin:0 auto; padding:0 32px 10px; }}
+  main section {{ padding-top:36px; }}
+  h2 {{ font-size:20px; font-weight:700; margin-bottom:20px; }}
+  h2 span {{ color:var(--gray); font-weight:500; }}
+
+  .tabs {{ max-width:980px; margin:0 auto; padding:0 32px; display:flex; gap:32px; border-bottom:1px solid var(--line); }}
+  .tabbtn {{
+    padding:14px 2px; font-weight:700; font-size:15px; color:var(--gray);
+    border-bottom:3px solid transparent; transition:color .15s ease,border-color .15s ease;
+  }}
+  .tabbtn.active {{ color:var(--white); border-bottom-color:var(--red); }}
   .tab-panel {{ display:none; }}
   .tab-panel.active {{ display:block; }}
-  .cta {{ max-width:1100px; margin:0 auto; padding:14px 20px 4px; text-align:center; }}
-  /* Frame 03 sets the primary action in caps. Done in CSS, not by upper-casing the
-     string, so the label stays one readable sentence for translation and for the
-     tests/scripts that match on it. */
-  .ctabtn {{ display:block; background:var(--accent); color:#0c1218; text-decoration:none; padding:15px 30px; border-radius:9px; font-weight:800; font-size:15px; letter-spacing:1px; text-transform:uppercase; }}
-  .ctasub {{ color:var(--muted); font-size:12px; margin-top:8px; }}
-  .upsell {{ max-width:1100px; margin:0 auto; padding:26px 20px 8px; border-top:1px solid var(--line); }}
-  .ulabel {{ color:var(--muted); font-size:11px; letter-spacing:2px; text-transform:uppercase; font-weight:700; margin-bottom:10px; }}
-  .urow {{ display:flex; gap:10px; overflow-x:auto; padding-bottom:6px; }}
-  .utile {{ flex:0 0 auto; min-width:150px; background:var(--surface); border:1px solid var(--line); border-radius:9px; padding:13px 15px; text-decoration:none; color:inherit; }}
-  .utile .utitle {{ font-size:12px; font-weight:800; letter-spacing:1px; text-transform:uppercase; }}
-  .utile .ublurb {{ color:var(--muted); font-size:12px; margin-top:5px; }}
-  .utile .uprice {{ font-weight:800; font-size:15px; margin-top:12px; }}
-  footer {{ text-align:center; color:#5c6b78; padding:30px; font-size:12px; }}
+
+  .vgrid {{ display:grid; grid-template-columns:repeat(2,1fr); gap:18px; }}
+  .vcard {{
+    position:relative; background:var(--surface); border:1px solid var(--line);
+    border-radius:14px; overflow:hidden; transition:border-color .15s ease,transform .15s ease;
+  }}
+  .vcard:hover {{ border-color:var(--red-dim); transform:translateY(-2px); }}
+  .vcard video {{ width:100%; display:block; background:#000; aspect-ratio:16/9; }}
+  .vlabel {{ padding:14px 16px 16px; display:flex; align-items:center; justify-content:space-between; gap:12px; }}
+  .vlabel .titles {{ min-width:0; font-weight:700; font-size:14.5px; }}
+  .vlabel span {{ display:block; font-weight:400; color:var(--gray); font-size:12.5px; margin-top:2px; }}
+  .vdl {{
+    flex-shrink:0; background:transparent; border:1px solid var(--red); color:var(--red);
+    font-weight:700; font-size:12.5px; padding:8px 14px; border-radius:8px;
+    transition:background .15s ease,color .15s ease;
+  }}
+  .vdl:hover {{ background:var(--red); color:#fff; }}
+  .pbadge {{
+    position:absolute; top:10px; left:10px; z-index:2;
+    background:rgba(0,0,0,.65); border:1px solid rgba(255,255,255,.15); color:var(--locked);
+    font-size:10px; font-weight:700; letter-spacing:.5px; padding:4px 8px; border-radius:6px;
+  }}
+  .pbadge.ok {{ color:#fff; }}
+
+  .shead {{ display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin-bottom:20px; }}
+  .shead h2 {{ margin-bottom:0; }}
+  .btn {{ background:var(--red); color:#fff; padding:10px 18px; border-radius:9px; font-weight:700; font-size:13px; }}
+  .pgrid {{ display:grid; grid-template-columns:repeat(4,1fr); gap:10px; }}
+  .ptile {{ display:block; aspect-ratio:1/1; overflow:hidden; border-radius:10px; border:1px solid var(--line); background:var(--surface); }}
+  .ptile img {{ width:100%; height:100%; object-fit:cover; transition:transform .2s; }}
+  .ptile:hover img {{ transform:scale(1.05); }}
+  .teaser {{ color:var(--gray); padding:14px 0; }}
+
+  /* The primary action. Set in caps in CSS, not by upper-casing the string, so the
+     label stays one readable sentence for translation and for the tests/scripts that
+     match on it (Frame 03). */
+  .cta {{ max-width:980px; margin:0 auto; padding:0 32px 34px; }}
+  /* The per-camera unlock offers and the photo-grid offer sit INSIDE main, which is
+     already inset — so they carry only the vertical rhythm, not a second gutter. */
+  main .cta {{ max-width:none; padding:20px 0 0; }}
+  .ctabtn {{
+    display:inline-flex; align-items:center; gap:14px;
+    background:var(--red); color:#fff; padding:16px 26px; border-radius:10px;
+    font-weight:700; font-size:16px; letter-spacing:.5px; text-transform:uppercase;
+    box-shadow:0 8px 24px rgba(213,0,0,.35); transition:transform .15s ease,box-shadow .15s ease;
+  }}
+  .ctabtn:hover {{ transform:translateY(-2px); box-shadow:0 12px 30px rgba(213,0,0,.45); }}
+  .ctasub {{ display:block; color:var(--gray); font-size:13px; margin-top:12px; }}
+
+  .upsell {{ max-width:980px; margin:44px auto 0; padding:0 32px 24px; }}
+  .ulabel {{ color:var(--red); font-weight:700; font-size:12px; letter-spacing:1px; text-transform:uppercase; margin-bottom:12px; }}
+  .urow {{ display:grid; gap:14px; }}
+  .utile {{
+    display:grid; grid-template-columns:1fr auto; column-gap:20px; align-items:center;
+    background:linear-gradient(120deg,var(--surface-2),#150505);
+    border:1px solid var(--red-dim); border-radius:16px; padding:24px 26px; color:inherit;
+  }}
+  .utile .utitle {{ grid-column:1; font-size:20px; font-weight:700; margin-bottom:6px; }}
+  .utile .ublurb {{ grid-column:1; color:var(--gray); font-size:14px; }}
+  .utile .uprice {{
+    grid-column:2; grid-row:1 / span 2; justify-self:end; white-space:nowrap;
+    background:var(--red); color:#fff; font-weight:700; font-size:26px;
+    padding:11px 22px; border-radius:9px;
+  }}
+  /* "Add $15" — the word is decoration, so it lives here and the price text stays
+     exactly the catalogue's string. */
+  .utile .uprice::before {{ content:"Add "; font-size:14px; font-weight:700; margin-right:6px; }}
+
+  footer {{ text-align:center; padding:30px 20px 50px; color:var(--gray); font-size:12.5px; border-top:1px solid var(--line); }}
+  footer .fmark {{ color:var(--red); font-weight:700; }}
+
+  @media (max-width:620px) {{
+    header {{ padding:10px 20px; }}
+    header .logo img {{ height:68px; }}
+    .hero, .tabs, main, .cta, .upsell {{ padding-left:20px; padding-right:20px; }}
+    .hero {{ padding-top:34px; }}
+    .tabs {{ gap:22px; }}
+    .vgrid {{ grid-template-columns:1fr; }}
+    .pgrid {{ grid-template-columns:repeat(3,1fr); }}
+    .utile {{ grid-template-columns:1fr; row-gap:14px; }}
+    .utile .uprice {{ grid-column:1; grid-row:auto; justify-self:start; }}
+  }}
 </style></head>
 <body>
-  <header><div class="brand">{brand_e}</div></header>
+  <header>{brand_mark}<div class="tagline">{_TAGLINE}</div></header>
   <div class="hero">{eyebrow_html}<h1>{title}</h1><div class="sub">{subtitle}</div></div>
   {cta_bar}{tab_nav}
   <main>
     {videos_section}{photos_section}
   </main>
   {upsell_section}
-  <footer>Powered by {brand_e}</footer>
+  <footer>Powered by <span class="fmark">{_PLATFORM_MARK}</span> · {brand_e}</footer>
 {tab_js}{flip_js}</body></html>"""

@@ -8,9 +8,12 @@ watermarked previews, the unlock CTA, and no way to download anything.
 
 from __future__ import annotations
 
+import base64
+from pathlib import Path
+
 import pytest
 
-from api.gallery import _display_date, render_gallery_html
+from api.gallery import _display_date, brand_logo_data_uri, render_gallery_html
 from api.upsell import DEFAULT_TILES, UpsellTile
 
 _BASE = {
@@ -403,3 +406,60 @@ def test_locked_page_without_photo_urls_keeps_the_teaser() -> None:
     html = _page(locked=True, photos=[], photo_count_teaser=32, tabbed=True)
     assert "32 photos included — unlock to see them all." in html
     assert "Unlock your photos" not in html
+
+
+# --------------------------------------------------------------------------- #
+# The Parachute Montréal skin (2026-08 mockup)
+# --------------------------------------------------------------------------- #
+
+
+def test_header_shows_the_logo_when_one_is_inlined() -> None:
+    html = _page(logo_data_uri="data:image/png;base64,AAAA")
+    assert '<div class="logo"><img src="data:image/png;base64,AAAA"' in html
+    assert 'alt="Ultimate DZ"' in html  # the brand is still readable without images
+
+
+def test_header_falls_back_to_the_brand_in_text_without_a_logo() -> None:
+    """A deployment with no logo configured must still get a finished header."""
+    html = _page()
+    assert "<img" not in html.split("</header>", 1)[0]
+    assert '<span class="brand">Ultimate DZ</span>' in html
+
+
+def test_brand_logo_data_uri_reads_a_real_file_and_never_raises(tmp_path: Path) -> None:
+    png = tmp_path / "logo.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    assert brand_logo_data_uri(str(png)) == (
+        "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\nfake").decode()
+    )
+    # The three ways it can have nothing to inline — none of them may raise, all of
+    # them fall back to the text header.
+    assert brand_logo_data_uri(None) is None
+    assert brand_logo_data_uri(str(tmp_path / "absent.png")) is None
+    empty = tmp_path / "empty.png"
+    empty.write_bytes(b"")
+    assert brand_logo_data_uri(str(empty)) is None
+
+
+def test_the_skin_is_the_brand_red_in_both_states() -> None:
+    """The redesign drops the green/amber accent swap: one accent, two copies."""
+    unlocked, locked = _state_1_unlocked(), _state_2_locked()
+    for html in (unlocked, locked):
+        assert "--red:#d50000" in html and "--bg:#0a0a0a" in html
+    # Amber survives only as the locked badge's colour, which is what makes a mixed
+    # jump's clean and watermarked cards distinguishable at a glance.
+    assert "--locked:#e2a13f" in unlocked
+    assert "720P PREVIEW" in locked and "720P PREVIEW" not in unlocked
+
+
+def test_upsell_price_carries_the_catalogue_string_verbatim() -> None:
+    """"Add" is CSS decoration — the price text stays exactly what was priced."""
+    html = _page(upsells=[UpsellTile("raw", "Raw Footage", "Every minute", "$15", None)])
+    assert '<div class="uprice">$15</div>' in html
+    assert 'content:"Add "' in html
+
+
+def test_platform_mark_and_tagline() -> None:
+    html = _page()
+    assert 'Powered by <span class="fmark">UltimateDZM</span> · Ultimate DZ' in html
+    assert "Your souvenir is ready" in html

@@ -575,6 +575,7 @@ def deliver_to_customer(
                 )
         page = gallery.render_gallery_html(
             brand=settings.delivery_brand_name,
+            logo_data_uri=gallery.brand_logo_data_uri(settings.gallery_logo),
             customer_name=job.customer_name,
             jump_date=job.jump_date,
             location=settings.delivery_location,

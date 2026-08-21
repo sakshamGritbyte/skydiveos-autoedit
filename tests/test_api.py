@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 
 from api.app import create_app, get_queue, get_store
 from api.config import get_settings
+from api.gallery import brand_logo_data_uri
 from api.jobs import ADJUSTMENTS_FILENAME, JobStatus, JobStore
 from edl.schema import Clip, EditDecisionList
 from edl.storage import edl_path, job_dir
@@ -982,6 +983,49 @@ def test_gallery_page_shows_the_hero_meta_and_download_action(client: TestClient
     assert "1080P · FULL QUALITY" in page
     assert "Download video" in page
     assert "yours to keep" in page
+
+
+def test_served_gallery_inlines_the_configured_logo(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The header logo is wired all the way through the route, not just the renderer.
+
+    Inlined as a ``data:`` URI (never a link) — the page must stay one self-contained
+    document, and a request to an outside host from a customer's gallery is a leak of
+    the short code that is the page's only credential.
+    """
+    logo = tmp_path / "brand.png"
+    logo.write_bytes(b"\x89PNG\r\n\x1a\nnot-really-a-png")
+    monkeypatch.setenv("GALLERY_LOGO", str(logo))
+    get_settings.cache_clear()
+    brand_logo_data_uri.cache_clear()
+    try:
+        job_id = _create(client, customer_name="Sophie Lavoie")
+        _rendered(client, job_id, locked=False)
+        page = client.get(f"/j/{_token(client, job_id)}").text
+    finally:
+        get_settings.cache_clear()
+        brand_logo_data_uri.cache_clear()
+    assert '<div class="logo"><img src="data:image/png;base64,' in page
+    assert str(logo) not in page  # the path, not just the bytes, stays server-side
+
+
+def test_served_gallery_without_a_logo_file_still_renders(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A branding asset must never take a customer's gallery down."""
+    monkeypatch.setenv("GALLERY_LOGO", str(tmp_path / "nope.png"))
+    get_settings.cache_clear()
+    brand_logo_data_uri.cache_clear()
+    try:
+        job_id = _create(client, customer_name="Sophie Lavoie")
+        _rendered(client, job_id, locked=False)
+        resp = client.get(f"/j/{_token(client, job_id)}")
+    finally:
+        get_settings.cache_clear()
+        brand_logo_data_uri.cache_clear()
+    assert resp.status_code == 200
+    assert '<span class="brand">' in resp.text and "Sophie Lavoie" in resp.text
 
 
 def test_gallery_shows_the_upsell_row_in_both_states(client: TestClient) -> None:

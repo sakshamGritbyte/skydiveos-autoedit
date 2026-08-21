@@ -199,6 +199,13 @@ class Settings:
     #: (``WATERMARK_LOGO``). Missing/unreadable → text-only watermark; a branding
     #: asset must never fail a preview render.
     watermark_logo: str = "templates/logo.png"
+    #: Dropzone logo shown in the customer gallery's header (``GALLERY_LOGO``). Inlined
+    #: as a ``data:`` URI so the page stays one self-contained document (the legacy path
+    #: uploads it to S3 verbatim), which is why it is a *separate* setting from
+    #: ``WATERMARK_LOGO``: a mark legible tiled across dark video is not the same asset
+    #: as a header logo, and a big one would bloat every gallery response. Missing or
+    #: unreadable → the brand name in text, exactly the pre-logo header.
+    gallery_logo: str = "templates/brand/gallery-logo.png"
     #: Checkout URL for the locked gallery's CTA (``CHECKOUT_URL_TEMPLATE``, with
     #: ``{job_id}`` / ``{booking_id}`` placeholders — and ``{item}`` for an upsell
     #: tile). ``None`` → the CTA renders as text ("ask at the desk") until SkydiveOS
@@ -349,6 +356,7 @@ def get_settings() -> Settings:
         public_base_url=(os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/") or None,
         preview_price_display=os.environ.get("PREVIEW_PRICE_DISPLAY") or "$39",
         watermark_logo=os.environ.get("WATERMARK_LOGO") or "templates/logo.png",
+        gallery_logo=os.environ.get("GALLERY_LOGO") or "templates/brand/gallery-logo.png",
         checkout_url_template=os.environ.get("CHECKOUT_URL_TEMPLATE") or None,
         upsell_tiles=parse_tiles(os.environ.get("UPSELL_TILES")),
         # Accept the SkydiveOS-side spellings too, so one secret can be pasted into

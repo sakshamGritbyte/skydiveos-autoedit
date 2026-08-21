@@ -61,7 +61,7 @@ from . import archive
 from .auth import PUBLIC_PATH_PREFIX, AdminDep, PrincipalDep, service_token_allows
 from .catalogue import PriceCatalogue, load_price_catalogue
 from .config import Settings, get_settings
-from .gallery import render_gallery_html
+from .gallery import brand_logo_data_uri, render_gallery_html
 from .jobs import (
     CAMERA_ROLE_EXTERNAL,
     CAMERA_ROLE_INSTRUCTOR,
@@ -1982,15 +1982,35 @@ def create_app() -> FastAPI:
                else []),
         )
         if not video_names and not photo_names:
+            # The "not edited yet" page is the SAME link the customer was emailed, so it
+            # wears the gallery's brand rather than a bare fallback: the logo, the
+            # near-black base and the red accent, so an early click reads as the same
+            # product they'll come back to. Self-contained and dependency-free for the
+            # same reason it always was — it must render when nothing else does.
             brand = html_escape(settings.delivery_brand_name)
+            logo = brand_logo_data_uri(settings.gallery_logo)
+            mark = (
+                f"<img src='{html_escape(logo)}' alt='{brand}' "
+                "style='height:110px;width:auto;margin:0 auto 26px;display:block'>"
+                if logo
+                else "<div style='font-weight:800;letter-spacing:3px;font-size:15px;"
+                f"text-transform:uppercase;margin-bottom:26px'>{brand}</div>"
+            )
             return HTMLResponse(
                 "<!doctype html><html><head><meta charset='utf-8'>"
                 "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+                "<meta name='referrer' content='no-referrer'>"
                 f"<title>{brand}</title></head>"
-                "<body style='background:#0d0d0d;color:#f2f2f2;font-family:sans-serif;"
-                "text-align:center;padding:60px 20px'>"
-                f"<h1>{brand}</h1><p>Your jump video is still being edited — "
-                "check back in a few minutes.</p></body></html>"
+                "<body style='background:#0a0a0a;color:#f5f5f5;margin:0;line-height:1.5;"
+                "font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Helvetica,Arial,"
+                "sans-serif;text-align:center;padding:80px 20px'>"
+                f"{mark}"
+                "<div style='color:#d50000;font-weight:700;font-size:12px;letter-spacing:"
+                "1.5px;text-transform:uppercase;margin-bottom:14px'>Still editing</div>"
+                "<h1 style='font-size:30px;font-weight:800;letter-spacing:-.5px;margin:0 0 12px'>"
+                "Your souvenir is on its way</h1>"
+                "<p style='color:#9a9a9a;font-size:15px;margin:0'>Your jump video is "
+                "still being edited — check back in a few minutes.</p></body></html>"
             )
 
         unlock_url = None
@@ -2038,6 +2058,7 @@ def create_app() -> FastAPI:
             )
         html_page = render_gallery_html(
             brand=settings.delivery_brand_name,
+            logo_data_uri=brand_logo_data_uri(settings.gallery_logo),
             customer_name=job.customer_name,
             jump_date=job.jump_date,
             location=settings.delivery_location,

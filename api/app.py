@@ -1255,11 +1255,24 @@ def create_app() -> FastAPI:
             # instructor who stopped and restarted recording); each is ingested
             # separately and the settle window in `ingest_s3_job` dispatches once they
             # have all landed, so the pipeline never cuts a partial jump.
-            bad = [k for k in s3_key if not k.lower().endswith(".mp4")]
+            # A real GoPro batch is mixed .mp4 + .lrv: the proxy stages beside its
+            # master for the analysis stages to discover, exactly as on the byte path
+            # above — and the same two rules apply. Anything else is refused, and a
+            # proxy-only call is refused too: an .lrv can never render, so accepting
+            # one without a master would create a job that can only fail.
+            bad = [k for k in s3_key if Path(k).suffix.lower() not in (".mp4", ".lrv")]
             if bad:
                 raise HTTPException(
                     status_code=422,
-                    detail=f"s3_key must point to an .mp4 master (got {bad!r})",
+                    detail=f"unsupported s3_key (expected .mp4 or .lrv): {bad!r}",
+                )
+            if not any(Path(k).suffix.lower() == ".mp4" for k in s3_key):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "at least one .mp4 is required "
+                        "(an .lrv proxy alone cannot be rendered)"
+                    ),
                 )
             if job.staged_by_camera_role:
                 from .selfie import CAMERA_ROLES

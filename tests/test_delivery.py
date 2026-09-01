@@ -972,6 +972,71 @@ def test_settle_check_is_noop_once_the_job_moved_on(
     assert enq == []
 
 
+def test_s3_ingest_lrv_stages_but_never_becomes_source(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An .lrv proxy stages beside its master and stamps the settle clock —
+    but only the master ever becomes ``source_path``."""
+    from api import tasks
+    from api.jobs import Job, Package
+
+    store.create(Job(job_id="j1", package=Package.selfie))
+    enq, armed = _s3_ingest_harness(tasks, store, tmp_path, monkeypatch)
+
+    tasks.ingest_s3_job(job_id="j1", s3_key="raw/1234/GX010001.MP4")
+    tasks.ingest_s3_job(job_id="j1", s3_key="raw/1234/GL010001.LRV")
+
+    job = store.load("j1")
+    assert job.source_path and job.source_path.endswith("raw/GX010001.MP4")
+    assert (store.raw_dir("j1") / "GL010001.LRV").exists()  # staged for analysis
+    assert job.raw_s3_keys["GL010001.LRV"] == "raw/1234/GL010001.LRV"
+    assert enq == []      # settle window still open
+    assert len(armed) == 2  # the proxy keeps the window open too
+
+
+def test_s3_ingest_lrv_does_not_revive_a_failed_job(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keys ingest as independent tasks in no guaranteed order: a proxy landing after
+    its master's download FAILED must not erase the failure and re-queue a job with
+    no master on disk."""
+    from api import tasks
+    from api.jobs import Job, Package
+    from api.jobs import JobStatus as JS
+
+    store.create(Job(job_id="j1", package=Package.selfie))
+    enq, _armed = _s3_ingest_harness(tasks, store, tmp_path, monkeypatch)
+
+    # The master's download fails → job failed.
+    def boom(s3_key: str, dest: Path, settings: object) -> None:
+        raise RuntimeError("connection reset")
+
+    monkeypatch.setattr(tasks, "_download_s3", boom)
+    with pytest.raises(RuntimeError):
+        tasks.ingest_s3_job(job_id="j1", s3_key="raw/1234/GX010001.MP4")
+    assert store.load("j1").status == JS.failed
+
+    # Its proxy succeeds afterwards → stages, but the failure stands.
+    def ok(s3_key: str, dest: Path, settings: object) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"proxy")
+
+    monkeypatch.setattr(tasks, "_download_s3", ok)
+    tasks.ingest_s3_job(job_id="j1", s3_key="raw/1234/GL010001.LRV")
+
+    job = store.load("j1")
+    assert job.status == JS.failed  # not revived
+    assert job.error and "S3 ingest failed" in job.error
+    assert not job.source_path      # never points at a proxy
+
+    # And the settle check the proxy armed refuses to dispatch a masterless job.
+    monkeypatch.setattr(
+        tasks.time, "time", lambda: (job.last_raw_clip_at or 0) + 999
+    )
+    tasks.raw_clips_settled_job("j1")
+    assert enq == []
+
+
 def test_s3_ingest_ultimum_waits_for_both_cameras(
     store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

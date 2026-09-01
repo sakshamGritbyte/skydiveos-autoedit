@@ -677,6 +677,38 @@ def test_upload_s3_key_non_mp4_is_422(client: TestClient, queue: FakeQueue) -> N
     assert queue.calls == []
 
 
+def test_upload_s3_key_accepts_lrv_beside_mp4(
+    client: TestClient, queue: FakeQueue
+) -> None:
+    """A real GoPro batch is mixed .mp4 + .lrv — the fast S3 path must take both.
+
+    Refusing the proxy pushed every real upload onto the slow byte-proxy route; the
+    .lrv stages beside its master for the analysis stages to discover, exactly as it
+    already does on the byte path.
+    """
+    job_id = _create(client)
+    resp = client.post(
+        f"/jobs/{job_id}/upload",
+        data={"s3_key": ["raw/1234/GX010001.MP4", "raw/1234/GL010001.LRV"]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert queue.calls == [
+        ("s3_ingest", (job_id, "raw/1234/GX010001.MP4", None)),
+        ("s3_ingest", (job_id, "raw/1234/GL010001.LRV", None)),
+    ]
+
+
+def test_upload_s3_key_lrv_only_is_422(client: TestClient, queue: FakeQueue) -> None:
+    """A proxy alone cannot render — same rule as the byte path's LRV-only refusal."""
+    job_id = _create(client)
+    resp = client.post(
+        f"/jobs/{job_id}/upload", data={"s3_key": "raw/1234/GL010001.LRV"}
+    )
+    assert resp.status_code == 422
+    assert "at least one .mp4" in resp.json()["detail"]
+    assert queue.calls == []
+
+
 def test_upload_s3_key_ultimum_requires_role(client: TestClient, queue: FakeQueue) -> None:
     job_id = _create(client, package="ultimum")
     # Without camera_role → 422

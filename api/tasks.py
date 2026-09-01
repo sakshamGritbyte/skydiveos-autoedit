@@ -810,12 +810,20 @@ def ingest_s3_job(job_id: str, s3_key: str, camera_role: str | None = None) -> s
     into the job's ``raw/`` staging (per-``camera_role`` for the two-camera Ultimate
     package), then hands off to the SAME pipeline dispatch a byte upload would — so the
     editing path is identical regardless of how the footage arrived.
+
+    An ``.lrv`` key (the GoPro proxy riding along with its master, same contract as the
+    byte path) only *stages*: it stamps the settle clock so a still-arriving batch keeps
+    its window open, but never becomes ``source_path`` and never touches ``status`` or
+    ``error`` — each key ingests as its own task in no guaranteed order, so a proxy
+    landing after its master's download FAILED must not erase that failure and re-queue
+    a job with no master on disk.
     """
     _ensure_repo_on_path()
     store = _store()
     settings = get_settings()
     job = store.load(job_id)
     filename = Path(s3_key).name
+    is_master = filename.lower().endswith(".mp4")
 
     if job.staged_by_camera_role:
         # Two products (or two cameras) on one job: the clips must be kept apart, both
@@ -849,8 +857,10 @@ def ingest_s3_job(job_id: str, s3_key: str, camera_role: str | None = None) -> s
         store.update(job_id, status=JobStatus.failed, error=f"S3 ingest failed: {e}")
         raise
 
-    # Record where this master lives in S3 — the disk-retention authority: the
+    # Record where this object lives in S3 — the disk-retention authority: the
     # pruner deletes the local copy only after re-confirming exactly this key.
+    # Proxies are recorded too (the map is the record of everything ingested);
+    # the pruner's own .mp4 filter keeps retention behaviour unchanged by them.
     job = store.load(job_id)
     store.update(job_id, raw_s3_keys={**job.raw_s3_keys, filename: s3_key})
 
@@ -867,11 +877,12 @@ def ingest_s3_job(job_id: str, s3_key: str, camera_role: str | None = None) -> s
         state = job.role_ingest.get(camera_role) or RoleIngest()
         store.update(
             job_id,
-            error=None,
             role_ingest={
                 **job.role_ingest,
                 camera_role: state.model_copy(update={"last_clip_at": time.time()}),
             },
+            # Only a master clears a prior error — a proxy must not revive a failed job.
+            **({"error": None} if is_master else {}),
         )
         settle = get_settings().raw_clip_settle_seconds
         if settle <= 0:
@@ -889,8 +900,13 @@ def ingest_s3_job(job_id: str, s3_key: str, camera_role: str | None = None) -> s
         # first external clip landing next to the instructor's set would render a
         # partial multi-cam edit (observed live: 2 of 8 cameraman clips made the
         # cut). Both-roles-present only makes the job ELIGIBLE; the settle window
-        # decides WHEN, exactly like the single-camera path below.
-        store.update(job_id, status=JobStatus.queued, error=None, last_raw_clip_at=time.time())
+        # decides WHEN, exactly like the single-camera path below. A proxy stamps the
+        # clock only — never status/error (it must not revive a failed job).
+        store.update(
+            job_id,
+            last_raw_clip_at=time.time(),
+            **({"status": JobStatus.queued, "error": None} if is_master else {}),
+        )
         if store.camera_roles_present(job_id, CAMERA_ROLES):
             settle = get_settings().raw_clip_settle_seconds
             if settle <= 0:
@@ -911,13 +927,18 @@ def ingest_s3_job(job_id: str, s3_key: str, camera_role: str | None = None) -> s
                 )
         return job_id
 
-    # Single-camera packages cut from a single source master; point at the downloaded MP4.
+    # Single-camera packages cut from a single source master; point at the downloaded
+    # MP4 — never at an .lrv proxy, which stages beside its master for analysis only
+    # and stamps just the settle clock (see the docstring for why it must not touch
+    # status/error).
     store.update(
         job_id,
-        source_path=str(dest),
-        status=JobStatus.queued,
-        error=None,
         last_raw_clip_at=time.time(),
+        **(
+            {"source_path": str(dest), "status": JobStatus.queued, "error": None}
+            if is_master
+            else {}
+        ),
     )
 
     # One jump can arrive as SEVERAL clips: SkydiveOS notifies once per clip (a GoPro

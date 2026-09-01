@@ -2352,7 +2352,13 @@ def render_selfie_video(
         cmd += [
             "-filter_complex", ";".join(chains),
             "-map", "[vout]", "-map", f"[{audio_label}]",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+            # `veryfast`, not `ultrafast` (and matching render.DEFAULT_PRESET):
+            # ultrafast disables CABAC and B-frames, so it encodes to Constrained
+            # Baseline at ~25 Mbit/s — a 2.5-minute jump landed as a 489 MB file that
+            # stalled in the customer's browser and was painful to download. veryfast
+            # keeps the same CRF quality at roughly a quarter of the bitrate for a
+            # modest encode-time cost.
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
             "-pix_fmt", "yuv420p", "-r", str(fps),
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart", "-t", f"{total:.3f}", str(out),

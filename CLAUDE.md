@@ -812,7 +812,16 @@ Two runtime media roots, with different audiences:
   "Add to your day" row, `key:title:blurb:price|…` — key/title/blurb only, since the
   admin catalogue owns the price and which tiles exist; unset → the design's three
   defaults, `off` → no row), `GALLERY_THUMBNAILS` (per-card poster frames, on by
-  default — off falls back to the browser's placeholder tile)
+  default — off falls back to the browser's placeholder tile); CloudFront delivery
+  (Bug 373) adds `CDN_BASE_URL`, `CDN_KEY_PAIR_ID`, `CDN_PRIVATE_KEY_PATH`,
+  `CDN_URL_TTL_S` — with all three set (see `deploy/CLOUDFRONT.md` for the AWS side),
+  the served gallery's player fetch of a **delivered, unlocked** video 302s to a
+  CloudFront **signed URL** (`api/cdn.py` — deterministic within a window, so a
+  replay reuses the browser cache; the edge caches by path + `v`), instead of
+  streaming the master through the API or minting a browser-cache-defeating
+  per-request presigned S3 URL after pruning. Locked deliverables NEVER get a CDN
+  URL; `?dl=1` (the gallery's Download buttons) bypasses the CDN and serves an
+  attachment; unset → pre-CDN behaviour, byte-identical
 - Under Docker the archive is a **host bind mount** (`./raw-storage:/data/raw-storage`),
   not a named volume: the container layer is wiped by `up --build`, and a bind mount can
   be rsync'd off the box without `docker exec`. Being a separate mount from the `jobs`

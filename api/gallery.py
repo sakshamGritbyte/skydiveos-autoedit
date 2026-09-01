@@ -154,6 +154,7 @@ def render_gallery_html(
     group_unlocks: Sequence[tuple[str, str | None]] = (),
     posters: Mapping[str, str] | None = None,
     logo_data_uri: str | None = None,
+    download_urls: Mapping[str, str] | None = None,
 ) -> str:
     """Render the customer gallery page as one self-contained HTML string.
 
@@ -205,6 +206,12 @@ def render_gallery_html(
       under the Video tab for a customer who already had a gallery and bought the load
       video as an add-on. Empty/None → no section. (A no-media customer's *child* gallery
       shows the load video as its main ``videos`` instead — it's the only video they have.)
+    * ``download_urls`` — ``{deliverable: href}`` for the per-card Download anchors when
+      that must differ from the player URL. The served route passes its ``?dl=1``
+      variant, which is served as an attachment and never redirected to the CDN — a
+      cross-origin redirect makes browsers ignore the ``download`` attribute, so the
+      click would *play* the video instead of saving it. A card with no entry keeps
+      using its player URL (the legacy S3 page, unchanged).
     """
     e = html.escape
     brand_e = e(brand)
@@ -214,6 +221,7 @@ def render_gallery_html(
     raw_videos = raw_videos or []
     load_videos = load_videos or []
     posters = posters or {}
+    download_urls = download_urls or {}
 
     # The header shows the dropzone's logo when the host inlined one, and the brand set
     # in letter-spaced caps otherwise — the pre-logo header, unchanged, so a deployment
@@ -267,7 +275,7 @@ def render_gallery_html(
             badge = ""
         guard = ' controlsList="nodownload"' if card_locked else ""
         dl = (
-            f'<a class="vdl" href="{e(url)}" download>Download</a>'
+            f'<a class="vdl" href="{e(download_urls.get(name, url))}" download>Download</a>'
             if show_downloads and not card_locked else ""
         )
         video_cards.append(f"""

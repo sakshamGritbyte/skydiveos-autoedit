@@ -43,6 +43,13 @@ FINAL_FILENAME = "final.mp4"
 # call (tests drop to ``ultrafast``).
 DEFAULT_PRESET = "veryfast"
 DEFAULT_CRF = 23
+# VBV cap (Bug 373): CRF alone has no bitrate ceiling, and high-motion freefall
+# measured ~19 Mbit/s at 1080p — playback then stalls on any link that can't sustain
+# ~20 Mbit/s, CDN or not. 12 Mbit/s stays well above streaming-service 1080p ladders,
+# so quality is untouched on normal scenes; only the spikes are clamped. Mirrored in
+# api/selfie.py's deliverable encode.
+MAXRATE = "12M"
+VBV_BUFSIZE = "24M"
 AUDIO_BITRATE = "192k"
 DEFAULT_TIMEOUT_S = 600
 
@@ -120,6 +127,7 @@ def _build_command(
         cmd += ["-map", f"[{graph.audio_label}]"]
     cmd += [
         "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+        "-maxrate", MAXRATE, "-bufsize", VBV_BUFSIZE,
         "-pix_fmt", "yuv420p", "-r", str(OUT_FPS),
     ]
     if graph.audio_label is not None:

@@ -158,6 +158,22 @@ class Settings:
     #: How often :func:`api.tasks.raw_clips_settled_job` re-checks while clips are still
     #: arriving. Keeps the re-schedule loop cheap without delaying a settled jump.
     raw_clip_settle_poll_seconds: float = 30.0
+    #: Seconds a job with footage STAGED but processing never dispatched may sit quiet
+    #: in ``queued`` before a status read re-arms its dispatch
+    #: (``STUCK_JOB_RECOVERY_AFTER_S``, default 10 min; ``<= 0`` disables). Bug 374:
+    #: the ``s3_key`` path's dispatch rides on a single Celery countdown message
+    #: (:func:`api.tasks.raw_clips_settled_job`) — a worker restart or broker flush
+    #: loses it and NOTHING re-arms it, so the job reads ``media_state=UPLOADED`` /
+    #: ``status=queued`` forever. See :func:`api.reconcile.reconcile_stuck_job`; the
+    #: effective threshold never undercuts the settle window itself.
+    stuck_job_recovery_after_s: float = 600.0
+    #: Seconds a job whose processing WAS dispatched may sit quiet in ``queued`` before
+    #: a status read fails it with an actionable ``error``
+    #: (``QUEUED_JOB_TIMEOUT_S``, default 6 h; ``<= 0`` disables). Generous on purpose:
+    #: a busy day legitimately queues jobs behind one worker for a while, and a false
+    #: failure costs a re-attach. Re-attaching footage to a failed job is already a
+    #: first-class retry (it clears the dispatch-once guard).
+    queued_job_timeout_s: float = 21600.0
     #: Shared secret sent on the status callback to SkydiveOS's receiver
     #: (``AUTO_EDIT_CALLBACK_TOKEN``); SkydiveOS optionally verifies it inbound. Sent as
     #: the ``X-Auto-Edit-Token`` header when set; ``None`` → no token header (open).
@@ -260,6 +276,29 @@ class Settings:
     #: back to the browser's own placeholder tile, which is where the cards were
     #: before the feature; nothing else changes.
     gallery_thumbnails: bool = True
+    #: CloudFront distribution fronting the S3 *delivery* bucket (``CDN_BASE_URL``,
+    #: e.g. ``https://media.ultimatedzm.com`` or ``https://dxxxx.cloudfront.net``).
+    #: When set together with the two key settings below, the served gallery's video
+    #: route redirects an UNLOCKED, delivered video to a CloudFront **signed URL** —
+    #: edge-cached, range-enabled — instead of streaming the 1080p master through
+    #: this process (or, once pruned, minting a browser-cache-defeating presigned S3
+    #: URL per request: Bug 373). Unset → the pre-CDN behaviour, byte-identical.
+    #: See :mod:`api.cdn` and ``deploy/CLOUDFRONT.md``.
+    cdn_base_url: str | None = None
+    #: The CloudFront public-key id (a key-group member) named on the signed URLs
+    #: (``CDN_KEY_PAIR_ID``, the ``K…`` id from CloudFront → Public keys).
+    cdn_key_pair_id: str | None = None
+    #: Path to the RSA private key PEM matching that public key
+    #: (``CDN_PRIVATE_KEY_PATH``). A *path*, not the PEM itself, so the secret can be
+    #: mounted like the other credentials rather than living in the environment.
+    cdn_private_key_path: str | None = None
+    #: Signed-URL stability window in seconds (``CDN_URL_TTL_S``, default 12 h).
+    #: Expiries are rounded UP to a multiple of this, so every request inside a
+    #: window mints the byte-identical URL — that determinism is what lets a replay
+    #: or reload reuse the browser's cached video bytes instead of re-downloading
+    #: (a per-request presigned URL never repeats, which was the bug). A URL stays
+    #: valid for between one and two windows.
+    cdn_url_ttl_s: int = 43200
 
 
 def _default_sdcard_roots() -> tuple[str, ...]:
@@ -346,6 +385,11 @@ def get_settings() -> Settings:
         raw_clip_settle_poll_seconds=float(
             os.environ.get("RAW_CLIP_SETTLE_POLL_SECONDS") or 30.0
         ),
+        # "0" is a non-empty string, so `or` only substitutes the default for unset/empty.
+        stuck_job_recovery_after_s=float(
+            os.environ.get("STUCK_JOB_RECOVERY_AFTER_S") or 600.0
+        ),
+        queued_job_timeout_s=float(os.environ.get("QUEUED_JOB_TIMEOUT_S") or 21600.0),
         auto_edit_callback_token=os.environ.get("AUTO_EDIT_CALLBACK_TOKEN") or None,
         camera_clock_tz=os.environ.get("CAMERA_CLOCK_TZ") or None,
         delivery_brand_name=os.environ.get("DELIVERY_BRAND_NAME") or "Ultimate DZ",
@@ -383,4 +427,8 @@ def get_settings() -> Settings:
         sdcard_qr_max_clip_seconds=float(os.environ.get("SDCARD_QR_MAX_CLIP_SECONDS") or 60.0),
         sdcard_qr_scan_seconds=float(os.environ.get("SDCARD_QR_SCAN_SECONDS") or 8.0),
         gallery_thumbnails=_flag("GALLERY_THUMBNAILS", default=True),
+        cdn_base_url=(os.environ.get("CDN_BASE_URL") or "").rstrip("/") or None,
+        cdn_key_pair_id=os.environ.get("CDN_KEY_PAIR_ID") or None,
+        cdn_private_key_path=os.environ.get("CDN_PRIVATE_KEY_PATH") or None,
+        cdn_url_ttl_s=int(os.environ.get("CDN_URL_TTL_S") or 43200),
     )

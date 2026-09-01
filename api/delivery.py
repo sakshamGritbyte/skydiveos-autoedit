@@ -154,8 +154,22 @@ def upload_and_link(
     for name, path in files.items():
         key = delivery_s3_key(job_id, path.name)
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        # Delivered files are effectively write-once — a key's bytes change only when
+        # the job is re-rendered and re-delivered — so downstream caches (CloudFront's
+        # edge, the viewer's browser) may hold them for a day without revalidating.
+        # Deliberately NOT `immutable`/1-year: an instructor tweak DOES overwrite the
+        # same key, and a day-stale edit is tolerable where a year-stale one is not
+        # (the CDN's `?v=` cache-key param busts the edge copy sooner — api.cdn).
+        # "public" grants shared caches permission to store; ACCESS control is the
+        # CloudFront signed URL / presigned URL, never this header.
         client.upload_file(
-            str(path), settings.s3_bucket, key, ExtraArgs={"ContentType": content_type}
+            str(path),
+            settings.s3_bucket,
+            key,
+            ExtraArgs={
+                "ContentType": content_type,
+                "CacheControl": "public, max-age=86400",
+            },
         )
         if presign is True or (allowed is not None and name in allowed):
             links[name] = client.generate_presigned_url(

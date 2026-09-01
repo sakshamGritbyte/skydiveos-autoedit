@@ -181,7 +181,10 @@ def test_upload_and_link_puts_files_and_presigns(tmp_path: Path) -> None:
             str(f),
             "test-bucket",
             f"{DELIVERY_KEY_PREFIX}/j1/final.mp4",
-            {"ContentType": "video/mp4"},
+            # CacheControl: delivered files are effectively write-once, so CloudFront
+            # and the browser may hold them for a day (Bug 373). Access control is
+            # the signed/presigned URL, never this header.
+            {"ContentType": "video/mp4", "CacheControl": "public, max-age=86400"},
         )
     ]
     assert links["final"].startswith("https://s3.test/test-bucket/deliveries/j1/final.mp4")

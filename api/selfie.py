@@ -2358,7 +2358,14 @@ def render_selfie_video(
             # stalled in the customer's browser and was painful to download. veryfast
             # keeps the same CRF quality at roughly a quarter of the bitrate for a
             # modest encode-time cost.
+            #
+            # The VBV cap (maxrate/bufsize, Bug 373): CRF alone has no ceiling, and
+            # high-motion freefall measured ~19 Mbit/s at 1080p — playback then stalls
+            # on any link that can't sustain ~20 Mbit/s, CDN or not. 12 Mbit/s is still
+            # well above streaming-service 1080p ladders, so quality is untouched on
+            # normal scenes; only the spikes are clamped.
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-maxrate", "12M", "-bufsize", "24M",
             "-pix_fmt", "yuv420p", "-r", str(fps),
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart", "-t", f"{total:.3f}", str(out),

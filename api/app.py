@@ -57,7 +57,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from edl.schema import EditDecisionList
 from ingest.registry import CameraRegistry
 
-from . import archive
+from . import archive, cdn
 from .auth import PUBLIC_PATH_PREFIX, AdminDep, PrincipalDep, service_token_allows
 from .catalogue import PriceCatalogue, load_price_catalogue
 from .config import Settings, get_settings
@@ -82,6 +82,7 @@ from .jobs import (
 )
 from .preview import ensure_photo_preview, preview_path
 from .queue import CeleryJobQueue, JobQueue
+from .reconcile import reconcile_stuck_job
 from .ratelimit import FixedWindowLimiter, caller_key
 from .schemas import (
     AssignCameraRequest,
@@ -1087,17 +1088,36 @@ def create_app() -> FastAPI:
         tags=["jobs"],
         summary="List jobs (an instructor's own, or all for an admin)",
     )
-    def list_jobs(store: StoreDep, principal: PrincipalDep) -> JobsListResponse:
+    def list_jobs(
+        store: StoreDep,
+        principal: PrincipalDep,
+        queue: QueueDep,
+        settings: SettingsDep,
+    ) -> JobsListResponse:
         """Every job the caller may see, newest first.
 
         An instructor sees only the jobs their account owns (those auto-stamped from
         the cameras assigned to them); an admin sees all. With access enforcement off,
         the caller is treated as an admin, so this returns every job.
+
+        Each row also runs the stranded-job reconciler (Bug 374) so an operator
+        opening the dashboard heals jobs nobody is individually polling — e.g. a
+        bridge-created job whose settle task was lost. A healthy job falls straight
+        through, and a reconcile failure must never break the listing.
         """
         instructor_id = None if principal.is_admin else principal.instructor_id
         jobs = store.list_jobs(instructor_id=instructor_id)
+        reconciled = []
+        for j in jobs:
+            try:
+                j = reconcile_stuck_job(j, store, queue, settings)
+            except Exception:  # noqa: BLE001 — one bad row must not break the listing
+                logger.exception(
+                    "job %s: stuck-job reconcile failed; listing current state", j.job_id
+                )
+            reconciled.append(j)
         return JobsListResponse(
-            count=len(jobs), jobs=[JobResponse.from_job(j) for j in jobs]
+            count=len(reconciled), jobs=[JobResponse.from_job(j) for j in reconciled]
         )
 
     @app.post(
@@ -1350,9 +1370,26 @@ def create_app() -> FastAPI:
         tags=["jobs"],
         summary="Get job status",
     )
-    def get_job(job_id: JobId, store: StoreDep) -> JobResponse:
-        """Return a job's current status and metadata."""
-        return JobResponse.from_job(_load_or_404(store, job_id))
+    def get_job(
+        job_id: JobId, store: StoreDep, queue: QueueDep, settings: SettingsDep
+    ) -> JobResponse:
+        """Return a job's current status and metadata.
+
+        The read doubles as the stranded-job reconciler (Bug 374): a job whose one
+        dispatch message was lost would otherwise sit at ``queued`` /
+        ``media_state=UPLOADED`` forever, and the status poll is the one channel
+        guaranteed to still be alive for a job somebody is waiting on. See
+        :func:`api.reconcile.reconcile_stuck_job` — a healthy job falls straight
+        through, and a reconcile failure must never break the poll itself.
+        """
+        job = _load_or_404(store, job_id)
+        try:
+            job = reconcile_stuck_job(job, store, queue, settings)
+        except Exception:  # noqa: BLE001 — the status poll must never fail on recovery
+            logger.exception(
+                "job %s: stuck-job reconcile failed; returning current state", job_id
+            )
+        return JobResponse.from_job(job)
 
     @app.get(
         "/jobs/{job_id}/edl",
@@ -1717,22 +1754,37 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="unknown gallery link")
         return job
 
-    def _presigned_delivery_url(job_id: str, filename: str, settings: Settings) -> str | None:
+    def _presigned_delivery_url(
+        job_id: str, filename: str, settings: Settings, *, download: bool = False
+    ) -> str | None:
         """A short-lived presigned URL for ``deliveries/{job_id}/{filename}``, or None.
 
         The disk-retention fallback for pruned renders (see ``scripts/prune_jobs.py``):
         minted per request with a small TTL — this is a *serving* URL behind the
         gallery's own auth (the short code), not a stored delivery link. Returns None
         when S3 isn't configured or errors — the caller 404s exactly as before.
+
+        ``download=True`` asks S3 to answer with ``Content-Disposition: attachment``:
+        the gallery's Download buttons redirect cross-origin here once the local file
+        is pruned, and a cross-origin ``download`` attribute is ignored by browsers —
+        without the header the click *plays* the video in a tab instead of saving it.
         """
         if not settings.s3_bucket:
             return None
         try:
             from .delivery import _default_s3_client  # noqa: PLC0415 - lazy boto3
 
+            params: dict[str, str] = {
+                "Bucket": settings.s3_bucket,
+                "Key": f"deliveries/{job_id}/{filename}",
+            }
+            if download:
+                params["ResponseContentDisposition"] = (
+                    f'attachment; filename="{filename}"'
+                )
             return _default_s3_client(settings).generate_presigned_url(
                 "get_object",
-                Params={"Bucket": settings.s3_bucket, "Key": f"deliveries/{job_id}/{filename}"},
+                Params=params,
                 ExpiresIn=6 * 3600,
             )
         except Exception:  # noqa: BLE001 - fallback must never 500 the gallery
@@ -1889,7 +1941,9 @@ def create_app() -> FastAPI:
         if size:
             bits.append(f"{size / 1_000_000:.0f} MB")
         bits.append("yours to keep")
-        return f"/j/{token}/media/{name}", "  ·  ".join(bits)
+        # dl=1: a download click, not a player fetch — served as an attachment and
+        # never CDN-redirected (cross-origin redirects void the `download` attribute).
+        return f"/j/{token}/media/{name}?dl=1", "  ·  ".join(bits)
 
     def _poster_source(store: JobStore, job: Job, name: str) -> Path | None:
         """The video file this card's poster must be cut from, or ``None``.
@@ -2076,6 +2130,10 @@ def create_app() -> FastAPI:
             jump_date=job.jump_date,
             location=settings.delivery_location,
             videos=[(n, f"/j/{token}/media/{n}") for n in video_names],
+            # The per-card Download anchors get the dl=1 variant of the same URL: an
+            # attachment that is never CDN-redirected, so the click keeps saving the
+            # file now that the bare player URL may 302 cross-origin (Bug 373).
+            download_urls={n: f"/j/{token}/media/{n}?dl=1" for n in video_names},
             posters=posters,
             photos=[f"/j/{token}/photos/{n}" for n in photo_names],
             photos_unlocked=not locked_photos,
@@ -2175,7 +2233,7 @@ def create_app() -> FastAPI:
         response_class=FileResponse,
     )
     def public_media(
-        token: str, name: str, store: StoreDep, settings: SettingsDep
+        token: str, name: str, store: StoreDep, settings: SettingsDep, dl: bool = False
     ) -> FileResponse:
         """Stream one deliverable to the customer (range-enabled).
 
@@ -2193,6 +2251,10 @@ def create_app() -> FastAPI:
         (:func:`_media_job`) while the lock is still **this** job's. That is what lets
         several customers share one render and unlock independently: the pair
         ``(master's file, this customer's lock)`` is evaluated per request.
+
+        ``dl=1`` marks a **download** click rather than a player fetch: it is served as
+        an attachment and never redirected to the CDN (a cross-origin redirect makes the
+        browser ignore the anchor's ``download`` attribute and play the file instead).
         """
         job = _job_by_token(store, token)
         if not _is_safe_segment(name) or name not in _gallery_videos(store, job):
@@ -2204,28 +2266,62 @@ def create_app() -> FastAPI:
             path = preview_path(job_dir, name)
         else:
             path = job_dir / f"{name}.mp4"
+            # CDN-first for the PLAYER (Bug 373): once the owner is `delivered`, this
+            # deliverable's clean master is in S3 under deliveries/{owner}/ — redirect
+            # the browser to a CloudFront signed URL so the bytes stream from an edge
+            # near the viewer, range-enabled and cacheable, instead of through this
+            # process (or, pruned, a per-request presigned URL the browser can never
+            # cache). The URL is deterministic within a window (api.cdn), so a replay
+            # or reload reuses the browser's cached ranges; the small Cache-Control on
+            # the redirect itself spares a round-trip here per range request. NEVER for
+            # a locked deliverable (this branch is unreachable for one), and never for
+            # a download click (`dl` — see the docstring). Unconfigured or failing CDN
+            # falls straight through to the pre-CDN behaviour below.
+            if not dl and owner.status is JobStatus.delivered:
+                try:
+                    version: int | None = int(path.stat().st_mtime)
+                except OSError:
+                    version = None  # pruned — the S3 copy is the only one left
+                url = cdn.signed_delivery_url(
+                    owner.job_id, f"{name}.mp4", settings, version=version
+                )
+                if url:
+                    return RedirectResponse(  # type: ignore[return-value]
+                        url,
+                        status_code=302,
+                        headers={"Cache-Control": "private, max-age=300"},
+                    )
         if path.exists() and _served_under(path, job_dir):
+            if dl and not locked:
+                # The Download button: an explicit attachment, so the click saves the
+                # file no matter where it was routed from.
+                return FileResponse(
+                    path, media_type="video/mp4", filename=f"{name}.mp4"
+                )
             # INLINE, deliberately. ``filename=`` would make Starlette send
             # ``Content-Disposition: attachment``, and this route is a **player** source:
             # a browser handed an attachment downloads the file instead of playing it (open
             # the URL in a tab and the tab closes onto a download). The page's Download
-            # button doesn't need it either — it uses the HTML ``download`` attribute on a
-            # same-origin link. And on a LOCKED deliverable ``attachment`` is actively
-            # wrong: it offers the watermarked preview as a file to keep, on a player the
-            # design deliberately marks ``nodownload``.
+            # button doesn't need it either — it uses the ``dl=1`` variant above. And on a
+            # LOCKED deliverable ``attachment`` is actively wrong: it offers the
+            # watermarked preview as a file to keep, on a player the design deliberately
+            # marks ``nodownload``.
             return FileResponse(
                 path, media_type="video/mp4", content_disposition_type="inline"
             )
         # Disk-retention fallback (scripts/prune_jobs.py): a pruned clean master is
         # still in S3 under deliveries/, so the never-expiring gallery link keeps
         # working — redirect to a short-lived presigned URL minted per request.
+        # (With the CDN configured, a pruned player fetch was already answered above.)
         # NEVER for a locked deliverable: its watermarked preview is local-only by design,
         # and a presigned master URL is the paywall bypass. The pruner refuses to
         # remove a locked deliverable's preview for the same reason.
         if not locked:
             # Keyed on the job that OWNS the file, since that is the prefix its renders
             # were uploaded under (``deliveries/{owner}/…``).
-            url = _presigned_delivery_url(owner.job_id, f"{name}.mp4", settings)
+            url = _presigned_delivery_url(
+                owner.job_id, f"{name}.mp4", settings, download=dl
+            )
             if url:
                 return RedirectResponse(url, status_code=302)  # type: ignore[return-value]
         raise HTTPException(status_code=404, detail="video not found")

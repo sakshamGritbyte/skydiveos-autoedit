@@ -23,7 +23,12 @@ services:
       - jobs:/data/jobs                  # api writes uploaded footage here
       - ./raw-storage:/data/raw-storage  # {date}/{instructor}/{customer}/ archive
     ports:
-      - "8000:8000"
+      # HOST port from the clone's .env (API_PORT), so a multi-tenant box — one
+      # clone per tenant, ports 8000/8010/8011/8012 — carries its identity in the
+      # never-reset .env instead of as an uncommitted edit to this tracked file.
+      # A `git reset --hard` deploy wiped exactly that edit on 2026-09-01 and the
+      # tenant then collided with prod's 8000. Default unchanged for a single box.
+      - "${API_PORT:-8000}:8000"
     depends_on: [redis]
     restart: unless-stopped
 
@@ -66,7 +71,9 @@ services:
     volumes:
       - jobs:/data/jobs                  # _bridge_state.json: dedupe/flags survive a restart
     ports:
-      - "9000:9000"
+      # Same rule as the api port: per-tenant host port (9000/9010/9011/9012)
+      # lives in the clone's .env, never as a local edit to this file.
+      - "${BRIDGE_PORT:-9000}:9000"
     depends_on: [api]
     restart: unless-stopped
 

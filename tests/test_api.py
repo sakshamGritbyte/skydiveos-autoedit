@@ -1223,6 +1223,46 @@ def test_raw_addon_gates_the_masters_and_grows_the_gallery(client: TestClient) -
     assert "Every unedited minute" not in page
 
 
+def test_purchased_raw_footage_gone_says_so(client: TestClient) -> None:
+    """Bought raw + files wiped -> an honest note, never a silently vanished section.
+
+    Pruning deliberately keeps purchased masters, so this state is a wiped or
+    hand-cleaned jobs volume. The paid-for section must not simply disappear (that
+    reads as a broken page), and no download may be offered to a missing file.
+    """
+    import shutil
+
+    job_id = _create(client, customer_name="Sophie Lavoie")
+    _rendered(client, job_id, locked=False)
+    store = JobStore(client.jobs_root)
+    raw_dir = store.dir(job_id) / "raw"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "GX010052.MP4").write_bytes(b"MASTER-A")
+    token = _token(client, job_id)
+    client.post(f"/jobs/{job_id}/unlock", json={**_PAYMENT_BODY, "item": "raw"})
+    assert "RAW · AS FILMED" in client.get(f"/j/{token}").text
+
+    shutil.rmtree(raw_dir)
+
+    page = client.get(f"/j/{token}").text
+    assert "Raw Footage <span>(0)</span>" in page
+    assert "no longer available" in page
+    assert "RAW · AS FILMED" not in page  # no player card for a missing file
+    # The tile is not re-offered (nothing to fulfil), and the file route stays dead.
+    assert "Every unedited minute" not in page
+    assert client.get(f"/j/{token}/raw/GX010052.MP4").status_code == 404
+
+
+def test_unpurchased_gallery_never_shows_the_unavailable_note(client: TestClient) -> None:
+    """No purchase, no files -> no Raw Footage section of any kind (unchanged)."""
+    job_id = _create(client, customer_name="Sophie Lavoie")
+    _rendered(client, job_id, locked=False)
+    token = _token(client, job_id)
+    page = client.get(f"/j/{token}").text
+    assert "Raw Footage <span>" not in page
+    assert "no longer available" not in page
+
+
 def test_photos_addon_opens_the_grid_while_the_video_stays_locked(client: TestClient) -> None:
     """Buying the photo pack must not unlock the edit — and vice versa."""
     job_id = _create(client, entitlement="preview_only")

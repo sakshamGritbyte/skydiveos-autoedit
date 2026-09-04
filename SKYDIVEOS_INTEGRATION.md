@@ -343,6 +343,38 @@ not the request.
 
 ---
 
+## 6.5 `GET /jobs/{job_id}/source-usage` — the raw-footage mapping (manual editor)
+
+SkydiveOS's video editor shows, per raw master, which seconds the AI actually used in
+each deliverable. That mapping is `source_usage.json` (built by `api/source_usage.py`
+from the persisted EDLs + scene manifests, with `exclude.json` cuts and the playable-
+duration clamp re-applied so it reflects the ACTUAL render). Contract:
+
+```json
+{ "job_id": "…", "version": 1,
+  "raw_files": [{ "filename": "GX010990.MP4", "role": "external",
+                   "s3_key": "ai-sources/<job>/external/<batch>/GX010990.MP4",
+                   "duration": 47.214 }],
+  "deliverables": {
+    "full_video": [{ "raw_filename": "GX010990.MP4", "role": "external",
+                      "s3_key": "…", "src_start": 0.0, "src_end": 34.368,
+                      "speed_multiplier": 1.0, "scene": "intro_interview",
+                      "out_start": 0.0, "out_end": 34.368 }] } }
+```
+
+`src_*` are **raw-master seconds** (a scene clip spanning two raw files is split into
+one entry per file); `out_*` are output-timeline seconds before the logo outro. Written
+at every render/replay, uploaded to `deliveries/{job_id}/source_usage.json` at delivery
+(so SkydiveOS reads it S3→S3 after the local raw masters are pruned), and this endpoint
+builds it **on demand** for jobs rendered before it existed — the inputs survive the
+pruner. 404 = photo-only, legacy single-master, or not rendered yet; SkydiveOS degrades
+to plain (un-highlighted) strips. `raw_s3_keys` is keyed `<role>/<filename>` for
+role-staged jobs since this shipped (`raw_key_for` falls back to the bare name for
+older rows). Distinct from `GET /jobs/{id}/edl`, which serves the legacy single-master
+schema and 404s for every AI-package job.
+
+---
+
 ## 7. Auth (optional, off by default)
 
 When `ENFORCE_INSTRUCTOR_AUTH=1`, SkydiveOS forwards identity on every request:

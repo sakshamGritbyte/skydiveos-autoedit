@@ -148,6 +148,7 @@ def render_gallery_html(
     photos_unlock_url: str | None = None,
     photos_unlock_price: str | None = None,
     raw_videos: list[tuple[str, str]] | None = None,
+    raw_unavailable: bool = False,
     load_videos: list[tuple[str, str]] | None = None,
     purchased_addons: Sequence[str] = (),
     locked_videos: Sequence[str] = (),
@@ -192,6 +193,11 @@ def render_gallery_html(
       URLs falls back to the old ``photo_count_teaser`` line.
     * ``raw_videos`` — the purchased Raw Footage section: ``(label, url)`` per camera
       master, rendered under the Video tab with download links. Empty/None → no section.
+    * ``raw_unavailable`` — the customer BOUGHT raw footage but the files are gone
+      (pruning keeps purchased masters, so this is a wiped or hand-cleaned volume).
+      Renders the section heading with an honest "no longer available" note instead of
+      silently dropping a section the customer paid for. Ignored when ``raw_videos``
+      has entries; without a purchase the caller passes neither and nothing renders.
     * ``posters`` — ``{deliverable or label: poster image URL}``. A card whose video has
       one opens on a real frame of that edit instead of the browser's generic
       placeholder tile (:mod:`api.thumbnail`); a card with no entry is rendered exactly
@@ -467,12 +473,21 @@ def render_gallery_html(
         </div>"""
         for label, url in raw_videos
     )
-    raw_section = (
-        f"""
+    if raw_videos:
+        raw_section = f"""
       <h2>Raw Footage <span>({len(raw_videos)})</span></h2>
       <div class="vgrid">{raw_cards}</div>"""
-        if raw_videos else ""
-    )
+    elif raw_unavailable:
+        # Purchased, but the masters are gone. A paid-for section that silently
+        # vanishes reads as a broken page (or a swindle); say what happened instead.
+        # No download link is offered to a missing file — the honest state is text.
+        raw_section = """
+      <h2>Raw Footage <span>(0)</span></h2>
+      <p style="color:#9a9a9a;font-size:14px;margin:6px 0 0">Your raw footage purchase
+      is on record, but the files are no longer available — raw camera files are kept
+      for a limited time after your jump. Contact the dropzone if you need help.</p>"""
+    else:
+        raw_section = ""
 
     # The purchased spec-flight load video: filmed from the air on the customer's jump
     # day, but by a flyer who exited with somebody else. Badged and captioned as the

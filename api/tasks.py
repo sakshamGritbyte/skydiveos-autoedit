@@ -862,7 +862,17 @@ def ingest_s3_job(job_id: str, s3_key: str, camera_role: str | None = None) -> s
     # Proxies are recorded too (the map is the record of everything ingested);
     # the pruner's own .mp4 filter keeps retention behaviour unchanged by them.
     job = store.load(job_id)
-    store.update(job_id, raw_s3_keys={**job.raw_s3_keys, filename: s3_key})
+    # Role-staged jobs key by `<role>/<filename>`: two GoPros emit colliding filenames,
+    # and a bare-name map would let the second camera's ingest silently overwrite the
+    # first's key (wrong retention target, wrong source-usage attribution). Plain jobs
+    # keep the bare filename, so every pre-existing job and reader is unchanged —
+    # readers go through `raw_key_for`, which tries role-scoped then bare.
+    key_name = (
+        f"{camera_role}/{filename}"
+        if job.staged_by_camera_role and camera_role
+        else filename
+    )
+    store.update(job_id, raw_s3_keys={**job.raw_s3_keys, key_name: s3_key})
 
     # File the freshly-downloaded master under the jump in the browsable archive before
     # any editing runs, so the raw footage is preserved even if the edit later fails.

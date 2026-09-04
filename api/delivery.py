@@ -562,6 +562,25 @@ def deliver_to_customer(
             presign=photos_owned,
         ).get("photos")
 
+    # Source-usage manifest → durable S3 copy beside the deliverables, so SkydiveOS's
+    # manual editor can read the raw-footage mapping S3→S3 long after the local raw
+    # masters are pruned. Deliberately NOT in the outputs map (it must never appear in
+    # the gallery, the deliverables list, or the customer email), and best-effort: a
+    # missing or failed upload costs the editor its highlights, never the delivery.
+    usage_file = store.source_usage_file(job.job_id)
+    if usage_file.is_file():
+        try:
+            client.upload_file(
+                str(usage_file),
+                settings.s3_bucket,
+                delivery_s3_key(job.job_id, usage_file.name),
+                ExtraArgs={"ContentType": "application/json"},
+            )
+        except Exception:  # noqa: BLE001 — bookkeeping must never fail the delivery
+            logger.exception(
+                "job %s: uploading source_usage.json failed", job.job_id
+            )
+
     if served_url is not None:
         # Served gallery: the page and its media stream live from this API, so no
         # gallery.html / per-photo uploads. The email carries the source-tagged link.

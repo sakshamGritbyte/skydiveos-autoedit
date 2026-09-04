@@ -44,6 +44,8 @@ from analysis.proxy import analysis_source
 from edl.storage import job_dir
 from edl.validate import validate_and_repair
 
+from .source_usage import write_source_usage
+
 if TYPE_CHECKING:  # types used only for annotation, never imported at runtime
     from anthropic.types import MessageParam
 
@@ -2776,6 +2778,7 @@ def run_selfie_pipeline(
         outputs["photos"] = str(job_dir(job_id, jobs_root) / "photos")
 
     store.set_pipeline_outputs(job_id, outputs, status=JobStatus.ready)
+    write_source_usage(job_id, store, jobs_root)  # best-effort; never raises
     return outputs
 
 
@@ -2937,6 +2940,7 @@ def run_media_ref_pipeline(
         status=JobStatus.ready,
         owns=_ref_deliverable_names(job, role, package),
     )
+    write_source_usage(job_id, store, jobs_root)  # rebuilt whole per pass; never raises
     _seed_deliverable_access(store, job_id, set(outputs), ref)
     logger.info(
         "job %s: media ref %s (%s/%s) rendered %s",
@@ -3391,6 +3395,7 @@ def run_ultimum_pipeline(
     outputs["photos"] = str(jd / "photos")
 
     store.set_pipeline_outputs(job_id, outputs, status=JobStatus.ready)
+    write_source_usage(job_id, store, jobs_root)  # best-effort; never raises
     return outputs
 
 
@@ -3462,6 +3467,7 @@ def replay_ultimum(
         outputs["photos"] = str(photos)
 
     store.set_pipeline_outputs(job_id, outputs, status=JobStatus.ready)
+    write_source_usage(job_id, store, jobs_root)  # tracks hand-tweaked EDLs; never raises
     return outputs
 
 
@@ -3664,6 +3670,7 @@ def replay_selfie(
     if photos.exists():
         outputs["photos"] = str(photos)
     store.set_pipeline_outputs(job_id, outputs, status=JobStatus.ready)
+    write_source_usage(job_id, store, jobs_root)  # tracks hand-tweaked EDLs; never raises
     return outputs
 
 

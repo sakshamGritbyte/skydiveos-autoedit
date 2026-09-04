@@ -58,6 +58,7 @@ from api.jobs import (  # noqa: E402
     JobStatus,
     JobStore,
     locked_deliverables,
+    raw_key_for,
 )
 
 logger = logging.getLogger("prune_jobs")
@@ -127,7 +128,10 @@ def prune_job_raw(
         # (`raw/{camera}/{date}/{name}`, see ingest.discovery.raw_object_key), so this
         # guess no longer matches a current key — and `_s3_confirms` requires a
         # size-matched HeadObject, so a guess that misses simply keeps the file.
-        key = job.raw_s3_keys.get(f.name) or f"raw/{job.camera_id}/{f.name}"
+        # Role-staged files live under raw/<role>/ and are keyed `<role>/<name>` since
+        # the collision fix; `raw_key_for` also tries the bare name for older jobs.
+        role = f.parent.name if f.parent != raw_dir else None
+        key = raw_key_for(job, role, f.name) or f"raw/{job.camera_id}/{f.name}"
         if _s3_confirms(client, bucket, key, f):
             freed += _delete(f, dry_run=dry_run, why=f"safe: s3://{bucket}/{key}")
         else:

@@ -82,8 +82,8 @@ from .jobs import (
 )
 from .preview import ensure_photo_preview, preview_path
 from .queue import CeleryJobQueue, JobQueue
-from .reconcile import reconcile_stuck_job
 from .ratelimit import FixedWindowLimiter, caller_key
+from .reconcile import reconcile_stuck_job
 from .schemas import (
     AssignCameraRequest,
     CameraInfo,
@@ -1411,6 +1411,36 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="no EDL yet; job not composed")
         return EditDecisionList.model_validate_json(edl_file.read_text())
 
+    @app.get(
+        "/jobs/{job_id}/source-usage",
+        tags=["review"],
+        summary="Which raw-master seconds each deliverable actually used",
+    )
+    def get_source_usage(job_id: JobId, store: StoreDep) -> dict[str, Any]:
+        """Return the job's ``source_usage.json`` — the raw-footage mapping SkydiveOS's
+        manual editor highlights (AI-used vs unused ranges per raw MP4).
+
+        Distinct from ``GET /jobs/{id}/edl`` on purpose: that route serves the legacy
+        single-master :class:`EditDecisionList` (``extra="forbid"``), which no AI-package
+        job ever writes. The manifest is normally written at render time; a job rendered
+        before that existed is built on demand here — every input (``edl_*.json``, scene
+        manifests, ``job.json``) survives the pruner, so this works for old jobs too.
+        404 when the job has no scene-pipeline artifacts (photo-only, legacy, or not yet
+        rendered).
+        """
+        from .source_usage import write_source_usage
+
+        _load_or_404(store, job_id)
+        usage_file = store.source_usage_file(job_id)
+        if not usage_file.exists():
+            write_source_usage(job_id, store, store.root)
+        if not usage_file.exists():
+            raise HTTPException(
+                status_code=404,
+                detail="no source usage for this job (not rendered, photo-only, or legacy)",
+            )
+        return json.loads(usage_file.read_text())
+
     @app.post(
         "/jobs/{job_id}/approve",
         response_model=JobResponse,
@@ -2140,6 +2170,10 @@ def create_app() -> FastAPI:
             photos_unlock_url=photos_unlock_url,
             photos_unlock_price=catalogue.display("photos") if catalogue else None,
             raw_videos=raw_clips,
+            # Bought it, files gone (pruning keeps purchased masters — this is a
+            # wiped volume): say so instead of dropping a section the customer
+            # paid for. `/j/{token}/raw/…` already 404s, so this is display-only.
+            raw_unavailable="raw" in job.addons and not raw_files,
             load_videos=load_clips,
             download_all_url=None,
             locked=locked,

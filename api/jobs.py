@@ -628,6 +628,22 @@ def deliverable_name(job: Job, role: str, base: str) -> str:
     return f"{role}_{base}"
 
 
+def raw_key_for(job: Job, role: str | None, filename: str) -> str | None:
+    """The S3 key a staged raw clip was ingested from, or ``None`` when unrecorded.
+
+    Role-staged jobs (ultimum / multi-ref) record keys as ``<role>/<filename>`` so the
+    two cameras' colliding GoPro names (``GH010001.MP4`` from each) can't overwrite each
+    other; every job written before that fix — and every plain job — keys by the bare
+    filename, so that is the fallback. ``None`` (not a guess) when neither is recorded:
+    byte-uploaded footage never had an S3 key, and a derived one would point at nothing.
+    """
+    if role:
+        key = job.raw_s3_keys.get(f"{role}/{filename}")
+        if key:
+            return key
+    return job.raw_s3_keys.get(filename)
+
+
 def entitlement_for(job: Job, name: str) -> Entitlement:
     """This deliverable's lock state — the ONLY way to ask the question.
 
@@ -839,6 +855,12 @@ class JobStore:
     def save_edl(self, job_id: str, edl: EditDecisionList) -> Path:
         """Persist (replace) the job's EDL under the same root as its state."""
         return persist_edl(edl, job_id, self._root)
+
+    def source_usage_file(self, job_id: str) -> Path:
+        """Path to the job's raw-source usage manifest (``source_usage.json``)."""
+        from .source_usage import source_usage_path
+
+        return source_usage_path(job_id, self._root)
 
     def _path(self, job_id: str) -> Path:
         return self.dir(job_id) / JOB_FILENAME

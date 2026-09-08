@@ -1447,3 +1447,189 @@ def test_status_callback_omits_identity_it_does_not_know(
     assert "customer_email" not in body  # type: ignore[operator]
     # customer_name has a model default, so it IS known and forwarded.
     assert body["customer_name"] == "Valued Skydiver"  # type: ignore[index]
+
+
+# --------------------------------------------------------------------------- #
+# The MIXED job's delivery gate: one gallery email, sent when BOTH products are in.
+#
+# A selfie + external-spec jump carries two media products on one job and one link,
+# each rendering from its own camera. Delivery is what emails the customer "your
+# gallery is ready", and it used to fire on the FIRST render — so the email went out
+# while the second video they had been sold was still rendering (or its card not yet
+# uploaded), and nothing ever told them it had arrived. The hold is bounded: a spec
+# card that never turns up must not keep the PAID edit from ever being delivered.
+# --------------------------------------------------------------------------- #
+
+
+def _mixed_rendered_job(
+    store: JobStore, tmp_path: Path, *, rendered: tuple[str, ...] = ("full_video",), **fields: Any
+) -> Job:
+    """A two-product job (paid instructor + spec external) with only `rendered` on disk."""
+    outputs = {}
+    for name in rendered:
+        path = tmp_path / "j1" / f"{name}.mp4"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"video")
+        outputs[name] = str(path)
+    fields.setdefault("status", JobStatus.ready)
+    fields.setdefault("customer_email", "jane@example.com")
+    return _job(
+        store,
+        media_refs=[
+            {"role": "instructor", "package": "selfie", "entitlement": "edited_download"},
+            {"role": "external", "package": "external", "entitlement": "preview_only"},
+        ],
+        outputs=outputs,
+        **fields,
+    )
+
+
+def _auto_deliver_run(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **setting_overrides: Any
+) -> list[str]:
+    """Run `_maybe_auto_deliver` with AUTO_DELIVER on; return the job ids it enqueued."""
+    from api import tasks
+
+    monkeypatch.setattr(
+        tasks,
+        "get_settings",
+        lambda: _settings(auto_deliver=True, jobs_root=str(tmp_path), **setting_overrides),
+    )
+    delayed: list[str] = []
+    monkeypatch.setattr(tasks.deliver_job, "delay", delayed.append)
+    tasks._maybe_auto_deliver(store, "j1")
+    return delayed
+
+
+def test_a_mixed_job_holds_delivery_until_its_other_camera_renders(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reported bug: instructor footage in → job created → email sent.
+
+    The customer was told their gallery was ready while the external edit they were
+    sold had not rendered. The render is kept; only the hand-off waits.
+    """
+    _mixed_rendered_job(store, tmp_path)
+
+    assert _auto_deliver_run(store, tmp_path, monkeypatch) == []
+
+    job = store.load("j1")
+    assert job.status == JobStatus.ready  # render kept, not approved
+    assert job.hold_reason and "external" in job.hold_reason
+    assert job.email_sent_at is None
+    assert job.ref_wait_started_at is not None  # the cap's clock is running
+
+
+def test_the_second_render_releases_the_hold_and_delivers_once(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both products rendered: ONE delivery, one email, a gallery with both videos."""
+    _mixed_rendered_job(
+        store, tmp_path,
+        rendered=("full_video", "external_full_video"),
+        hold_reason="holding delivery: ...",
+    )
+
+    assert _auto_deliver_run(store, tmp_path, monkeypatch) == ["j1"]
+
+    job = store.load("j1")
+    assert job.status == JobStatus.approved
+    assert job.hold_reason is None
+
+
+def test_a_spec_card_that_never_arrives_stops_holding_at_the_upload_cap(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failure this gate is allowed to have, and must have.
+
+    Nothing was ever uploaded for the second camera. Holding the PAID edit for that is
+    strictly worse than a gallery with one video in it, so the cap expires and the
+    customer is delivered what exists.
+    """
+    _mixed_rendered_job(store, tmp_path, ref_wait_started_at=time.time() - 46 * 60)
+
+    assert _auto_deliver_run(store, tmp_path, monkeypatch) == ["j1"]
+    assert store.load("j1").status == JobStatus.approved
+
+
+def test_a_camera_that_is_actually_rendering_gets_the_longer_cap(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Footage staged = it IS coming. Releasing at the 45-min upload cap would deliver
+    a half gallery minutes before a render that is provably in flight."""
+    _mixed_rendered_job(store, tmp_path, ref_wait_started_at=time.time() - 46 * 60)
+    staged = store.camera_raw_dir("j1", "external")
+    staged.mkdir(parents=True, exist_ok=True)
+    (staged / "GX010007.MP4").write_bytes(b"master")
+
+    assert _auto_deliver_run(store, tmp_path, monkeypatch) == []
+    assert store.load("j1").status == JobStatus.ready
+
+
+def test_the_wait_clock_is_stamped_once_not_restarted_per_render(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three products would otherwise push the cap out on every render that lands —
+    the wait must measure from the FIRST one, or it never expires."""
+    started = time.time() - 10 * 60
+    _mixed_rendered_job(store, tmp_path, ref_wait_started_at=started)
+
+    _auto_deliver_run(store, tmp_path, monkeypatch)
+
+    assert store.load("j1").ref_wait_started_at == pytest.approx(started)
+
+
+def test_a_zero_cap_restores_delivery_on_the_first_render(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The opt-out, for a dropzone that would rather have the paid edit immediately."""
+    _mixed_rendered_job(store, tmp_path)
+
+    delayed = _auto_deliver_run(
+        store, tmp_path, monkeypatch, mixed_ref_upload_wait_s=0.0
+    )
+
+    assert delayed == ["j1"]
+
+
+def test_a_single_product_job_delivers_on_its_render_exactly_as_before(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One media ref is not a mixed job — nor is a job with none at all. Neither has a
+    second product to wait for, and neither may change behaviour."""
+    _rendered_job(store, status=JobStatus.ready, customer_email="jane@example.com")
+
+    assert _auto_deliver_run(store, tmp_path, monkeypatch) == ["j1"]
+    assert store.load("j1").ref_wait_started_at is None
+
+
+def test_the_watchdog_delivers_a_job_whose_wait_ran_out(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`mixed_ref_wait_job` is the release valve when the second render never comes:
+    re-deciding from live state is the whole task."""
+    from api import tasks
+
+    _mixed_rendered_job(store, tmp_path, ref_wait_started_at=time.time() - 46 * 60)
+    monkeypatch.setattr(tasks, "_store", lambda: store)
+    monkeypatch.setattr(
+        tasks, "get_settings",
+        lambda: _settings(auto_deliver=True, jobs_root=str(tmp_path)),
+    )
+    delayed: list[str] = []
+    monkeypatch.setattr(tasks.deliver_job, "delay", delayed.append)
+
+    tasks.mixed_ref_wait_job("j1")
+
+    assert delayed == ["j1"]
+    assert store.load("j1").status == JobStatus.approved
+
+
+def test_the_watchdog_is_a_no_op_for_a_job_that_vanished(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Operator cleanup during the countdown must not crash a worker."""
+    from api import tasks
+
+    monkeypatch.setattr(tasks, "_store", lambda: store)
+    assert tasks.mixed_ref_wait_job("gone") == "gone"

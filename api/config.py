@@ -147,6 +147,19 @@ class Settings:
     #: Stops a mis-mapped package or a never-arriving second camera from stranding the
     #: job in ``queued`` forever. See :func:`api.tasks.ultimum_watchdog_job`.
     ultimum_second_camera_timeout_s: float = 3600.0
+    #: How long a MIXED job (two media products, one per camera) holds its DELIVERY —
+    #: and therefore the customer's "your gallery is ready" email — while a ref is still
+    #: outstanding. Two caps, because the two reasons a camera is missing are not the
+    #: same problem: ``mixed_ref_render_wait_s`` (``MIXED_REF_RENDER_WAIT_S``, default
+    #: 6h) when its footage is staged and rendering, ``mixed_ref_upload_wait_s``
+    #: (``MIXED_REF_UPLOAD_WAIT_S``, default 45 min) when the card never arrived — a
+    #: speculative camera that is never uploaded must not starve the edit the customer
+    #: PAID for. Past the cap the gallery is delivered with what rendered. Either set to
+    #: ``0`` restores the pre-gate behaviour for that case (deliver on the first render).
+    #: The values mirror SkydiveOS's own delivery-notification caps (BUG 389) so the two
+    #: services release at the same time rather than one holding behind the other.
+    mixed_ref_render_wait_s: float = 6 * 3600.0
+    mixed_ref_upload_wait_s: float = 45 * 60.0
     #: Seconds of quiet (no new clip for the job) before the ``s3_key`` ingest path
     #: dispatches processing (``RAW_CLIP_SETTLE_SECONDS``, default 3 min). SkydiveOS
     #: notifies once per clip, so a multi-file jump would otherwise dispatch a render
@@ -299,6 +312,15 @@ class Settings:
     #: (a per-request presigned URL never repeats, which was the bug). A URL stays
     #: valid for between one and two windows.
     cdn_url_ttl_s: int = 43200
+    #: Transcode a purchased camera master into an H.264 web proxy the gallery's player
+    #: streams (``RAW_WEB_PROXIES``, on by default — see :mod:`api.rawproxy`). GoPro
+    #: masters are HEVC, which Chrome/Firefox cannot decode: without this the paid Raw
+    #: Footage card showed a duration and a black frame. Off → the player streams the
+    #: master directly, as before; the Download button is the master in both cases.
+    raw_web_proxies: bool = True
+    #: Height cap of that proxy (``RAW_WEB_MAX_HEIGHT``, default 1080). A master already
+    #: H.264 at or under the cap is served as-is instead of re-encoded.
+    raw_web_max_height: int = 1080
 
 
 def _default_sdcard_roots() -> tuple[str, ...]:
@@ -317,6 +339,23 @@ def _flag(name: str, *, default: bool = False) -> bool:
     if not raw:
         return default
     return raw in {"1", "true", "yes", "on"}
+
+
+def _seconds(name: str, default: float) -> float:
+    """A duration from the environment, where ``0`` is a MEANINGFUL value.
+
+    ``float(os.environ.get(X) or default)`` reads ``"0"`` as absent and hands back the
+    default — which for a wait cap silently re-enables the very hold the operator set
+    the variable to switch off. An unparseable value keeps the default rather than
+    crashing a worker on boot.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 
 @lru_cache(maxsize=1)
@@ -376,6 +415,10 @@ def get_settings() -> Settings:
         ultimum_second_camera_timeout_s=float(
             os.environ.get("ULTIMUM_SECOND_CAMERA_TIMEOUT_S") or 3600.0
         ),
+        # 0 is meaningful (deliver on the first render, the pre-gate behaviour), so
+        # these read the raw value rather than falling back on falsiness.
+        mixed_ref_render_wait_s=_seconds("MIXED_REF_RENDER_WAIT_S", 6 * 3600.0),
+        mixed_ref_upload_wait_s=_seconds("MIXED_REF_UPLOAD_WAIT_S", 45 * 60.0),
         # 0 is meaningful (dispatch immediately), so don't fall back on falsiness.
         raw_clip_settle_seconds=float(
             os.environ.get("RAW_CLIP_SETTLE_SECONDS") or 180.0
@@ -431,4 +474,6 @@ def get_settings() -> Settings:
         cdn_key_pair_id=os.environ.get("CDN_KEY_PAIR_ID") or None,
         cdn_private_key_path=os.environ.get("CDN_PRIVATE_KEY_PATH") or None,
         cdn_url_ttl_s=int(os.environ.get("CDN_URL_TTL_S") or 43200),
+        raw_web_proxies=_flag("RAW_WEB_PROXIES", default=True),
+        raw_web_max_height=int(os.environ.get("RAW_WEB_MAX_HEIGHT") or 1080),
     )

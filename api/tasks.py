@@ -49,6 +49,7 @@ from .jobs import (
     RoleIngest,
     deliverable_names,
     entitlement_for,
+    pending_ref_roles,
 )
 from .lifecycle import media_state
 
@@ -258,6 +259,74 @@ def _auto_deliver_block(store: JobStore, job: Job) -> str | None:
     )
 
 
+def _mixed_ref_delivery_hold(store: JobStore, job: Job) -> tuple[str, float] | None:
+    """Why a mixed job must not be delivered yet, and how long is left on the clock.
+
+    A jump can carry TWO media products — the paid selfie/handcam edit and a spec
+    external one — on ONE job and ONE gallery link, each rendering from its own camera.
+    The renders finish minutes or hours apart, and delivery is what emails the customer
+    "your gallery is ready": sending it on the FIRST render told them their gallery was
+    complete while the second edit they had been sold was still rendering (or its card
+    not yet uploaded). The gallery is a live route, so the video does appear later — but
+    the one email that points at it had already gone, saying the wrong thing.
+
+    So a mixed job holds until every ref has a video deliverable. The hold is BOUNDED,
+    because the failure it must never cause is worse than the one it fixes: a
+    speculative camera that is never uploaded must not keep the customer's PAID edit
+    from ever being delivered. Two caps, measured from the first render's finish
+    (:attr:`api.jobs.Job.ref_wait_started_at`):
+
+    * footage staged for the missing camera → it is rendering; wait the render cap.
+    * nothing staged → the card may never come; wait the much shorter upload cap.
+
+    Past the cap the gallery is delivered with whatever rendered, and the late render
+    still lands (``_maybe_auto_deliver``'s already-delivered branch uploads it, and
+    SkydiveOS's follow-up watch tells the customer a video was added).
+
+    Returns ``None`` — deliver now — for every single-product job, for a mixed job whose
+    refs have all rendered, and when the cap has run out. A cap of ``0`` disables that
+    half of the gate.
+    """
+    pending = pending_ref_roles(job)
+    if not pending:
+        return None
+    settings = get_settings()
+    # "Staged" is the honest test for is-it-coming: the claim is set when a render is
+    # dispatched, and clips on disk mean the footage arrived even if the dispatch is
+    # still settling. Either one means the longer, render-shaped wait.
+    staged = any(
+        (job.role_ingest.get(role) or RoleIngest()).dispatched
+        or _role_has_footage(store, job.job_id, role)
+        for role in pending
+    )
+    cap = settings.mixed_ref_render_wait_s if staged else settings.mixed_ref_upload_wait_s
+    if cap <= 0:
+        return None
+    started = job.ref_wait_started_at
+    if started is None:
+        started = time.time()
+        store.update(job.job_id, ref_wait_started_at=started)
+    left = cap - (time.time() - started)
+    if left <= 0:
+        return None
+    what = "rendering" if staged else "footage not uploaded"
+    return (
+        f"holding delivery: this jump carries {len(job.media_refs)} media products and "
+        f"{sorted(pending)} has not rendered yet ({what}). The customer's gallery email "
+        f"must not say 'ready' while a video they were sold is missing; it is sent as "
+        f"soon as that render lands, or in {left / 60:.0f} min regardless.",
+        left,
+    )
+
+
+def _role_has_footage(store: JobStore, job_id: str, role: str) -> bool:
+    """Whether any master is staged for ``role``. Case-insensitive — GoPro writes ``.MP4``."""
+    role_dir = store.camera_raw_dir(job_id, role)
+    return role_dir.is_dir() and any(
+        p.suffix.lower() == ".mp4" for p in role_dir.glob("*")
+    )
+
+
 def _maybe_auto_deliver(store: JobStore, job_id: str) -> None:
     """Skip the review gate when ``AUTO_DELIVER`` is on: approve + enqueue delivery.
 
@@ -272,6 +341,21 @@ def _maybe_auto_deliver(store: JobStore, job_id: str) -> None:
     A job with no jump evidence is held for a human instead (:func:`_auto_deliver_block`).
     """
     job = store.load(job_id)
+    if job.status is JobStatus.delivered and job.outputs:
+        # A render that finished INTO an already-delivered job — the second camera of
+        # a mixed job. Delivery already ran for the first one and will not run again,
+        # so its files would stay local-only and vanish at the next prune. Upload the
+        # durable copies now; nothing else about delivery is repeated (no email, no
+        # links, no status change).
+        try:
+            from .delivery import upload_missing_deliverables  # noqa: PLC0415
+
+            uploaded = upload_missing_deliverables(job, store, get_settings())
+            if uploaded:
+                logger.info("job %s: late render(s) uploaded to S3: %s", job_id, uploaded)
+        except Exception:  # noqa: BLE001 - never let a bonus upload break the render's finish
+            logger.warning("job %s: late-render S3 upload failed", job_id, exc_info=True)
+        return
     if job.status not in (JobStatus.ready_for_review, JobStatus.ready):
         return
     if job.hold_reason:
@@ -285,6 +369,21 @@ def _maybe_auto_deliver(store: JobStore, job_id: str) -> None:
     if blocked is not None:
         store.update(job_id, hold_reason=blocked)
         logger.warning("AUTO_DELIVER: job %s HELD for review — %s", job_id, blocked)
+        return
+    waiting = _mixed_ref_delivery_hold(store, job)
+    if waiting is not None:
+        reason, left = waiting
+        store.update(job_id, hold_reason=reason)
+        # One countdown, armed for the time actually left — the other release trigger is
+        # the missing render finishing, which re-enters this function directly. The
+        # re-check re-derives the cap, so a card that lands during an upload-shaped wait
+        # simply extends it to the render-shaped one instead of delivering early.
+        # Skipped under eager mode, where a countdown is ignored: the watchdog would run
+        # inline, find the same live hold and arm itself again, forever. Tests drive
+        # `mixed_ref_wait_job` themselves.
+        if not get_settings().task_always_eager:
+            mixed_ref_wait_job.apply_async((job_id,), countdown=max(1.0, left))
+        logger.info("AUTO_DELIVER: job %s HELD for its other camera — %s", job_id, reason)
         return
     store.update(job_id, status=JobStatus.approved)
     if job.job_kind is JobKind.load_master:
@@ -369,6 +468,18 @@ def process_selfie_package(job_id: str) -> str:
     return job_id
 
 
+#: Statuses a per-role render may advance to ``processing`` from.
+#:
+#: A mixed job's second camera routinely lands AFTER the first product was rendered,
+#: reviewed and delivered — so this render must never knock the job back. It is the same
+#: rule ``api.app`` applies when it refuses to reset a multi-ref job's status on a late
+#: S3 ingest ("that would undo a completed review/delivery"), and the reason this pass
+#: reports progress only when there is no finished product to report instead.
+_ROLE_RENDER_ADVANCEABLE = frozenset(
+    {JobStatus.queued, JobStatus.failed, JobStatus.rejected}
+)
+
+
 @celery_app.task(name="api.process_media_ref_job")
 def process_media_ref_job(job_id: str, role: str) -> str:
     """Render ONE media product of a mixed job, from ONE camera's footage.
@@ -383,6 +494,12 @@ def process_media_ref_job(job_id: str, role: str) -> str:
     :func:`api.delivery.send_gallery_email_once` owns that, keyed on ``email_sent_at``.
     """
     store = _store()
+    # Say so while it runs. Every other render task marks the job `processing` on entry;
+    # this one didn't, and since the per-ref path writes a status only at the END (the
+    # `ready` in `set_pipeline_outputs`), a 20-minute mixed render sat at `queued` —
+    # indistinguishable, to an operator or to SkydiveOS, from a job whose worker is dead.
+    if store.load(job_id).status in _ROLE_RENDER_ADVANCEABLE:
+        store.update(job_id, status=JobStatus.processing, error=None)
     try:
         _ensure_repo_on_path()
         from .selfie import run_media_ref_pipeline
@@ -491,6 +608,33 @@ def deliver_job(job_id: str) -> str:
     # Record what the customer got in the jump's archive manifest, so the folder alone
     # answers "was this delivered, and to where?".
     archive.archive_delivery(updated, get_settings())
+    return job_id
+
+
+@celery_app.task(name="api.render_raw_proxies_job")
+def render_raw_proxies_job(job_id: str) -> str:
+    """Make a job's purchased camera masters watchable in a browser (:mod:`api.rawproxy`).
+
+    Queued by the ``raw`` add-on purchase and by the gallery's self-heal. Idempotent:
+    every master already decided (proxy / native / failed marker on disk) is skipped, so
+    a duplicate dispatch costs a directory scan. Never touches the job's status — a
+    proxy is a viewing aid; the customer's download of the master works regardless.
+    """
+    store = _store()
+    try:
+        job = store.load(job_id)
+    except FileNotFoundError:
+        logger.warning("raw-web proxies for unknown job %s — dropping", job_id)
+        return job_id
+    if "raw" not in job.addons:
+        # The purchase, never the queue, opens the work — a stray dispatch must not
+        # spend an hour of CPU on footage nobody bought.
+        logger.info("job %s does not own raw footage — no proxies rendered", job_id)
+        return job_id
+    from .rawproxy import render_job_raw_proxies
+
+    decided = render_job_raw_proxies(job, store, get_settings())
+    logger.info("job %s raw-web proxies: %s", job_id, decided or "nothing to do")
     return job_id
 
 
@@ -992,20 +1136,12 @@ def _dispatch_processing(store: JobStore, job_id: str, role: str | None = None) 
             process_job.delay(job_id)
         return True
 
-    state = job.role_ingest.get(role) or RoleIngest()
-    if state.dispatched:
+    if not store.claim_role_dispatch(job_id, role):
         logger.info(
             "job %s role %s already dispatched — not enqueuing a second render",
             job_id, role,
         )
         return False
-    store.update(
-        job_id,
-        role_ingest={
-            **job.role_ingest,
-            role: state.model_copy(update={"dispatched": True}),
-        },
-    )
     process_media_ref_job.delay(job_id, role)
     return True
 
@@ -1089,6 +1225,35 @@ def raw_clips_settled_job(job_id: str, role: str | None = None) -> str:
         job_id, f" role {role}" if role else "", quiet_for, n_clips,
     )
     _dispatch_processing(store, job_id, role)
+    return job_id
+
+
+@celery_app.task(name="api.mixed_ref_wait_job")
+def mixed_ref_wait_job(job_id: str) -> str:
+    """Release a mixed job whose OTHER camera never showed up, instead of holding forever.
+
+    Armed by :func:`_maybe_auto_deliver` when a mixed job's first render finishes with
+    another ref outstanding, for exactly the time left on that ref's cap. Re-entering
+    ``_maybe_auto_deliver`` is the whole task: it re-derives the hold from live state, so
+
+    * the second render landed → the hold is gone and the job delivers with both videos
+      (usually this already happened, driven by that render — then this is a no-op);
+    * the card arrived while an upload-shaped wait was running → the cap becomes the
+      longer render-shaped one and this re-arms rather than delivering a half gallery;
+    * nothing changed and the cap is spent → ``_mixed_ref_delivery_hold`` returns
+      ``None`` and the customer gets the gallery with what rendered, which is the
+      failure mode this whole gate is allowed to have.
+
+    A job that was approved, delivered, rejected or re-rendered in the meantime falls
+    straight through ``_maybe_auto_deliver``'s own status guard.
+    """
+    store = _store()
+    try:
+        store.load(job_id)
+    except FileNotFoundError:
+        logger.warning("mixed-ref wait for unknown job %s — dropping", job_id)
+        return job_id
+    _maybe_auto_deliver(store, job_id)
     return job_id
 
 

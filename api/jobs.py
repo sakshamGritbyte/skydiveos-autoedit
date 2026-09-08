@@ -539,6 +539,12 @@ class Job(BaseModel):
     #: carries one; the instructor can still approve it by hand, which is the deliberate
     #: human override for a mis-classified scene set. Cleared on every re-render.
     hold_reason: str | None = None
+    #: Epoch seconds when a MIXED job first finished a render with another ref still
+    #: outstanding — the clock the bounded delivery wait is measured against
+    #: (``api.tasks._mixed_ref_delivery_hold``). Stamped once and never re-stamped, so a
+    #: second render arriving does not restart the cap. ``None`` on every other job, and
+    #: on a mixed job whose refs all rendered before delivery was considered.
+    ref_wait_started_at: float | None = None
     #: Epoch seconds when the customer's delivery email actually went out. The
     #: idempotency record for delivery: Celery runs with ``task_acks_late=True``, so a
     #: worker killed after sending but before the ack re-runs the whole task — and the
@@ -721,6 +727,36 @@ def role_for_deliverable(job: Job, name: str) -> str | None:
         if ref.role != primary.role and name.startswith(f"{ref.role}_"):
             return ref.role
     return primary.role
+
+
+def rendered_ref_roles(job: Job) -> frozenset[str]:
+    """Which media refs already have a VIDEO deliverable — i.e. which cameras rendered.
+
+    Read back through :func:`role_for_deliverable`, so it can never disagree with the
+    naming authority. ``photos`` is excluded: the photo set is produced from the PAID
+    ref alone, so counting it would report that ref rendered when only stills exist.
+    """
+    return frozenset(
+        role
+        for role in (
+            role_for_deliverable(job, name)
+            for name in (job.outputs or {})
+            if name != "photos"
+        )
+        if role is not None
+    )
+
+
+def pending_ref_roles(job: Job) -> frozenset[str]:
+    """The mixed job's media products that have NOT rendered yet.
+
+    Empty — and therefore inert — for every job that is not multi-ref, which is every
+    ordinary job, the two-camera Ultimate (one merged product) and every job written
+    before ``media_refs`` existed.
+    """
+    if not job.is_multi_ref:
+        return frozenset()
+    return frozenset(r.role for r in job.media_refs) - rendered_ref_roles(job)
 
 
 def unlockable_group(job: Job, *, role: str | None = None) -> frozenset[str]:
@@ -1064,6 +1100,61 @@ class JobStore:
         updated = current.model_copy(update=changes)
         # Re-validate so an illegal field/value is rejected before it's written.
         return self.save(Job.model_validate(updated.model_dump()))
+
+    def claim_role_dispatch(self, job_id: str, role: str) -> bool:
+        """Claim the one render of ``role`` on a mixed job. ``True`` if this caller won.
+
+        A mixed job renders once per media ref, and EVERY path that can start such a
+        render has to come through here — the byte upload, the settle check behind an S3
+        ingest, reconciliation. The byte-upload path used to enqueue directly and stamp
+        nothing, so its own comment ("the per-role guard keeps a repeated upload from
+        starting a second render") described a guard it wasn't setting: a re-upload of
+        the same camera started a second render concurrently into one job dir, and the
+        retry-clear in :mod:`api.app` had no flag to clear.
+
+        The claim is the per-role ``dispatched`` flag in :attr:`Job.role_ingest`, cleared
+        only when footage is re-attached to a ``failed``/``rejected`` job — a genuine
+        retry. Like every other ``job.json`` field it is read-modify-write, so it
+        serialises what actually happens (a duplicate notification, an operator
+        re-uploading) but not two writers landing in the same instant.
+        :meth:`claim_email_send` reaches for an ``O_EXCL`` file instead because sending a
+        customer two emails is worse than rendering twice.
+        """
+        job = self.load(job_id)
+        state = job.role_ingest.get(role) or RoleIngest()
+        if state.dispatched:
+            return False
+        self.update(
+            job_id,
+            role_ingest={
+                **job.role_ingest,
+                role: state.model_copy(update={"dispatched": True}),
+            },
+        )
+        return True
+
+    def release_role_dispatch(self, job_id: str, role: str) -> Job:
+        """Release :meth:`claim_role_dispatch` so this role can render again.
+
+        The ONE legitimate reason to re-render a camera's footage: it is being re-attached
+        to a job that ``failed`` or was ``rejected``. Anything weaker — a duplicate
+        notification, a second upload of clips already staged — is what the claim exists
+        to refuse, so this is never called speculatively.
+
+        A no-op when the role was never claimed, so a first upload to a failed job (the
+        other camera's, say) behaves exactly as it did before.
+        """
+        job = self.load(job_id)
+        state = job.role_ingest.get(role)
+        if state is None:
+            return job
+        return self.update(
+            job_id,
+            role_ingest={
+                **job.role_ingest,
+                role: state.model_copy(update={"dispatched": False}),
+            },
+        )
 
     def set_pipeline_outputs(
         self,

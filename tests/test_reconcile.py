@@ -101,6 +101,9 @@ class FakeQueue:
     def arm_ultimum_watchdog(self, job_id: str, countdown: float) -> None:
         self.calls.append(("ultimum_watchdog", (job_id, countdown)))
 
+    def enqueue_raw_proxies(self, job_id: str) -> None:
+        self.calls.append(("raw_proxies", (job_id,)))
+
     def kinds(self) -> list[str]:
         return [kind for kind, _ in self.calls]
 

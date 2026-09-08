@@ -108,6 +108,61 @@ def collect_deliverables(job: Job, store: JobStore) -> dict[str, Path]:
     return files
 
 
+
+def _s3_object_exists(client: Any, bucket: str, key: str) -> bool:
+    """HeadObject → True ONLY on a definitive 200.
+
+    A 404 is "missing". So is a 403: an identity without ``s3:ListBucket`` gets
+    403, not 404, for a key that does not exist (S3 hides existence from callers
+    who may not list) — and the pipeline's identity is exactly that, so treating
+    403 as "exists" made :func:`upload_missing_deliverables` skip every late render
+    on the live box and quietly leave the customer's paid video local-only. The
+    consumer of this answer re-uploads, which is idempotent, so erring towards
+    "missing" costs bandwidth at worst; erring towards "exists" costs the file.
+    """
+    try:
+        client.head_object(Bucket=bucket, Key=key)
+        return True
+    except Exception as exc:  # noqa: BLE001 - botocore ClientError shape varies by client
+        code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", "")) or str(exc)
+        if not any(tok in code for tok in ("404", "NoSuchKey", "NotFound", "403", "Forbidden")):
+            logger.warning("HeadObject %s/%s failed (%s) — treating as missing", bucket, key, code)
+        return False
+
+
+def upload_missing_deliverables(
+    job: Job,
+    store: JobStore,
+    settings: Settings,
+    *,
+    s3_client: Any | None = None,
+) -> list[str]:
+    """Upload every rendered VIDEO deliverable that is not yet in S3. No email,
+    no presigned links, no status change — purely the durable copy.
+
+    Why this exists: a MIXED job delivers on its FIRST finished render (the job
+    flips to ``delivered``), and ``_maybe_auto_deliver`` only acts on
+    ``ready``/``ready_for_review``, so the SECOND camera's renders finish into an
+    already-delivered job and never get uploaded — the paid ``full_video`` then
+    lives on local disk only and dies at the next prune (seen 2026-09-07). Safe
+    to call any number of times; returns the names it uploaded.
+    """
+    if not settings.s3_bucket:
+        return []
+    files = {n: p for n, p in collect_deliverables(job, store).items() if n != "photos"}
+    if not files:
+        return []
+    client = s3_client if s3_client is not None else _default_s3_client(settings)
+    missing = {
+        n: p for n, p in files.items()
+        if not _s3_object_exists(client, settings.s3_bucket, delivery_s3_key(job.job_id, p.name))
+    }
+    if not missing:
+        return []
+    upload_and_link(missing, job_id=job.job_id, settings=settings, s3_client=client, presign=False)
+    logger.info("job %s: uploaded %d late deliverable(s): %s", job.job_id, len(missing), sorted(missing))
+    return sorted(missing)
+
 def _default_s3_client(settings: Settings) -> Any:
     import boto3  # deferred: only the delivery path needs it
 

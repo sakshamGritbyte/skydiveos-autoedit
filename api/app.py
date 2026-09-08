@@ -57,7 +57,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from edl.schema import EditDecisionList
 from ingest.registry import CameraRegistry
 
-from . import archive, cdn
+from . import archive, cdn, rawproxy
 from .auth import PUBLIC_PATH_PREFIX, AdminDep, PrincipalDep, service_token_allows
 from .catalogue import PriceCatalogue, load_price_catalogue
 from .config import Settings, get_settings
@@ -104,6 +104,8 @@ from .schemas import (
     TweakRequest,
     UnlockRequest,
     UploadResponse,
+    ReplaceDeliverableBody,
+    ReplaceDeliverableResponse,
 )
 from .thumbnail import ensure_poster
 from .upsell import (
@@ -346,6 +348,41 @@ def _booking_sidecar(job: Job) -> dict[str, object]:
     }
 
 
+def _refuse_upload_while_processing(job: Job, camera_role: str | None) -> None:
+    """409 a ``processing`` job — unless this is a DIFFERENT camera on a mixed job.
+
+    A mixed job carries one media product per camera and renders each on its own: the
+    paid handcam edit ships as soon as its clips land, the speculative cameraman card
+    joins the same gallery whenever (or if) it turns up. Those renders take tens of
+    minutes, so the second camera's upload lands precisely while ``job.status`` is
+    ``processing`` for the FIRST one — and a blanket refusal here made that whole design
+    unreachable in production: the operator got "job is already processing" partway
+    through a multi-GB upload and the second product could never be filmed. Nothing
+    below this guard needs the block — every mixed-job path (byte upload, S3 ingest,
+    settle) is keyed per role, and none of them touches the running render's status.
+
+    A role whose OWN render is already claimed stays refused while the job runs: its
+    footage is being read right now, so re-sending it can only mean a second render of
+    the same jump — and the message says that, instead of blaming a camera the operator
+    never touched. Every other job (single product, the two-camera Ultimate, a plain
+    package) keeps the original blanket refusal.
+    """
+    if job.status != JobStatus.processing:
+        return
+    if job.is_multi_ref and camera_role and job.ref_for_role(camera_role) is not None:
+        claimed = job.role_ingest.get(camera_role)
+        if not (claimed and claimed.dispatched):
+            return  # another camera's product — it renders on its own
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"the {camera_role} product is already rendering from the clips it was "
+                "given — a second upload would render this jump twice"
+            ),
+        )
+    raise HTTPException(status_code=409, detail="job is already processing")
+
+
 async def _upload_media_ref(
     job: Job,
     store: JobStore,
@@ -400,10 +437,21 @@ async def _upload_media_ref(
     archive.archive_raw_footage(job, store, settings)
 
     # A byte upload delivers a whole clip set in one call, so there is nothing to settle:
-    # dispatch this role now. The per-role guard keeps a repeated upload from starting a
-    # second render of the same footage.
+    # dispatch this role now. Through the per-role claim, which is what keeps a repeated
+    # upload from starting a second render of the same footage — this path used to enqueue
+    # directly, so the guard it relied on was never set and the retry-clear below had
+    # nothing to clear. The claim is released only by re-attaching footage to a
+    # `failed`/`rejected` job.
     store.update(job.job_id, error=None)
-    queue.enqueue_media_ref_processing(job.job_id, camera_role)
+    # Re-attaching footage to a job that FAILED (or was rejected) is a genuine retry, so
+    # release this role's claim first — the same rule the S3 ingest path applies. Without
+    # it the claim below would make a failed mixed job unretryable by re-upload, which is
+    # how this path was recovered before there was a claim at all.
+    if job.status in (JobStatus.failed, JobStatus.rejected):
+        store.release_role_dispatch(job.job_id, camera_role)
+    dispatched = store.claim_role_dispatch(job.job_id, camera_role)
+    if dispatched:
+        queue.enqueue_media_ref_processing(job.job_id, camera_role)
     n = len(uploaded)
     ref = job.ref_for_role(camera_role)
     assert ref is not None  # refused above
@@ -416,7 +464,14 @@ async def _upload_media_ref(
         files_received=n,
         detail=(
             f"received {n} files for {camera_role} ({ref.package.value}/"
-            f"{ref.entitlement.value}); processing enqueued for that product"
+            f"{ref.entitlement.value}); "
+            + (
+                "processing enqueued for that product"
+                if dispatched
+                # The clips are staged either way (the running pass globs `raw/<role>/`
+                # when it reaches them); what is refused is a SECOND render of them.
+                else "that product is already rendering — no second render started"
+            )
         ),
     )
 
@@ -1173,8 +1228,7 @@ def create_app() -> FastAPI:
         camera and reports that it's waiting for the other.
         """
         job = _load_or_404(store, job_id)
-        if job.status == JobStatus.processing:
-            raise HTTPException(status_code=409, detail="job is already processing")
+        _refuse_upload_while_processing(job, camera_role)
         if job.job_kind is JobKind.load_child:
             # A child gallery is a *view* of its load master's renders, never a job with
             # footage of its own. Attaching clips here would render a second copy of the
@@ -1329,16 +1383,10 @@ def create_app() -> FastAPI:
                 # A mixed job's second camera routinely lands after the first product was
                 # rendered and delivered, so its status must NOT be knocked back to
                 # `queued` — that would undo a completed review/delivery. The per-role
-                # guard in `role_ingest` is cleared instead, and only on a real retry.
-                clear: dict[str, object] = {}
+                # guard in `role_ingest` is released instead, and only on a real retry.
                 if retrying and camera_role is not None:
-                    state = job.role_ingest.get(camera_role)
-                    if state is not None:
-                        clear["role_ingest"] = {
-                            **job.role_ingest,
-                            camera_role: state.model_copy(update={"dispatched": False}),
-                        }
-                store.update(job_id, error=None, **clear)
+                    store.release_role_dispatch(job_id, camera_role)
+                store.update(job_id, error=None)
             else:
                 store.update(
                     job_id,
@@ -1475,7 +1523,8 @@ def create_app() -> FastAPI:
         summary="Mark the media purchased (SkydiveOS calls this after payment capture)",
     )
     def unlock(
-        job_id: JobId, body: UnlockRequest, store: StoreDep, principal: AdminDep
+        job_id: JobId, body: UnlockRequest, store: StoreDep, principal: AdminDep,
+        queue: QueueDep, settings: SettingsDep,
     ) -> JobResponse:
         """Flip a ``preview_only`` job to ``edited_download`` — the paywall unlock.
 
@@ -1577,6 +1626,12 @@ def create_app() -> FastAPI:
             "job %s add-on %r purchased payment=%s by=%s",
             job_id, item, body.payment_reference, principal.instructor_id or "service",
         )
+        if item == "raw" and settings.raw_web_proxies:
+            # The masters are HEVC straight off the camera; the gallery's player needs
+            # an H.264 proxy to show anything (api.rawproxy). Queue it the moment the
+            # purchase lands so the first page load already has it under way.
+            rawproxy.mark_dispatched(store, job_id)
+            queue.enqueue_raw_proxies(job_id)
         return JobResponse.from_job(updated)
 
     @app.post(
@@ -1722,6 +1777,126 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="deliverable file not found")
         return FileResponse(path, media_type="video/mp4", filename=f"{job_id}_{name}.mp4")
 
+    @app.post(
+        "/jobs/{job_id}/deliverables/{name}/replace",
+        response_model=ReplaceDeliverableResponse,
+        tags=["review"],
+        summary="Replace one delivered video with a re-edit, behind the customer's existing link",
+    )
+    def replace_deliverable(
+        job_id: JobId,
+        name: Annotated[str, PathParam(description="Deliverable key, e.g. full_video")],
+        body: ReplaceDeliverableBody,
+        store: StoreDep,
+        settings: SettingsDep,
+    ) -> ReplaceDeliverableResponse:
+        """Swap the bytes behind a delivered video without changing its link.
+
+        SkydiveOS calls this after an operator re-edits an AI render and chooses
+        "Replace customer's video". The gallery player serves the LOCAL file first
+        (S3 only via CDN, or once pruned), so the S3 object alone cannot change what
+        the customer sees — this replaces BOTH, atomically for the local copy:
+
+        1. download ``body.s3_key`` (must be in our own delivery bucket) to a temp
+           file beside the deliverable, then ``os.replace`` it over ``{name}.mp4`` —
+           the new mtime is the ``?v=`` the CDN cache key already carries (Bug 373),
+           so a fronted deployment busts its edge cache for free;
+        2. upload it to ``deliveries/{job}/{name}.mp4`` (created if it never
+           existed — the late-render gap), so the durable copy and any CDN agree;
+        3. upload any OTHER deliverable of this job that never reached S3.
+
+        Refused for a ``preview_only`` deliverable (403): the gallery shows those
+        watermarked, and a clean re-edit there is the paid product for free. Refused
+        unless the job is ``delivered`` (409): before that there is no customer link
+        to preserve, and the pipeline's own delivery will publish the render.
+        """
+        import os  # noqa: PLC0415
+        from .delivery import (  # noqa: PLC0415 - keep app import light
+            _default_s3_client, delivery_s3_key, upload_and_link, upload_missing_deliverables,
+        )
+
+        job = _load_or_404(store, job_id)
+        outputs = job.outputs or {}
+        if name == "photos" or name not in outputs or not _is_safe_segment(name):
+            raise HTTPException(status_code=404, detail=f"no video deliverable {name!r}")
+        if job.status is not JobStatus.delivered:
+            raise HTTPException(
+                status_code=409,
+                detail=f"job {job_id} is {job.status.value}, not delivered — nothing to replace yet",
+            )
+        if entitlement_for(job, name) is Entitlement.preview_only:
+            raise HTTPException(
+                status_code=403,
+                detail=f"{name!r} is preview_only (unpaid): a clean re-edit may not replace its watermarked preview",
+            )
+        if not settings.s3_bucket:
+            raise HTTPException(status_code=503, detail="S3 is not configured on the pipeline")
+        key = body.s3_key.strip().lstrip("/")
+        if not key or ".." in key or key.startswith(("http://", "https://", "s3://")):
+            raise HTTPException(status_code=422, detail="s3_key must be a plain object key in the delivery bucket")
+
+        job_dir = store.dir(job_id)
+        dest = job_dir / f"{name}.mp4"
+        if not _served_under(dest, job_dir):
+            raise HTTPException(status_code=400, detail="refusing to write outside the job directory")
+
+        # Every S3 touch below is answered as 502 with the real reason, never a
+        # bare 500: on a box without credentials/region the first cut swallowed
+        # the head_object error as "exists", then download_file raised outside
+        # any handler — the operator saw "Internal Server Error" and nothing else.
+        try:
+            client = _default_s3_client(settings)
+            client.head_object(Bucket=settings.s3_bucket, Key=key)
+        except Exception as exc:  # noqa: BLE001 - botocore error shapes vary
+            code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", "")) or ""
+            if any(tok in code or tok in str(exc) for tok in ("404", "NoSuchKey", "NotFound", "Not Found")):
+                raise HTTPException(status_code=404, detail=f"no object at s3://{settings.s3_bucket}/{key}") from exc
+            if "403" in code or "Forbidden" in str(exc):
+                # Without s3:ListBucket, S3 answers 403 for a key that does not exist,
+                # so this is EITHER a wrong key OR a permission gap — say both.
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"S3 answered 403 Forbidden for s3://{settings.s3_bucket}/{key}: the object does not exist, "
+                        "or the pipeline's AWS identity cannot read it (it lacks s3:ListBucket, so a missing key "
+                        "reads as 403). Check the key, then the pipeline's IAM policy."
+                    ),
+                ) from exc
+            logger.warning("job %s: replace cannot reach S3 (%s)", job_id, exc)
+            raise HTTPException(
+                status_code=502,
+                detail=f"pipeline cannot reach S3 to fetch the replacement: {type(exc).__name__}: {exc}",
+            ) from exc
+
+        tmp = job_dir / f".{name}.mp4.replacing"
+        try:
+            try:
+                client.download_file(settings.s3_bucket, key, str(tmp))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("job %s: replace download failed (%s)", job_id, exc)
+                raise HTTPException(
+                    status_code=502, detail=f"pipeline could not download the replacement: {type(exc).__name__}: {exc}",
+                ) from exc
+            if tmp.stat().st_size == 0:
+                raise HTTPException(status_code=422, detail="replacement object is empty")
+            os.replace(tmp, dest)  # atomic on the same filesystem; new mtime = new CDN ?v=
+        finally:
+            if tmp.exists():
+                tmp.unlink(missing_ok=True)
+
+        delivery_key = delivery_s3_key(job_id, dest.name)
+        upload_and_link({name: dest}, job_id=job_id, settings=settings, s3_client=client, presign=False)
+        try:
+            uploaded_missing = upload_missing_deliverables(job, store, settings, s3_client=client)
+        except Exception:  # noqa: BLE001 - the replace itself succeeded; this is a bonus pass
+            logger.warning("job %s: late-deliverable upload after replace failed", job_id, exc_info=True)
+            uploaded_missing = []
+        logger.info("job %s: deliverable %s REPLACED from %s (%d bytes)", job_id, name, key, dest.stat().st_size)
+        return ReplaceDeliverableResponse(
+            job_id=job_id, name=name, s3_key=delivery_key, size=dest.stat().st_size,
+            uploaded_missing=uploaded_missing,
+        )
+
     @app.get(
         "/jobs/{job_id}/photos",
         response_model=PhotosResponse,
@@ -1829,14 +2004,10 @@ def create_app() -> FastAPI:
         ``/j/{token}/raw/{path}`` serves — nothing outside ``raw/`` is ever listed.
         """
         raw_dir = store.dir(job.job_id) / "raw"
-        if not raw_dir.is_dir():
-            return []
         clips: list[tuple[str, str]] = []
-        for p in sorted(raw_dir.rglob("*")):
-            if not p.is_file() or p.suffix.lower() not in (".mp4", ".lrv"):
-                continue
-            if p.suffix.lower() == ".lrv":
-                continue  # proxies are pipeline internals, not a customer product
+        # MP4s only — an .lrv GoPro proxy is a pipeline internal, not a customer product
+        # (api.rawproxy.iter_raw_masters is the one filter, shared with the proxy render).
+        for p in rawproxy.iter_raw_masters(raw_dir):
             rel = p.relative_to(raw_dir)
             label = p.stem if len(rel.parts) == 1 else f"{rel.parts[0]} · {p.stem}"
             clips.append((label, str(rel)))
@@ -2021,7 +2192,7 @@ def create_app() -> FastAPI:
 
     @app.get("/j/{token}", response_class=HTMLResponse, include_in_schema=False)
     def public_gallery(
-        token: str, store: StoreDep, settings: SettingsDep
+        token: str, store: StoreDep, settings: SettingsDep, queue: QueueDep
     ) -> HTMLResponse:
         """The customer landing page — Path A unlocked, Path B watermarked + paywalled.
 
@@ -2055,6 +2226,27 @@ def create_app() -> FastAPI:
             [(label, f"/j/{token}/raw/{rel}") for label, rel in raw_files]
             if "raw" in job.addons else []
         )
+        # What each raw card PLAYS (the Download stays on the master URL above). GoPro
+        # masters are HEVC, which Chrome/Firefox cannot decode — the card showed a
+        # duration and a black frame — so the player streams the H.264 web proxy
+        # (api.rawproxy) once it exists; a browser-native master (or a failed
+        # transcode, or the feature off) plays the master itself; a master still being
+        # transcoded is `None`, which the card renders as "preparing playback" and the
+        # page's poll flips the moment it lands. Purchases that predate the proxies, or
+        # a lost task, self-heal here: re-queued at most every 30 min while pending.
+        raw_play_urls: dict[str, str | None] = {}
+        raw_pending = 0
+        if raw_clips and settings.raw_web_proxies:
+            for label, rel in raw_files:
+                state = rawproxy.playback_for(store, job.job_id, rel)
+                if state == "proxy":
+                    raw_play_urls[label] = f"/j/{token}/raw-web/{rel}"
+                elif state == "pending":
+                    raw_play_urls[label] = None
+                    raw_pending += 1
+            if raw_pending and rawproxy.needs_dispatch(store, job):
+                rawproxy.mark_dispatched(store, job.job_id)
+                queue.enqueue_raw_proxies(job.job_id)
         # A media buyer on a spec-flight load who bought the load video: their OWN
         # deliverables stay the page's main videos, and the load's aerial cut is an extra
         # section. (A no-media customer's child gallery has no own footage, so the load
@@ -2170,6 +2362,8 @@ def create_app() -> FastAPI:
             photos_unlock_url=photos_unlock_url,
             photos_unlock_price=catalogue.display("photos") if catalogue else None,
             raw_videos=raw_clips,
+            raw_play_urls=raw_play_urls,
+            raw_pending=raw_pending,
             # Bought it, files gone (pruning keeps purchased masters — this is a
             # wiped volume): say so instead of dropping a section the customer
             # paid for. `/j/{token}/raw/…` already 404s, so this is display-only.
@@ -2225,7 +2419,9 @@ def create_app() -> FastAPI:
         return HTMLResponse(html_page)
 
     @app.get("/j/{token}/state", include_in_schema=False)
-    def public_gallery_state(token: str, store: StoreDep) -> dict[str, bool | list[str]]:
+    def public_gallery_state(
+        token: str, store: StoreDep, settings: SettingsDep
+    ) -> dict[str, bool | int | list[str]]:
         """Whether this jump is still behind the paywall — one boolean, nothing else.
 
         Frame 03 says the page "re-renders in place" when payment lands. The page is
@@ -2251,6 +2447,15 @@ def create_app() -> FastAPI:
             # Purchased add-on keys (sorted, names only — no references), so an open
             # page can also notice a raw/photos purchase and re-render in place.
             "addons": sorted(job.addons),
+            # How many purchased camera masters still have no browser-playable proxy
+            # (api.rawproxy), so a page showing "preparing playback" cards reloads
+            # itself when the transcode lands. A count, never a filename. Always 0
+            # without the purchase or with the feature off — the page's baseline
+            # signature must match this predicate exactly or it reloads in a loop.
+            "raw_pending": (
+                len(rawproxy.pending_masters(store, job))
+                if "raw" in job.addons and settings.raw_web_proxies else 0
+            ),
         }
 
     # HEAD as well as GET. FastAPI's ``@app.get`` registers ONLY GET — unlike Starlette's
@@ -2485,6 +2690,33 @@ def create_app() -> FastAPI:
         path = raw_dir.joinpath(*parts)
         if not path.is_file() or path.suffix.lower() != ".mp4" or not _served_under(path, raw_dir):
             raise HTTPException(status_code=404, detail="raw clip not found")
+        return FileResponse(path, media_type="video/mp4", filename=path.name)
+
+    @app.get("/j/{token}/raw-web/{name:path}", include_in_schema=False, response_class=FileResponse)
+    def public_raw_web(token: str, name: str, store: StoreDep) -> FileResponse:
+        """Stream the browser-playable proxy of one purchased camera master.
+
+        The player's URL for a Raw Footage card (:mod:`api.rawproxy`); the Download
+        button stays on ``/j/{token}/raw/{name}``, the master itself. Gated exactly like
+        the master: no ``raw`` purchase → 404 at every path. ``name`` is the same
+        relpath as the master's, resolved under ``raw-web/`` with the same traversal
+        checks, and a proxy still being written (``.part``) is never a served name.
+        """
+        job = _job_by_token(store, token)
+        if "raw" not in job.addons:
+            raise HTTPException(status_code=404, detail="raw footage is a paid add-on")
+        parts = name.split("/")
+        if len(parts) > 2 or not all(_is_safe_segment(p) for p in parts):
+            raise HTTPException(status_code=400, detail="invalid raw clip path")
+        web_dir = rawproxy.web_dir(store, job.job_id)
+        path = web_dir.joinpath(*parts)
+        if (
+            not path.is_file()
+            or path.suffix.lower() != ".mp4"
+            or rawproxy.PARTIAL_SUFFIX in path.name
+            or not _served_under(path, web_dir)
+        ):
+            raise HTTPException(status_code=404, detail="raw clip proxy not found")
         return FileResponse(path, media_type="video/mp4", filename=path.name)
 
     # ----------------------------------------------------------------------- #

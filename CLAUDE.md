@@ -315,7 +315,33 @@ Two runtime media roots, with different audiences:
     deliverable added later simply appears, and `send_gallery_email_once` keeps it to one
     email). The primary ref keeps the plain deliverable names, every other ref is
     namespaced `<role>_<name>` (`api.jobs.deliverable_name`) so both renders share one
-    `outputs` map.
+    `outputs` map. **`POST /jobs/{id}/upload`'s "job is already processing" 409 does not
+    apply to a mixed job's OTHER camera** (`_refuse_upload_while_processing`): a ref
+    render holds the job at `processing` for tens of minutes, which is exactly when the
+    second card is uploaded, so the blanket refusal made this rule unreachable in
+    production — the operator lost a multi-GB upload to it and the spec product could
+    never be filmed. Everything under that guard is already per-role and leaves the
+    running render's status alone; only a role whose OWN dispatch is claimed is still
+    refused (its clips are being read right now), and it is refused by name.
+  * **DELIVERY waits for every ref; the RENDERS still don't**
+    (`api.tasks._mixed_ref_delivery_hold`). The rule above is about rendering, and it
+    stays: each camera renders the moment its own clips are quiet. But delivery is what
+    emails the customer *"your gallery is ready"*, and firing it on the FIRST render said
+    that while the second video they were sold was still rendering — with no later notice,
+    because the job is emailed once. So `_maybe_auto_deliver` holds a multi-ref job (via
+    the existing `hold_reason`, so a human `POST /approve` still overrides) until every ref
+    has a video deliverable — `api.jobs.pending_ref_roles`, read back through
+    `role_for_deliverable` so it cannot drift from the naming authority. **Bounded**, and
+    that bound is not optional: a spec card that never arrives must never keep the PAID
+    edit from being delivered. Two caps from `Job.ref_wait_started_at` (stamped ONCE, or a
+    third product would push the deadline out forever): footage staged → `MIXED_REF_RENDER_WAIT_S`
+    (6h), nothing staged → `MIXED_REF_UPLOAD_WAIT_S` (45 min), either `0` = deliver on the
+    first render as before. `api.mixed_ref_wait_job` is the release valve — one countdown
+    for the time actually left, re-deciding from live state (so a card landing mid-wait
+    extends the short cap to the long one rather than delivering half a gallery); the other
+    trigger is the missing render finishing, which re-enters `_maybe_auto_deliver` directly.
+    Values mirror SkydiveOS's BUG 389 notification caps so the two services release together
+    rather than one holding behind the other. A single-ref job never enters any of this.
   * **`outputs` is merged, never replaced** (`JobStore.set_pipeline_outputs`, `owns=`).
     The four render sites pass `owns=None` (a wholesale replace, exactly as before); a
     per-role pass names the set it owns, so it drops only its own stale keys. Without this
@@ -379,6 +405,28 @@ Two runtime media roots, with different audiences:
   gated — they're fulfilled outside this system. The pruner correspondingly **never
   sweeps a purchased job's `raw/`** (`"raw" in Job.addons` — the gallery streams those
   masters locally, from a link that never expires).
+- **The Raw Footage card PLAYS a web proxy; its Download is the master** (`api/rawproxy.py`).
+  GoPro masters are HEVC (2704x1520 `yuvj420p` on the Hero 11/12), which Chrome/Edge/
+  Firefox cannot decode — `<video src=master>` parsed the container and showed the
+  duration over a black frame, on footage the customer had just paid for (2026-09-07).
+  The `raw` purchase (`POST /jobs/{id}/unlock`) queues `render_raw_proxies_job`, which
+  writes ONE H.264/AAC proxy per master under `jobs/<id>/raw-web/<rel>` (a SIBLING of
+  `raw/` — inside it, the archive would mirror it and `_gallery_raw_clips` would list it
+  as a second camera), capped at `RAW_WEB_MAX_HEIGHT` (1080), `-map 0:v:0 -map 0:a?`
+  only (GPMF/timecode data streams fail the MP4 muxer), `yuv420p` (10-bit HEVC must come
+  out 8-bit), written as `.part` then `os.replace`d. A master already H.264/yuv420p at or
+  under the cap gets a `<name>.native` marker and plays as-is; a failed transcode writes
+  `<name>.failed` (the card falls back to the master, and it is NOT retried on every
+  poll — delete the marker to retry). Every state is re-derived from disk, nothing is
+  recorded on the job. While a master is `pending` the card shows "Preparing playback…"
+  with the download live — never the black player — and `/j/{code}/state` carries
+  `raw_pending` in the page's poll signature (the page baseline MUST match that
+  predicate exactly or it reloads in a loop; see `test_mixed_entitlement`). Purchases
+  that predate this (or a lost task) self-heal from the gallery request, at most once per
+  `REDISPATCH_AFTER_S` (30 min) via `raw-web/.dispatched`. `GET /j/{code}/raw-web/{rel}`
+  is gated exactly like `/raw/`. `RAW_WEB_PROXIES=0` turns it off (player = master, as
+  before). **The Celery worker must be restarted to learn the task** — uvicorn reloads,
+  the worker does not. Tests: `test_rawproxy`, §raw-web in `test_api`.
 - **Every video card opens on a frame from that very video** (`api/thumbnail.py` →
   `GET /j/{code}/poster/{name}`). A `<video>` with no `poster` is drawn by the browser
   — a grey box or iOS's generic cloud tile — so five cards read as one stock page, on

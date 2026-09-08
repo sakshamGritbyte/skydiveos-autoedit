@@ -61,6 +61,9 @@ class FakeQueue:
     def arm_ultimum_watchdog(self, job_id: str, countdown: float) -> None:
         self.calls.append(("ultimum_watchdog", (job_id, countdown)))
 
+    def enqueue_raw_proxies(self, job_id: str) -> None:
+        self.calls.append(("raw_proxies", (job_id,)))
+
     def kinds(self) -> list[str]:
         return [kind for kind, _ in self.calls]
 
@@ -1127,6 +1130,7 @@ def test_gallery_state_endpoint_reports_only_the_lock(client: TestClient) -> Non
         "locked": True,
         "locked_deliverables": ["full_video"],
         "addons": [],
+        "raw_pending": 0,
     }
     assert "Sophie" not in resp.text and token not in resp.text
 
@@ -1135,15 +1139,18 @@ def test_gallery_state_endpoint_reports_only_the_lock(client: TestClient) -> Non
         "locked": False,
         "locked_deliverables": [],
         "addons": [],
+        "raw_pending": 0,
     }
 
     # An add-on purchase shows up as its key only — never the payment reference.
+    # (No masters on disk here, so nothing is pending a web proxy.)
     client.post(f"/jobs/{job_id}/unlock", json={**_PAYMENT_BODY, "item": "raw"})
     state = client.get(f"/j/{token}/state")
     assert state.json() == {
         "locked": False,
         "locked_deliverables": [],
         "addons": ["raw"],
+        "raw_pending": 0,
     }
     assert _PAYMENT_BODY["payment_reference"] not in state.text
 
@@ -1253,6 +1260,133 @@ def test_purchased_raw_footage_gone_says_so(client: TestClient) -> None:
     assert client.get(f"/j/{token}/raw/GX010052.MP4").status_code == 404
 
 
+def test_raw_purchase_queues_the_web_proxies(client: TestClient, queue: FakeQueue) -> None:
+    """Buying raw footage kicks off the browser-playable transcode at once."""
+    job_id = _create(client, customer_name="Sophie Lavoie")
+    _rendered(client, job_id, locked=False)
+    assert "raw_proxies" not in queue.kinds()
+
+    client.post(f"/jobs/{job_id}/unlock", json={**_PAYMENT_BODY, "item": "raw"})
+    assert queue.calls.count(("raw_proxies", (job_id,))) == 1
+    # A repeat purchase call is idempotent — no second render queued.
+    client.post(f"/jobs/{job_id}/unlock", json={**_PAYMENT_BODY, "item": "raw"})
+    assert queue.calls.count(("raw_proxies", (job_id,))) == 1
+    # Buying the photos add-on has nothing to transcode.
+    client.post(f"/jobs/{job_id}/unlock", json={**_PAYMENT_BODY, "item": "photos"})
+    assert queue.calls.count(("raw_proxies", (job_id,))) == 1
+
+
+def test_raw_card_plays_the_web_proxy_and_downloads_the_master(
+    client: TestClient, queue: FakeQueue
+) -> None:
+    """HEVC masters show a black frame in a browser: the player must stream the proxy.
+
+    Until the proxy exists the card says "preparing" (no black player), the download is
+    live, and /state counts the pending master so the page reloads when it lands. Once
+    the proxy exists the <video> points at /raw-web/, Download stays on /raw/.
+    """
+    from api.rawproxy import RAW_WEB_DIRNAME
+
+    job_id = _create(client, customer_name="Sophie Lavoie")
+    _rendered(client, job_id, locked=False)
+    store = JobStore(client.jobs_root)
+    raw_dir = store.dir(job_id) / "raw"
+    (raw_dir / "external").mkdir(parents=True)
+    (raw_dir / "GX010052.MP4").write_bytes(b"HEVC-MASTER-A")
+    (raw_dir / "external" / "GX020001.MP4").write_bytes(b"HEVC-MASTER-B")
+    token = _token(client, job_id)
+    client.post(f"/jobs/{job_id}/unlock", json={**_PAYMENT_BODY, "item": "raw"})
+    assert queue.calls.count(("raw_proxies", (job_id,))) == 1
+
+    # Pending: no player pointed at the undecodable master, a notice instead, and the
+    # download (the product) is live. The purchase already queued the render, so the
+    # page does NOT re-queue it within the dispatch window.
+    page = client.get(f"/j/{token}").text
+    assert "Raw Footage <span>(2)</span>" in page
+    assert page.count("Preparing playback") == 2
+    assert f'src="/j/{token}/raw/GX010052.MP4"' not in page
+    assert f'href="/j/{token}/raw/GX010052.MP4" download' in page
+    assert client.get(f"/j/{token}/state").json()["raw_pending"] == 2
+    assert queue.calls.count(("raw_proxies", (job_id,))) == 1
+    # The page's poll baseline carries the pending count, matching /state's predicate.
+    assert "|raw|2'" in page
+
+    # The worker lands one proxy; the card flips to a player streaming it.
+    web = store.dir(job_id) / RAW_WEB_DIRNAME
+    (web / "external").mkdir(parents=True)
+    (web / "GX010052.MP4").write_bytes(b"H264-PROXY-A")
+    page = client.get(f"/j/{token}").text
+    assert f'<video controls preload="metadata" playsinline src="/j/{token}/raw-web/GX010052.MP4">' in page
+    assert f'href="/j/{token}/raw/GX010052.MP4" download' in page  # download = the master
+    assert page.count("Preparing playback") == 1
+    assert client.get(f"/j/{token}/state").json()["raw_pending"] == 1
+    assert client.get(f"/j/{token}/raw-web/GX010052.MP4").content == b"H264-PROXY-A"
+    assert client.get(f"/j/{token}/raw/GX010052.MP4").content == b"HEVC-MASTER-A"
+
+    # A browser-native master (marker) plays the master itself, nothing pending.
+    (web / "external" / "GX020001.MP4.native").touch()
+    page = client.get(f"/j/{token}").text
+    assert f'src="/j/{token}/raw/external/GX020001.MP4"' in page
+    assert "Preparing playback" not in page
+    assert client.get(f"/j/{token}/state").json()["raw_pending"] == 0
+    assert "|raw|0'" in page
+
+
+def test_raw_web_proxy_route_is_gated_like_the_master(client: TestClient) -> None:
+    """No purchase → 404 at every /raw-web/ path; traversal and partial files stay dead."""
+    from api.rawproxy import RAW_WEB_DIRNAME
+
+    job_id = _create(client, customer_name="Sophie Lavoie")
+    _rendered(client, job_id, locked=False)
+    store = JobStore(client.jobs_root)
+    (store.dir(job_id) / "raw").mkdir(parents=True)
+    (store.dir(job_id) / "raw" / "GX010052.MP4").write_bytes(b"MASTER")
+    web = store.dir(job_id) / RAW_WEB_DIRNAME
+    web.mkdir(parents=True)
+    (web / "GX010052.MP4").write_bytes(b"PROXY")
+    (web / "GX010053.MP4.part.MP4").write_bytes(b"HALF-WRITTEN")
+    token = _token(client, job_id)
+
+    assert client.get(f"/j/{token}/raw-web/GX010052.MP4").status_code == 404
+    client.post(f"/jobs/{job_id}/unlock", json={**_PAYMENT_BODY, "item": "raw"})
+    assert client.get(f"/j/{token}/raw-web/GX010052.MP4").content == b"PROXY"
+    assert client.get(f"/j/{token}/raw-web/GX010053.MP4.part.MP4").status_code == 404
+    assert client.get(f"/j/{token}/raw-web/../job.json").status_code in (400, 404)
+    assert client.get(f"/j/{token}/raw-web/GX010052.MP4.native").status_code == 404
+
+
+def test_gallery_self_heals_a_raw_purchase_with_no_proxies(
+    client: TestClient, queue: FakeQueue
+) -> None:
+    """A purchase that predates the proxies (or a lost task) is re-queued from the page."""
+    import os
+    import time
+
+    from api.rawproxy import DISPATCH_MARKER, RAW_WEB_DIRNAME, REDISPATCH_AFTER_S
+
+    job_id = _create(client, customer_name="Sophie Lavoie")
+    _rendered(client, job_id, locked=False)
+    store = JobStore(client.jobs_root)
+    (store.dir(job_id) / "raw").mkdir(parents=True)
+    (store.dir(job_id) / "raw" / "GX010052.MP4").write_bytes(b"MASTER")
+    token = _token(client, job_id)
+    # Purchased "before this shipped": the add-on is on the job, nothing was queued.
+    store.update(job_id, addons={"raw": "clover_txn_old"})
+    assert "raw_proxies" not in queue.kinds()
+
+    client.get(f"/j/{token}")
+    assert queue.calls.count(("raw_proxies", (job_id,))) == 1
+    # Polled again seconds later: the dispatch marker holds it to one queueing.
+    client.get(f"/j/{token}")
+    assert queue.calls.count(("raw_proxies", (job_id,))) == 1
+    # Marker older than the window (the task was lost): queued once more.
+    marker = store.dir(job_id) / RAW_WEB_DIRNAME / DISPATCH_MARKER
+    old = time.time() - REDISPATCH_AFTER_S - 5
+    os.utime(marker, (old, old))
+    client.get(f"/j/{token}")
+    assert queue.calls.count(("raw_proxies", (job_id,))) == 2
+
+
 def test_unpurchased_gallery_never_shows_the_unavailable_note(client: TestClient) -> None:
     """No purchase, no files -> no Raw Footage section of any kind (unchanged)."""
     job_id = _create(client, customer_name="Sophie Lavoie")
@@ -1354,13 +1488,13 @@ def test_gallery_page_carries_the_flip_poll_in_both_states(client: TestClient) -
     token = _token(client, job_id)
     page = client.get(f"/j/{token}").text
     assert f"/j/{token}/state" in page and "location.reload()" in page
-    assert "'locked|'" in page  # baseline signature: still behind the paywall
+    assert "'locked||0'" in page  # baseline signature: locked, no add-ons, no pending proxies
 
     client.post(f"/jobs/{job_id}/unlock", json=_PAYMENT_BODY)
     # The unlocked page still polls — an add-on purchase (raw/photos) must flip
     # it in place too — with the signature updated so it doesn't reload-loop.
     unlocked = client.get(f"/j/{token}").text
-    assert "location.reload()" in unlocked and "'open|'" in unlocked
+    assert "location.reload()" in unlocked and "'open||0'" in unlocked
 
 
 def test_gallery_ignores_any_source_tag(client: TestClient) -> None:

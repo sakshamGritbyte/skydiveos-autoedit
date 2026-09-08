@@ -66,6 +66,14 @@ class JobQueue(Protocol):
         """Schedule the stranded-Ultimate check for ``countdown`` seconds from now."""
         ...
 
+    def enqueue_raw_proxies(self, job_id: str) -> None:
+        """Queue the browser-playable proxies of a job's purchased camera masters.
+
+        Fired by the ``raw`` add-on purchase and by the gallery's self-heal
+        (:mod:`api.rawproxy`); a no-op inside the task unless the job owns ``raw``.
+        """
+        ...
+
 
 class CeleryJobQueue:
     """Production :class:`JobQueue` — dispatches to the Celery tasks via ``.delay``."""
@@ -116,3 +124,8 @@ class CeleryJobQueue:
         from .tasks import ultimum_watchdog_job
 
         ultimum_watchdog_job.apply_async((job_id,), countdown=countdown)
+
+    def enqueue_raw_proxies(self, job_id: str) -> None:
+        from .tasks import render_raw_proxies_job
+
+        render_raw_proxies_job.delay(job_id)

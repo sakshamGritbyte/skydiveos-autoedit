@@ -674,6 +674,218 @@ def test_upload_stages_per_role_and_dispatches_only_that_product(client, queue) 
     assert ("media_ref", (job_id, "external")) in queue.calls
 
 
+def test_a_byte_upload_claims_the_role_so_a_repeat_starts_no_second_render(
+    client, queue
+) -> None:
+    """A re-upload of a camera already rendering must not start a second pass.
+
+    The byte path used to enqueue directly and stamp nothing, so its own comment
+    described a guard it wasn't setting: two renders of one camera ran concurrently into
+    one job dir, racing on `job.json` and on the scene set. The clips still stage (the
+    running pass globs `raw/<role>/` when it reaches them) — only the second render is
+    refused.
+    """
+    job_id = _mixed_job_id(client)
+    store = JobStore(client.jobs_root)
+
+    for _ in range(2):
+        r = client.post(
+            f"/jobs/{job_id}/upload",
+            files=[("files", ("GH010001.MP4", b"fake-mp4-bytes", "video/mp4"))],
+            data={"camera_role": "instructor"},
+        )
+        assert r.status_code == 200, r.text
+
+    assert store.load(job_id).role_ingest["instructor"].dispatched is True
+    assert queue.calls.count(("media_ref", (job_id, "instructor"))) == 1
+    assert "already rendering" in r.json()["detail"]
+
+
+def test_the_second_camera_uploads_while_the_first_one_renders(client, queue) -> None:
+    """The reported failure: "job is already processing" partway through the upload.
+
+    A ref render marks the job `processing` and holds it there for tens of minutes, so
+    the cameraman's card lands in exactly that window — and the endpoint's blanket
+    refusal made the mixed job's whole point (each product ships on its own) unreachable
+    outside tests, which never ran a real render. The other camera's product has its own
+    footage, its own claim and its own dispatch; nothing about it is in flight.
+    """
+    job_id = _mixed_job_id(client)
+    store = JobStore(client.jobs_root)
+
+    r = client.post(
+        f"/jobs/{job_id}/upload",
+        files=[("files", ("GH010001.MP4", b"fake-mp4-bytes", "video/mp4"))],
+        data={"camera_role": "instructor"},
+    )
+    assert r.status_code == 200, r.text
+    store.update(job_id, status=JobStatus.processing)  # the instructor edit is rendering
+
+    r = client.post(
+        f"/jobs/{job_id}/upload",
+        files=[("files", ("GX010007.MP4", b"fake-mp4-bytes", "video/mp4"))],
+        data={"camera_role": "external"},
+    )
+    assert r.status_code == 200, r.text
+    assert ("media_ref", (job_id, "external")) in queue.calls
+    # The running render's status is its own — staging the other camera must not move it.
+    assert store.load(job_id).status is JobStatus.processing
+
+
+def test_the_s3_hand_off_of_a_second_camera_also_survives_a_running_render(
+    client, queue
+) -> None:
+    """The production path is presign → browser PUT → attach by key, not a byte stream,
+    and it 409'd on the same guard — after the operator had already spent minutes
+    pushing the clips into S3."""
+    job_id = _mixed_job_id(client)
+    store = JobStore(client.jobs_root)
+    client.post(
+        f"/jobs/{job_id}/upload",
+        files=[("files", ("GH010001.MP4", b"fake-mp4-bytes", "video/mp4"))],
+        data={"camera_role": "instructor"},
+    )
+    store.update(job_id, status=JobStatus.processing)
+
+    r = client.post(
+        f"/jobs/{job_id}/upload",
+        data={"s3_key": "raw/1234/GX010007.MP4", "camera_role": "external"},
+    )
+    assert r.status_code == 200, r.text
+    assert ("s3_ingest", (job_id, "raw/1234/GX010007.MP4", "external")) in queue.calls
+
+
+def test_a_camera_already_rendering_is_refused_by_name(client) -> None:
+    """The one upload that must still be refused mid-render — and it says which camera.
+
+    That role's clips are being read right now, so re-sending them can only mean a
+    second render of the same jump. The generic "job is already processing" blamed a
+    camera the operator hadn't touched, which is what sent them looking in the wrong
+    place.
+    """
+    job_id = _mixed_job_id(client)
+    store = JobStore(client.jobs_root)
+    client.post(
+        f"/jobs/{job_id}/upload",
+        files=[("files", ("GH010001.MP4", b"fake-mp4-bytes", "video/mp4"))],
+        data={"camera_role": "instructor"},
+    )
+    store.update(job_id, status=JobStatus.processing)
+
+    r = client.post(
+        f"/jobs/{job_id}/upload",
+        files=[("files", ("GH010001.MP4", b"fake-mp4-bytes", "video/mp4"))],
+        data={"camera_role": "instructor"},
+    )
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert "instructor" in detail and "twice" in detail
+
+
+def test_a_single_product_job_keeps_the_blanket_refusal(client) -> None:
+    """Only the mixed job has a second product to upload. Everything else — a plain
+    package, the two-camera Ultimate (which dispatches only once BOTH cameras are in, so
+    a processing job has all its footage) — refuses exactly as before."""
+    r = client.post(
+        "/jobs",
+        json={"customer_name": "Sam", "package": "selfie", "entitlement": "edited_download"},
+    )
+    job_id = str(r.json()["job_id"])
+    JobStore(client.jobs_root).update(job_id, status=JobStatus.processing)
+
+    r = client.post(
+        f"/jobs/{job_id}/upload",
+        files=[("files", ("GH010001.MP4", b"fake-mp4-bytes", "video/mp4"))],
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"] == "job is already processing"
+
+
+def test_re_uploading_to_a_failed_mixed_job_renders_again(client, queue) -> None:
+    """The claim must not make a failed job unretryable.
+
+    Re-attaching footage to a `failed`/`rejected` job is the one legitimate reason to
+    render a camera twice, and before the claim existed a byte re-upload was how that
+    recovery was done. So the claim is released first, exactly as the S3 path does.
+    """
+    job_id = _mixed_job_id(client)
+    store = JobStore(client.jobs_root)
+
+    client.post(
+        f"/jobs/{job_id}/upload",
+        files=[("files", ("GH010001.MP4", b"fake-mp4-bytes", "video/mp4"))],
+        data={"camera_role": "instructor"},
+    )
+    store.update(job_id, status=JobStatus.failed, error="render blew up")
+
+    r = client.post(
+        f"/jobs/{job_id}/upload",
+        files=[("files", ("GH010001.MP4", b"fake-mp4-bytes", "video/mp4"))],
+        data={"camera_role": "instructor"},
+    )
+    assert r.status_code == 200, r.text
+    assert queue.calls.count(("media_ref", (job_id, "instructor"))) == 2
+    assert store.load(job_id).role_ingest["instructor"].dispatched is True
+
+
+def _run_ref_task(
+    monkeypatch: pytest.MonkeyPatch, store: JobStore, job_id: str, role: str
+) -> list[JobStatus]:
+    """Run ``process_media_ref_job`` with the render stubbed; return the status it ran at.
+
+    Everything after the render is a hand-off (callback, archive, posters, delivery) and
+    is stubbed out — the question here is only what the job REPORTS while the pass runs.
+    """
+    from api import selfie, tasks
+
+    seen: list[JobStatus] = []
+
+    def _pipeline(jid: str, r: str, **_kw: object) -> dict[str, str]:
+        seen.append(store.load(jid).status)
+        return {}
+
+    monkeypatch.setattr(tasks, "_store", lambda: store)
+    monkeypatch.setattr(selfie, "run_media_ref_pipeline", _pipeline)
+    for hook in (
+        "_render_previews", "_notify_skydiveos", "_archive_deliverables",
+        "_render_posters", "_maybe_auto_deliver",
+    ):
+        monkeypatch.setattr(tasks, hook, lambda *_a, **_kw: None)
+    tasks.process_media_ref_job(job_id, role)
+    return seen
+
+
+def test_a_ref_render_reports_processing_while_it_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`queued` for the length of a 20-minute render is indistinguishable from a dead
+    worker. Every other render task marks the job `processing` on entry; this one has to
+    as well, because the per-ref path writes its only other status at the very end."""
+    store = JobStore(tmp_path)
+    job = _mixed_job(store, tmp_path)
+    store.update(job.job_id, status=JobStatus.queued)
+
+    assert _run_ref_task(monkeypatch, store, job.job_id, "instructor") == [
+        JobStatus.processing
+    ]
+
+
+@pytest.mark.parametrize(
+    "settled", [JobStatus.ready, JobStatus.approved, JobStatus.delivered]
+)
+def test_a_late_second_camera_never_knocks_a_finished_job_backwards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, settled: JobStatus
+) -> None:
+    """A mixed job's spec card routinely lands after the PAID product was rendered,
+    reviewed and delivered. Reporting progress must not undo that — the same rule the S3
+    ingest path applies when it refuses to reset a multi-ref job's status."""
+    store = JobStore(tmp_path)
+    job = _mixed_job(store, tmp_path)
+    store.update(job.job_id, status=settled)
+
+    assert _run_ref_task(monkeypatch, store, job.job_id, "external") == [settled]
+
+
 def test_upload_to_a_mixed_job_requires_a_camera_role(client) -> None:
     """Without a role there is no way to tell which product the footage feeds — and
     therefore whether the resulting edit should be watermarked. Refuse."""
@@ -1313,7 +1525,11 @@ def test_mixed_page_poll_baseline_agrees_with_the_state_endpoint(client) -> None
     assert "720P PREVIEW" in page and "1080P · FULL QUALITY" in page
     assert state["locked"] is True
 
-    live = ("locked" if state["locked"] else "open") + "|" + ",".join(state["addons"])
+    live = (
+        ("locked" if state["locked"] else "open")
+        + "|" + ",".join(state["addons"])
+        + "|" + str(state["raw_pending"])
+    )
     assert _poll_baseline(page) == live
 
 
@@ -1330,7 +1546,7 @@ def test_wholly_owned_page_poll_baseline_is_open(client) -> None:
     state = client.get(f"/j/{token}/state").json()
 
     assert state["locked"] is False
-    assert _poll_baseline(page) == "open|"
+    assert _poll_baseline(page) == "open||0"
 
 
 # --------------------------------------------------------------------------- #

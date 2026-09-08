@@ -317,6 +317,29 @@ class DeliverablesResponse(BaseModel):
     deliverables: list[DeliverableInfo]
 
 
+
+class ReplaceDeliverableBody(BaseModel):
+    """Body for ``POST /jobs/{id}/deliverables/{name}/replace``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Key of the re-edited master, already in OUR delivery bucket (SkydiveOS
+    #: exports to ``media/…`` in the same bucket). Never a URL, never another bucket.
+    s3_key: str = Field(min_length=1, max_length=1024)
+
+
+class ReplaceDeliverableResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    name: str
+    #: Where the customer-facing copy now lives (``deliveries/{job}/{name}.mp4``).
+    s3_key: str
+    size: int
+    #: Other deliverables of this job that had never reached S3 and were uploaded
+    #: on the way (the late-render gap) — informational.
+    uploaded_missing: list[str]
+
 class PhotoInfo(BaseModel):
     """One still in a job's photo set, with the URL to fetch the full-res JPEG."""
 

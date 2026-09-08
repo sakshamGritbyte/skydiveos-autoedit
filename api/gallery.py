@@ -149,6 +149,8 @@ def render_gallery_html(
     photos_unlock_price: str | None = None,
     raw_videos: list[tuple[str, str]] | None = None,
     raw_unavailable: bool = False,
+    raw_play_urls: Mapping[str, str | None] | None = None,
+    raw_pending: int = 0,
     load_videos: list[tuple[str, str]] | None = None,
     purchased_addons: Sequence[str] = (),
     locked_videos: Sequence[str] = (),
@@ -198,6 +200,16 @@ def render_gallery_html(
       Renders the section heading with an honest "no longer available" note instead of
       silently dropping a section the customer paid for. Ignored when ``raw_videos``
       has entries; without a purchase the caller passes neither and nothing renders.
+    * ``raw_play_urls`` — ``{label: player URL}`` for a raw card whose PLAYER must differ
+      from its download: GoPro masters are HEVC, which most browsers cannot decode, so
+      the served route plays an H.264 web proxy (:mod:`api.rawproxy`) while the Download
+      button keeps the master — the bytes the customer bought. ``None`` as the value =
+      the proxy is still being made: the card says "preparing playback" (with the
+      download live) instead of a player that would show a black frame. A label with no
+      entry plays its own URL, exactly as before (the legacy callers).
+    * ``raw_pending`` — how many raw cards are in that preparing state; part of the
+      poll signature so the page reloads itself when the proxies land. Must equal
+      ``/j/{code}/state``'s ``raw_pending`` for the same request or the page loops.
     * ``posters`` — ``{deliverable or label: poster image URL}``. A card whose video has
       one opens on a real frame of that edit instead of the browser's generic
       placeholder tile (:mod:`api.thumbnail`); a card with no entry is rendered exactly
@@ -225,6 +237,7 @@ def render_gallery_html(
     if photos_unlocked is None:
         photos_unlocked = not locked
     raw_videos = raw_videos or []
+    raw_play_urls = raw_play_urls or {}
     load_videos = load_videos or []
     posters = posters or {}
     download_urls = download_urls or {}
@@ -427,7 +440,11 @@ def render_gallery_html(
     # page reloaded every 6 s, forever, the moment a spec camera's locked edit joined a
     # paid one (observed live 2026-08-13). ``locked or locked_set`` is any-locked here.
     poll_locked = bool(locked or locked_set)
-    init_sig = ("locked" if poll_locked else "open") + "|" + ",".join(sorted(purchased_addons))
+    init_sig = (
+        ("locked" if poll_locked else "open")
+        + "|" + ",".join(sorted(purchased_addons))
+        + "|" + str(int(raw_pending))
+    )
     flip_js = (
         "<script>(function(){var n=0;"
         f"var init='{{sig}}';"
@@ -435,7 +452,7 @@ def render_gallery_html(
         f"if(++n>{_FLIP_POLL_LIMIT}){{clearInterval(t);return;}}"
         f"fetch('/j/{{token}}/state',{{cache:'no-store'}}).then(function(r){{return r.json();}})"
         ".then(function(s){if(!s)return;"
-        "var sig=(s.locked?'locked':'open')+'|'+((s.addons||[]).join(','));"
+        "var sig=(s.locked?'locked':'open')+'|'+((s.addons||[]).join(','))+'|'+(s.raw_pending||0);"
         "if(sig!==init){clearInterval(t);location.reload();}})"
         "['catch'](function(){});"
         f"}},{_FLIP_POLL_MS});}})();</script>"
@@ -464,10 +481,23 @@ def render_gallery_html(
     # The purchased Raw Footage section: camera masters, always downloadable (the
     # customer bought exactly these bytes), badged as-filmed so they aren't mistaken
     # for the edit. Lives in the Video tab — one layout, one place for moving pictures.
+    # The PLAYER is the web proxy where the host made one (the master is HEVC — a
+    # `<video src=master>` parses the container and shows a black frame); the Download
+    # is always the master. A card whose proxy is still rendering gets a plain notice
+    # in the player's place rather than that black frame.
+    def raw_player(label: str, url: str) -> str:
+        play = raw_play_urls.get(label, url)
+        if play is None:
+            return (
+                '<div class="vprep">Preparing playback…<span>Your download is ready now; '
+                "the player appears here in a few minutes.</span></div>"
+            )
+        return f'<video controls preload="metadata" playsinline src="{e(play)}"></video>'
+
     raw_cards = "".join(
         f"""
         <div class="vcard"><div class="pbadge ok">RAW · AS FILMED</div>
-          <video controls preload="metadata" playsinline src="{e(url)}"></video>
+          {raw_player(label, url)}
           <div class="vlabel"><div class="titles">{e(label)}<span>Camera master</span></div>
           <a class="vdl" href="{e(url)}" download>Download</a></div>
         </div>"""
@@ -582,6 +612,8 @@ def render_gallery_html(
   }}
   .vcard:hover {{ border-color:var(--red-dim); transform:translateY(-2px); }}
   .vcard video {{ width:100%; display:block; background:#000; aspect-ratio:16/9; }}
+  .vprep {{ width:100%; aspect-ratio:16/9; background:#000; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; padding:0 24px; box-sizing:border-box; color:#f5f5f5; font-weight:700; font-size:15px; }}
+  .vprep span {{ display:block; margin-top:8px; color:#9a9a9a; font-weight:400; font-size:13px; }}
   .vlabel {{ padding:14px 16px 16px; display:flex; align-items:center; justify-content:space-between; gap:12px; }}
   .vlabel .titles {{ min-width:0; font-weight:700; font-size:14.5px; }}
   .vlabel span {{ display:block; font-weight:400; color:var(--gray); font-size:12.5px; margin-top:2px; }}

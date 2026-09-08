@@ -2000,3 +2000,57 @@ def test_unlock_stays_idempotent_and_keeps_the_first_reference(gated: TestClient
 
     assert second["paid_at"] == first["paid_at"]  # not re-stamped
     assert JobStore(gated.jobs_root).load(job_id).payment_reference == "clover_txn_9f21c7"
+
+
+# --------------------------------------------------------------------------- #
+# job.json is written atomically — a concurrent reader never sees a partial file
+# --------------------------------------------------------------------------- #
+
+
+def test_a_concurrent_reader_never_sees_a_half_written_job(tmp_path: Path) -> None:
+    """``job.json`` is read by other processes while it is being rewritten.
+
+    ``Path.write_text`` truncates and *then* writes, so the file is zero bytes for the
+    width of every write. A reader that lands in that window gets ``''`` and dies on
+    ``Invalid JSON: EOF while parsing a value at line 1 column 0`` — which failed
+    whichever task happened to be reading (observed in the dev worker 2026-09-08,
+    ``api.ingest_s3_job``). It is not a rare race: one jump's clips arrive as several
+    upload notifications, each enqueuing a task that stamps the same ``job.json``, and
+    ``JobStore.update`` is itself load-modify-save, so every writer is also a reader.
+    """
+    import threading
+
+    from api.jobs import Job
+
+    store = JobStore(tmp_path)
+    job_id = store.create(Job(job_id="j-atomic", customer_name="Priya")).job_id
+    errors: list[BaseException] = []
+    stop = threading.Event()
+
+    def _writer() -> None:
+        try:
+            for i in range(300):
+                store.update(job_id, customer_name=f"Priya {i}")
+        except BaseException as e:  # noqa: BLE001 - reported, not swallowed
+            errors.append(e)
+        finally:
+            stop.set()
+
+    def _reader() -> None:
+        try:
+            while not stop.is_set():
+                store.load(job_id)
+        except BaseException as e:  # noqa: BLE001 - reported, not swallowed
+            errors.append(e)
+
+    threads = [threading.Thread(target=_writer), *(
+        threading.Thread(target=_reader) for _ in range(4)
+    )]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    assert not errors, f"a reader saw a partially written job.json: {errors[0]!r}"
+    # And nothing was left behind by the temp-file-plus-rename.
+    assert [p.name for p in store.dir(job_id).glob(".job.json*")] == []

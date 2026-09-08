@@ -63,6 +63,48 @@ ADJUSTMENTS_FILENAME = "adjustments.jsonl"
 EMAIL_CLAIM_FILENAME = ".email_claimed"
 
 
+def _atomic_write_text(path: Path, payload: str) -> None:
+    """Replace ``path``'s contents in one step — never leaving it partially written.
+
+    ``Path.write_text`` opens with ``"w"``, which **truncates the file and then** writes
+    it, so for the width of that write the file is zero bytes on disk. Every reader here
+    is a different process (the API, N Celery workers), and readers are not rare:
+    :meth:`JobStore.update` is load-modify-save, so every write is also a read.
+
+    A reader that landed in that window got an empty string and blew up on it —
+    ``Invalid JSON: EOF while parsing a value at line 1 column 0`` — failing whichever
+    task read it (observed in the dev worker 2026-09-08, ``api.ingest_s3_job``). It is
+    hit routinely rather than rarely because ONE jump's clips arrive as SEVERAL
+    ``POST /jobs/{id}/upload`` notifications: each enqueues its own ``ingest_s3_job``,
+    and every one of them stamps ``role_ingest``/``last_raw_clip_at`` on the same
+    ``job.json``.
+
+    So the payload is written to a temp file and renamed over the target. ``os.replace``
+    is atomic on POSIX and Windows, so a concurrent reader observes either the previous
+    complete file or this one, never a partial. The temp file is created in the SAME
+    directory because a rename is only atomic within one filesystem, and is named per
+    (pid, thread) so two concurrent writers don't scribble on each other's. A crash
+    between create and rename leaves a stray ``.job.json.*.tmp``, which nothing reads —
+    the glob in :meth:`JobStore.list_jobs` matches ``job.json`` exactly.
+
+    This makes a torn READ impossible. It does **not** make read-modify-write safe: two
+    writers still lose one of the two updates, which is why
+    :meth:`JobStore.claim_email_send` arbitrates with an ``O_EXCL`` file rather than a
+    field. A lost field is a bug; a torn read was a crash.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with tmp.open("w") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 class Package(StrEnum):
     """The product a jump was booked under (drives which pipeline runs).
 
@@ -876,8 +918,7 @@ class JobStore:
     def write_booking(self, job_id: str, booking: dict[str, object]) -> Path:
         """Persist the booking sidecar the selfie pipeline reads back."""
         path = self.booking_path(job_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(booking, indent=2) + "\n")
+        _atomic_write_text(path, json.dumps(booking, indent=2) + "\n")
         return path
 
     def final_path(self, job_id: str) -> Path:
@@ -1218,6 +1259,4 @@ class JobStore:
         return path
 
     def _write(self, job: Job) -> None:
-        path = self._path(job.job_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(job.model_dump_json(indent=2) + "\n")
+        _atomic_write_text(self._path(job.job_id), job.model_dump_json(indent=2) + "\n")

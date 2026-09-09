@@ -1633,3 +1633,60 @@ def test_the_watchdog_is_a_no_op_for_a_job_that_vanished(
 
     monkeypatch.setattr(tasks, "_store", lambda: store)
     assert tasks.mixed_ref_wait_job("gone") == "gone"
+
+
+# --------------------------------------------------------------------------- #
+# CUSTOMER_EMAIL_SENDER=skydiveos (BUG 392 — one customer email, not two)
+# --------------------------------------------------------------------------- #
+
+
+def test_delegated_sender_sends_nothing_and_still_reports_the_customer_reachable(
+    store: JobStore,
+) -> None:
+    """BUG 392: with SkydiveOS sending its branded email from the ``delivered``
+    callback, this service's plain-text copy was a second email to the same
+    customer for the same jump. Delegated, ``send_gallery_email_once`` must touch
+    no SMTP, stamp nothing (``email_sent_at`` means *this service* emailed them),
+    hold no claim (flipping back must still send), and yet answer True — the
+    status callback carries the gallery URL, so the customer IS reachable and the
+    job must not fail as undeliverable.
+    """
+    from api.delivery import send_gallery_email_once
+
+    job = _job(store, customer_email="jane@example.com")
+    smtp = FakeSMTP()
+
+    reachable = send_gallery_email_once(
+        job, store, "https://gallery.test/j/abc",
+        _settings(customer_email_sender="skydiveos"),
+        smtp_factory=lambda: smtp,  # type: ignore[arg-type,return-value]
+    )
+
+    assert reachable is True
+    assert smtp.sent == []
+    assert store.load(job.job_id).email_sent_at is None
+    assert store.claim_email_send(job.job_id) is True  # nothing was claimed
+
+
+def test_delegated_sender_delivery_still_uploads_and_returns_links(store: JobStore) -> None:
+    """The whole delivery still happens — S3 upload, presigned links, the callback's
+    inputs — only the email leg is SkydiveOS's. Both the default (``pipeline``)
+    and the delegated value are exercised so the flag is the ONLY difference."""
+    smtp_delegated = FakeSMTP()
+    delegated = deliver_to_customer(
+        _rendered_job(store, customer_email="jane@example.com"), store,
+        _settings(customer_email_sender="skydiveos", skydiveos_api_base="http://skydiveos.test"),
+        s3_client=FakeS3(), smtp_factory=lambda: smtp_delegated,  # type: ignore[arg-type,return-value]
+    )
+    assert delegated  # links were produced
+    assert smtp_delegated.sent == []
+
+    store2 = JobStore(store.root / "second")
+    smtp_pipeline = FakeSMTP()
+    own = deliver_to_customer(
+        _rendered_job(store2, customer_email="jane@example.com"), store2,
+        _settings(customer_email_sender="pipeline", skydiveos_api_base="http://skydiveos.test"),
+        s3_client=FakeS3(), smtp_factory=lambda: smtp_pipeline,  # type: ignore[arg-type,return-value]
+    )
+    assert set(own) == set(delegated)
+    assert len(smtp_pipeline.sent) == 1  # the legacy behaviour, unchanged

@@ -618,6 +618,14 @@ Two runtime media roots, with different audiences:
   stays distinguishable from a real failure and exits 0 instead of mailing an error),
   and discards output (everything is timestamped into `logs/prune-jobs.log` with the
   disk's before/after). Run the wrapper by hand with `--dry-run` first
+- `bash deploy/ec2/customer-email-sender.sh audit | set skydiveos|pipeline` — on the media
+  EC2, audit or flip `CUSTOMER_EMAIL_SENDER` across EVERY auto-edit stack (`STACKS=` to
+  narrow). The flag is a per-stack `.env` value read once at process start, so `set`
+  edits each stack's own `.env` and runs `docker compose up -d` (a `restart` does NOT
+  re-read `env_file`). The audit proves the gate is live per stack: HEAD contains
+  `7986199`, the RUNNING worker image has the gate, `printenv` in api+worker matches the
+  file, and the effect — "customer email delegated to SkydiveOS" in the worker log and no
+  `email_sent_at` on jobs delivered after the flip. Exits non-zero on any `!!` line
 - `python scripts/restamp_footage.py --at <local-time> --out-dir <dir> <masters…>` —
   write re-stamped COPIES of GoPro masters so an old card can be demoed against a load
   manifested for today (prefer manifesting the load for the footage's real date — then

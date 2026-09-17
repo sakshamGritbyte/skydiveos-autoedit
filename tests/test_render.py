@@ -282,3 +282,36 @@ def test_process_jump_end_to_end(templates: Path, tmp_path: Path) -> None:
     assert (stream["width"], stream["height"]) == (OUT_WIDTH, OUT_HEIGHT)
     num, den = stream["r_frame_rate"].split("/")
     assert int(num) / int(den) == pytest.approx(OUT_FPS)
+
+
+# --------------------------------------------------------------------------- #
+# The VBV cap (Bug 373) — one authority, three encoders.
+# --------------------------------------------------------------------------- #
+
+def test_deliverable_encode_carries_the_vbv_cap(edl: EditDecisionList) -> None:
+    """CRF alone has no ceiling; the cap is what keeps high-motion freefall streamable."""
+    from render.render import MAXRATE, VBV_BUFSIZE, _build_command
+
+    g = build_filtergraph(edl, "src.mp4", has_audio=False, music_path=None)
+    cmd = _build_command(g, Path("out.mp4"), preset="veryfast", crf=23)
+    assert cmd[cmd.index("-maxrate") + 1] == MAXRATE
+    assert cmd[cmd.index("-bufsize") + 1] == VBV_BUFSIZE
+    # The quality TARGET is untouched — the cap clamps peaks, it does not lower CRF.
+    assert cmd[cmd.index("-crf") + 1] == "23"
+    assert "+faststart" in cmd
+
+
+def test_vbv_cap_is_imported_not_repeated() -> None:
+    """A re-calibration must be one edit: the other encoders import the numbers.
+
+    Three literal copies of the cap is how the 2026-09-01 cut half-landed — the raw
+    proxy had none at all. Source-pinned because the selfie encode is inline in a
+    3000-line module with no seam to call it through.
+    """
+    from render.render import MAXRATE, VBV_BUFSIZE
+
+    for rel in ("api/selfie.py", "api/rawproxy.py"):
+        src = (REPO_ROOT / rel).read_text()
+        assert "from render.render import" in src, rel
+        for literal in (f'"{MAXRATE}"', f'"{VBV_BUFSIZE}"', '"12M"', '"24M"'):
+            assert literal not in src, f"{rel} hardcodes {literal}; import render.render's cap"

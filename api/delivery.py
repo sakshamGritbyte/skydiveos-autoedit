@@ -46,6 +46,25 @@ logger = logging.getLogger(__name__)
 #: Distinct from ``raw/`` (ingest masters) so bucket lifecycle rules can differ.
 DELIVERY_KEY_PREFIX = "deliveries"
 
+#: ``Cache-Control`` stamped on every delivery object at upload (Bug 373).
+#:
+#: Delivered files are effectively write-once — a key's bytes change only when the job
+#: is re-rendered and re-delivered — so downstream caches (CloudFront's edge, the
+#: viewer's browser) may hold them for a day without revalidating. Deliberately NOT
+#: ``immutable``/1-year: an instructor tweak DOES overwrite the same key, and a
+#: day-stale edit is tolerable where a year-stale one is not (the CDN's ``?v=``
+#: cache-key param busts the edge copy sooner — :mod:`api.cdn`).
+#:
+#: ``public`` grants shared caches permission to STORE; it grants nobody permission to
+#: FETCH. Access control is the CloudFront signed URL / presigned URL, never this
+#: header — the object itself stays unreadable without one.
+#:
+#: The ONE authority on the string, because
+#: ``scripts/backfill_delivery_cache_headers.py`` has to write byte-identically to what
+#: this module uploads: a backfill that wrote a different lifetime would make an old
+#: gallery behave differently from a new one.
+DELIVERY_CACHE_CONTROL = "public, max-age=86400"
+
 #: Human labels for the email body, keyed by deliverable name.
 _LABELS = {
     "final": "Your skydive edit",
@@ -209,21 +228,15 @@ def upload_and_link(
     for name, path in files.items():
         key = delivery_s3_key(job_id, path.name)
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        # Delivered files are effectively write-once — a key's bytes change only when
-        # the job is re-rendered and re-delivered — so downstream caches (CloudFront's
-        # edge, the viewer's browser) may hold them for a day without revalidating.
-        # Deliberately NOT `immutable`/1-year: an instructor tweak DOES overwrite the
-        # same key, and a day-stale edit is tolerable where a year-stale one is not
-        # (the CDN's `?v=` cache-key param busts the edge copy sooner — api.cdn).
-        # "public" grants shared caches permission to store; ACCESS control is the
-        # CloudFront signed URL / presigned URL, never this header.
         client.upload_file(
             str(path),
             settings.s3_bucket,
             key,
             ExtraArgs={
                 "ContentType": content_type,
-                "CacheControl": "public, max-age=86400",
+                # See DELIVERY_CACHE_CONTROL: this is what lets an edge and a browser
+                # keep the bytes instead of re-fetching the whole MP4 per playback.
+                "CacheControl": DELIVERY_CACHE_CONTROL,
             },
         )
         if presign is True or (allowed is not None and name in allowed):
@@ -247,7 +260,17 @@ def _upload_photos_individually(
     urls: list[str] = []
     for p in sorted(photos_dir.glob("*.jpg")):
         key = delivery_s3_key(job_id, f"photos/{p.name}")
-        client.upload_file(str(p), settings.s3_bucket, key, ExtraArgs={"ContentType": "image/jpeg"})
+        # Same write-once reasoning as the videos: the photo grid re-fetches every tile
+        # on every page view, so an unstamped still is a full re-download per reload.
+        client.upload_file(
+            str(p),
+            settings.s3_bucket,
+            key,
+            ExtraArgs={
+                "ContentType": "image/jpeg",
+                "CacheControl": DELIVERY_CACHE_CONTROL,
+            },
+        )
         urls.append(
             client.generate_presigned_url(
                 "get_object", Params={"Bucket": settings.s3_bucket, "Key": key}, ExpiresIn=ttl

@@ -43,13 +43,25 @@ FINAL_FILENAME = "final.mp4"
 # call (tests drop to ``ultrafast``).
 DEFAULT_PRESET = "veryfast"
 DEFAULT_CRF = 23
-# VBV cap (Bug 373): CRF alone has no bitrate ceiling, and high-motion freefall
-# measured ~19 Mbit/s at 1080p — playback then stalls on any link that can't sustain
-# ~20 Mbit/s, CDN or not. 12 Mbit/s stays well above streaming-service 1080p ladders,
-# so quality is untouched on normal scenes; only the spikes are clamped. Mirrored in
-# api/selfie.py's deliverable encode.
-MAXRATE = "12M"
-VBV_BUFSIZE = "24M"
+# VBV cap (Bug 373). CRF alone has no bitrate ceiling, so high-motion freefall spends
+# whatever it likes: an uncapped 1080p render measured ~19 Mbit/s, and playback then
+# stalls on any link that cannot sustain ~20 Mbit/s, CDN or not.
+#
+# Re-measured on a real delivered render (2026-09-09): even WITH a 12M cap, whole files
+# came off at 8.3-9.5 Mbit/s and a 20 s high-motion excerpt at 11.3 — i.e. 12M was
+# barely binding, and we were shipping roughly twice a streaming service's 1080p. At 8M
+# the same excerpt encodes to 8.2 Mbit/s for a 0.17 dB PSNR / 0.0009 SSIM difference,
+# because CRF (the quality target) is untouched and only the peaks are clamped harder.
+# 8 Mbit/s is still above YouTube's recommended 1080p30 rate; it roughly halves what a
+# far-away viewer's link has to sustain, and halves the download the gallery's primary
+# button starts.
+#
+# THE ONE AUTHORITY on the cap: ``api.selfie`` (the selfie/ultimum deliverable encode)
+# and ``api.rawproxy`` (the purchased raw master's web proxy) import these rather than
+# repeating the numbers, so a re-calibration is one edit and cannot half-land.
+# Pre-existing renders keep their bitrate until they are re-rendered.
+MAXRATE = "8M"
+VBV_BUFSIZE = "16M"
 AUDIO_BITRATE = "192k"
 DEFAULT_TIMEOUT_S = 600
 

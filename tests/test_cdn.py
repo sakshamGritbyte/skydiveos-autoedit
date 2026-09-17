@@ -266,3 +266,150 @@ def test_gallery_page_separates_player_and_download_urls(gallery) -> None:
     assert f'src="/j/{token}/media/full_video"' in html
     # …while every Download anchor carries the dl=1 attachment variant.
     assert f'href="/j/{token}/media/full_video?dl=1" download' in html
+
+
+# ---------------------------------------------------------------------------
+# Cache-Control — the half of Bug 373 that works with NO CDN configured
+#
+# The CDN redirect only covers a delivered, UNLOCKED video. Everything else the
+# gallery streams still leaves this process — an undelivered render, a purchased raw
+# master and its proxy, the load video, the photo stills, and (on a stack with no
+# CDN_BASE_URL, which is every stack until it is configured) the delivered videos too.
+# Starlette sends etag/last-modified but no lifetime, so without these headers a
+# replay re-fetches: "the video reloads every time I play it", exactly as reported.
+#
+# The rule: `private` (never `public` — the gallery's short code is the only
+# credential, so no shared cache may store the response), long for what the customer
+# owns, 60s for what is still behind the paywall so an unlock is visible at once.
+# ---------------------------------------------------------------------------
+
+
+def test_owned_video_is_browser_cacheable_for_a_day(gallery) -> None:
+    """No CDN configured → the local stream still carries a lifetime."""
+    client, store, token = gallery
+    resp = client.get(f"/j/{token}/media/full_video", follow_redirects=False)
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "private, max-age=86400"
+    # Never `public`: a proxy that cached this would serve one customer's jump to the
+    # next request for the same URL.
+    assert "public" not in resp.headers["cache-control"]
+
+
+def test_download_click_is_cacheable_too(gallery) -> None:
+    client, store, token = gallery
+    resp = client.get(f"/j/{token}/media/full_video?dl=1", follow_redirects=False)
+    assert resp.status_code == 200
+    assert "attachment" in resp.headers["content-disposition"]
+    assert resp.headers["cache-control"] == "private, max-age=86400"
+
+
+def test_locked_preview_is_only_briefly_cacheable(gallery) -> None:
+    """A watermark must not outlive the payment that removes it."""
+    client, store, token = gallery
+    store.update("jj", entitlement=Entitlement.preview_only)
+    (store.dir("jj") / "preview_full_video.mp4").write_bytes(b"WATERMARKED")
+    resp = client.get(f"/j/{token}/media/full_video", follow_redirects=False)
+    assert resp.status_code == 200
+    assert resp.content == b"WATERMARKED"
+    # 60s, the poster route's rule: the clean master is served at THIS SAME URL once
+    # /unlock lands, so a day-long lifetime would keep showing the watermark to a
+    # customer who has paid.
+    assert resp.headers["cache-control"] == "private, max-age=60"
+
+
+def test_raw_player_is_inline_and_cacheable(gallery) -> None:
+    """The raw card's player URL is a <video src>, not a download."""
+    client, store, token = gallery
+    store.update("jj", addons={"raw": "ref"})
+    web = store.dir("jj") / "raw-web"
+    web.mkdir(parents=True, exist_ok=True)
+    (web / "GX010052.mp4").write_bytes(b"PROXY")
+    resp = client.get(f"/j/{token}/raw-web/GX010052.mp4", follow_redirects=False)
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "private, max-age=86400"
+    # `filename=` would send `Content-Disposition: attachment` on a player source —
+    # the same mistake public_media documents at length.
+    assert "attachment" not in resp.headers.get("content-disposition", "")
+
+
+def test_raw_master_download_stays_an_attachment(gallery) -> None:
+    """The Download button keeps saving the file; it just stops re-fetching it."""
+    client, store, token = gallery
+    store.update("jj", addons={"raw": "ref"})
+    raw = store.dir("jj") / "raw"
+    raw.mkdir(parents=True, exist_ok=True)
+    (raw / "GX010052.mp4").write_bytes(b"MASTER")
+    resp = client.get(f"/j/{token}/raw/GX010052.mp4", follow_redirects=False)
+    assert resp.status_code == 200
+    assert "attachment" in resp.headers["content-disposition"]
+    assert resp.headers["cache-control"] == "private, max-age=86400"
+
+
+def test_unpurchased_raw_is_still_404_not_a_cached_anything(gallery) -> None:
+    """Caching changed no access rule: without the add-on every raw path 404s."""
+    client, store, token = gallery
+    raw = store.dir("jj") / "raw"
+    raw.mkdir(parents=True, exist_ok=True)
+    (raw / "GX010052.mp4").write_bytes(b"MASTER")
+    assert client.get(f"/j/{token}/raw/GX010052.mp4").status_code == 404
+    assert client.get(f"/j/{token}/raw-web/GX010052.mp4").status_code == 404
+
+
+def test_cdn_redirect_still_wins_over_the_local_cache_header(cdn_env: object, gallery) -> None:
+    """With the CDN on, the 302 (and its own small lifetime) is unchanged."""
+    client, store, token = gallery
+    resp = client.get(f"/j/{token}/media/full_video", follow_redirects=False)
+    assert resp.status_code == 302
+    assert resp.headers["cache-control"] == "private, max-age=300"
+
+
+# ---------------------------------------------------------------------------
+# The S3 side: one string, shared by the uploader and the backfill script
+# ---------------------------------------------------------------------------
+
+
+def test_uploads_stamp_the_shared_cache_control(tmp_path: Path) -> None:
+    from api.delivery import DELIVERY_CACHE_CONTROL, upload_and_link
+
+    # Reuse the delivery suite's fully-populated Settings builder rather than a
+    # half-constructed one: upload_and_link reads several fields, and a model_construct
+    # fake fails on whichever one it reads next.
+    from tests.test_delivery import _settings
+
+    recorded: list[dict] = []
+
+    class FakeS3:
+        def upload_file(self, path: str, bucket: str, key: str, ExtraArgs: dict) -> None:  # noqa: N803
+            recorded.append({"key": key, **ExtraArgs})
+
+        def generate_presigned_url(self, op: str, Params: dict, ExpiresIn: int) -> str:  # noqa: N803
+            return "https://s3.test/x"
+
+    f = tmp_path / "full_video.mp4"
+    f.write_bytes(b"x")
+    upload_and_link(
+        {"full_video": f}, job_id="jj", settings=_settings(), s3_client=FakeS3()
+    )
+
+    assert recorded and recorded[0]["CacheControl"] == DELIVERY_CACHE_CONTROL
+    # `public` is deliberate HERE and only here: CloudFront is a shared cache and must be
+    # allowed to STORE the object. Permission to store is not permission to fetch — the
+    # signed URL is the access control, and the bucket itself stays private.
+    assert recorded[0]["CacheControl"].startswith("public,")
+
+
+def test_backfill_only_touches_media_and_is_idempotent() -> None:
+    from api.delivery import DELIVERY_CACHE_CONTROL
+    from scripts.backfill_delivery_cache_headers import _cacheable, needs_stamp
+
+    assert _cacheable("deliveries/j/full_video.mp4")
+    assert _cacheable("deliveries/j/photos/boarding_1.jpg")
+    assert _cacheable("deliveries/j/photos.zip")
+    # A page bakes its lock state in at delivery, so it must not be cached for a day;
+    # the usage manifest is an internal file nothing streams.
+    assert not _cacheable("deliveries/j/gallery.html")
+    assert not _cacheable("deliveries/j/source_usage.json")
+
+    assert needs_stamp({})  # pre-fix object: no lifetime at all
+    assert needs_stamp({"CacheControl": "max-age=60"})  # a DIFFERENT lifetime is corrected
+    assert not needs_stamp({"CacheControl": DELIVERY_CACHE_CONTROL})  # second run: no-op

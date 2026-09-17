@@ -43,6 +43,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from analysis.proxy import analysis_source
 from edl.storage import job_dir
 from edl.validate import validate_and_repair
+from render.render import MAXRATE as _MAXRATE
+from render.render import VBV_BUFSIZE as _VBV_BUFSIZE
 
 from .source_usage import write_source_usage
 
@@ -2361,13 +2363,13 @@ def render_selfie_video(
             # keeps the same CRF quality at roughly a quarter of the bitrate for a
             # modest encode-time cost.
             #
-            # The VBV cap (maxrate/bufsize, Bug 373): CRF alone has no ceiling, and
-            # high-motion freefall measured ~19 Mbit/s at 1080p — playback then stalls
-            # on any link that can't sustain ~20 Mbit/s, CDN or not. 12 Mbit/s is still
-            # well above streaming-service 1080p ladders, so quality is untouched on
-            # normal scenes; only the spikes are clamped.
+            # The VBV cap (maxrate/bufsize, Bug 373) comes from render.render, which
+            # owns the calibration and the reasoning: CRF alone has no ceiling, so a
+            # high-motion freefall would spend ~19 Mbit/s and stall a viewer whose link
+            # cannot sustain it. Imported, never repeated — three copies of a number is
+            # how a re-calibration half-lands.
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-maxrate", "12M", "-bufsize", "24M",
+            "-maxrate", _MAXRATE, "-bufsize", _VBV_BUFSIZE,
             "-pix_fmt", "yuv420p", "-r", str(fps),
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart", "-t", f"{total:.3f}", str(out),

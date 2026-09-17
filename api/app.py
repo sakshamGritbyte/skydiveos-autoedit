@@ -262,6 +262,33 @@ def _served_under(path: Path, root: Path) -> bool:
         return False
 
 
+#: ``Cache-Control`` for a customer's OWN media served by this API (Bug 373).
+#:
+#: The CDN redirect handles a *delivered, unlocked* video, but every other public media
+#: byte still leaves this process: an undelivered render, a purchased raw master and its
+#: web proxy, the load video, the photo stills — and, on a deployment with no
+#: ``CDN_BASE_URL`` configured, the delivered videos too. Starlette sends ``etag`` and
+#: ``last-modified`` but no lifetime, and without one a browser revalidates (or re-fetches
+#: outright) on every play, replay and reload. That is the reported symptom — "the videos
+#: appear to reload every time" — for exactly the paths the CDN does not cover.
+#:
+#: ``private``, not ``public``: unlike the S3 objects behind CloudFront (see
+#: ``api.delivery.DELIVERY_CACHE_CONTROL``), these responses are served straight to the
+#: viewer with the gallery's short code as their only credential, so no shared or proxy
+#: cache may store them. The viewer's own browser may — which is the whole point, and
+#: costs nothing in access control.
+MEDIA_CACHE_OWNED = "private, max-age=86400"
+
+#: ``Cache-Control`` for media the customer has NOT paid for yet.
+#:
+#: A locked deliverable's watermarked preview and a locked still are served at the SAME
+#: URL the clean file will be served at once ``/unlock`` lands — so a long lifetime would
+#: keep showing a watermark to somebody who just paid. Sixty seconds, matching the poster
+#: route's rule, is long enough to spare a re-fetch while scrubbing and short enough that
+#: an unlock appears immediately.
+MEDIA_CACHE_LOCKED = "private, max-age=60"
+
+
 #: Gallery upsell items ``POST /jobs/{id}/unlock`` can record besides the paywall
 #: ``unlock`` itself. Must stay in step with SkydiveOS's priced item keys — and, like
 #: SkydiveOS's ``NON_PURCHASABLE_ITEMS``, ``rebook`` is a promo and deliberately absent.
@@ -2530,12 +2557,16 @@ def create_app() -> FastAPI:
                         status_code=302,
                         headers={"Cache-Control": "private, max-age=300"},
                     )
+        cache = MEDIA_CACHE_LOCKED if locked else MEDIA_CACHE_OWNED
         if path.exists() and _served_under(path, job_dir):
             if dl and not locked:
                 # The Download button: an explicit attachment, so the click saves the
                 # file no matter where it was routed from.
                 return FileResponse(
-                    path, media_type="video/mp4", filename=f"{name}.mp4"
+                    path,
+                    media_type="video/mp4",
+                    filename=f"{name}.mp4",
+                    headers={"Cache-Control": cache},
                 )
             # INLINE, deliberately. ``filename=`` would make Starlette send
             # ``Content-Disposition: attachment``, and this route is a **player** source:
@@ -2546,7 +2577,12 @@ def create_app() -> FastAPI:
             # watermarked preview as a file to keep, on a player the design deliberately
             # marks ``nodownload``.
             return FileResponse(
-                path, media_type="video/mp4", content_disposition_type="inline"
+                path,
+                media_type="video/mp4",
+                content_disposition_type="inline",
+                # A replay must reuse the bytes it already has (Bug 373). Short-lived
+                # while locked, so an unlock swaps the watermark out at once.
+                headers={"Cache-Control": cache},
             )
         # Disk-retention fallback (scripts/prune_jobs.py): a pruned clean master is
         # still in S3 under deliveries/, so the never-expiring gallery link keeps
@@ -2639,8 +2675,20 @@ def create_app() -> FastAPI:
             if preview is None:
                 raise HTTPException(status_code=404, detail="photo preview unavailable")
             # Inline and unnamed: a locked preview is a look, not a file to keep.
-            return FileResponse(preview, media_type="image/jpeg")
-        return FileResponse(path, media_type="image/jpeg", filename=filename)
+            return FileResponse(
+                preview,
+                media_type="image/jpeg",
+                headers={"Cache-Control": MEDIA_CACHE_LOCKED},
+            )
+        return FileResponse(
+            path,
+            media_type="image/jpeg",
+            filename=filename,
+            # The grid re-requests every tile on each page view (and the flip-poll
+            # reloads the page): without a lifetime, a 40-still set is re-downloaded
+            # in full every time (Bug 373).
+            headers={"Cache-Control": MEDIA_CACHE_OWNED},
+        )
 
     @app.get("/j/{token}/load/{name}", include_in_schema=False, response_class=FileResponse)
     def public_load_video(token: str, name: str, store: StoreDep) -> FileResponse:
@@ -2668,7 +2716,16 @@ def create_app() -> FastAPI:
         path = master_dir / f"{name}.mp4"
         if not path.is_file() or not _served_under(path, master_dir):
             raise HTTPException(status_code=404, detail="load video not found")
-        return FileResponse(path, media_type="video/mp4", filename=f"{name}.mp4")
+        # INLINE and cacheable, for ``public_media``'s two reasons: this URL is the
+        # load-video card's ``<video src>``, and ``filename=`` would make Starlette send
+        # ``Content-Disposition: attachment`` on a player source; and a replay must reuse
+        # the bytes rather than re-stream the whole cut through this process (Bug 373).
+        return FileResponse(
+            path,
+            media_type="video/mp4",
+            content_disposition_type="inline",
+            headers={"Cache-Control": MEDIA_CACHE_OWNED},
+        )
 
     @app.get("/j/{token}/raw/{name:path}", include_in_schema=False, response_class=FileResponse)
     def public_raw(token: str, name: str, store: StoreDep) -> FileResponse:
@@ -2690,7 +2747,15 @@ def create_app() -> FastAPI:
         path = raw_dir.joinpath(*parts)
         if not path.is_file() or path.suffix.lower() != ".mp4" or not _served_under(path, raw_dir):
             raise HTTPException(status_code=404, detail="raw clip not found")
-        return FileResponse(path, media_type="video/mp4", filename=path.name)
+        # An attachment, deliberately: this URL is the Raw Footage card's *Download*
+        # (the player uses the ``raw-web`` proxy below). A resumed or repeated download
+        # of a multi-GB master should not re-fetch what the browser still holds.
+        return FileResponse(
+            path,
+            media_type="video/mp4",
+            filename=path.name,
+            headers={"Cache-Control": MEDIA_CACHE_OWNED},
+        )
 
     @app.get("/j/{token}/raw-web/{name:path}", include_in_schema=False, response_class=FileResponse)
     def public_raw_web(token: str, name: str, store: StoreDep) -> FileResponse:
@@ -2717,7 +2782,15 @@ def create_app() -> FastAPI:
             or not _served_under(path, web_dir)
         ):
             raise HTTPException(status_code=404, detail="raw clip proxy not found")
-        return FileResponse(path, media_type="video/mp4", filename=path.name)
+        # INLINE and cacheable: the proxy exists precisely to be PLAYED in the card
+        # (``filename=`` would send an attachment disposition on a player source), and
+        # a purchased master's proxy never changes, so a replay should cost nothing.
+        return FileResponse(
+            path,
+            media_type="video/mp4",
+            content_disposition_type="inline",
+            headers={"Cache-Control": MEDIA_CACHE_OWNED},
+        )
 
     # ----------------------------------------------------------------------- #
     # Per-deliverable music: upload a backing track per video deliverable BEFORE

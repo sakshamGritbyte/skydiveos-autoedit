@@ -33,6 +33,26 @@ Everything in this repo degrades safely: with the env vars unset (or the key
 unreadable), behaviour is byte-identical to before. **The AWS resources below must be
 created manually — nothing in this repository deploys them.**
 
+### The half that works with NO CDN
+
+The CDN redirect only covers a **delivered, unlocked video**. Every other public media
+byte still leaves the API process — an undelivered render, a purchased raw master and
+its web proxy, the load video, the photo stills, and, on any stack where `CDN_BASE_URL`
+is unset, the delivered videos too. Starlette sends `etag`/`last-modified` but no
+lifetime, and without one a browser revalidates (or re-fetches outright) on every play.
+So the served routes now carry `Cache-Control` of their own (`api/app.py`):
+
+| What | Header | Why |
+|---|---|---|
+| A video/still/raw proxy the customer OWNS | `private, max-age=86400` | A replay reuses bytes it already has |
+| A locked deliverable's watermarked preview, a locked still | `private, max-age=60` | The clean file is served at the SAME URL after `/unlock` — a watermark must not outlive the payment |
+| The CDN redirect itself | `private, max-age=300` | Spares a round-trip per range request |
+
+`private`, never `public`: unlike the S3 objects behind CloudFront, these responses go
+straight to the viewer with the gallery's short code as their only credential, so no
+shared or proxy cache may store them. Access control is unchanged — the raw routes still
+404 without the add-on, and a locked deliverable still serves only its preview.
+
 ## 1. What to create in AWS
 
 All of this fronts the existing delivery bucket (`$S3_BUCKET`), touching only the
@@ -120,6 +140,30 @@ they can share one distribution and key pair if they share the delivery bucket.
 
 ## 3. Verify
 
+**One command, five isolated steps** — run it on the box that serves the galleries,
+with the deployment's env loaded. It says which link in the chain is broken instead of
+leaving you to infer it from a missing header:
+
+```bash
+cd /opt/skydiveos-autoedit && set -a && . ./.env && set +a && \
+    .venv/bin/python scripts/cdn_healthcheck.py
+```
+
+It checks, in order: the three settings + that the PEM loads into a signer; the S3
+object (reporting its `Cache-Control` and average bitrate); that two signed URLs minted
+a second apart are **byte-identical** (the determinism that makes a replay cheap); that
+the edge answers a range request `206` and reports `X-Cache: Hit` on a repeat; and that
+the same URL **without** its signature is refused `403`. It fetches one kilobyte and
+writes nothing. With no `--job` it picks the newest delivered job, which is the one a
+customer is most likely watching.
+
+This matters because the code degrades *silently* by design: an unconfigured stack
+behaves exactly like a configured one from the outside, minus the header nobody reads.
+`[FAIL] config: CDN delivery is OFF` is the answer to "did we ever actually turn this
+on here?".
+
+The manual equivalents, if you want to see the raw exchange:
+
 ```bash
 # 1. A delivered, unlocked job's player URL redirects to the CDN with a signature:
 curl -sI "https://<PUBLIC_BASE_URL>/j/<code>/media/full_video" | grep -i '^location'
@@ -142,7 +186,37 @@ curl -sI 'https://media.../deliveries/<job>/full_video.mp4'   # → 403 MissingK
 attachment — a cross-origin redirect would make browsers ignore the `download`
 attribute and play the file instead of saving it.
 
-## 4. Operational notes
+## 4. Backfill the objects that predate the fix
+
+`api/delivery.py` stamps `Cache-Control: public, max-age=86400`
+(`DELIVERY_CACHE_CONTROL`) on everything it uploads, but an object already in the
+bucket keeps the metadata it was written with — and a gallery link never expires, so
+the galleries most likely to be replayed are exactly the ones written before the fix.
+Measured on this account 2026-09-09: **34 of 49 sampled delivery MP4s carried no
+`Cache-Control` at all**, across all three media buckets.
+
+With no lifetime on the object, CloudFront still caches it (the distribution's cache
+policy has its own default TTL), but the **viewer's browser is told nothing** and
+revalidates — or re-fetches the whole MP4 — on every play. That is the reported symptom,
+and on a pre-fix object it survives the CDN.
+
+```bash
+# Dry-run is the DEFAULT: it lists what would change and writes nothing.
+.venv/bin/python scripts/backfill_delivery_cache_headers.py
+.venv/bin/python scripts/backfill_delivery_cache_headers.py --apply
+
+# Other tenants' buckets (repeatable; each stack has its own):
+.venv/bin/python scripts/backfill_delivery_cache_headers.py \
+    --bucket skydiveos-northshore-media --bucket skydiveos-southshore-media --apply
+```
+
+It is a **metadata-only** `CopyObject` onto the same key: the bytes, key, content type
+and storage class are preserved, nothing is deleted or re-encoded, and a second run
+finds nothing to do. `gallery.html` and `source_usage.json` are deliberately skipped —
+a page bakes its lock state in at delivery, so a day of browser caching there could show
+a stale paywall.
+
+## 5. Operational notes
 
 * **Re-delivered jobs**: the signed `?v=` param (local render mtime) changes on a
   re-render, so players fetch the fresh edit without an invalidation. If you must
@@ -158,8 +232,31 @@ attribute and play the file instead of saving it.
   previews and photo previews (local-only, the paywall product), photos, posters, raw
   masters, load videos, the legacy S3 `gallery.html` path, and the presigned links in
   delivery emails / SkydiveOS callbacks.
-* **HLS/adaptive bitrate** is *not* part of this fix. Progressive MP4 (`+faststart`,
-  already in place) + edge caching + range requests covers the reported failure; an
-  HLS ladder (1080/720/480) would add a per-job packaging step, ~1.6× storage, and a
-  player library on the gallery page. Revisit only if far-from-edge viewers on slow
-  links still stall *after* CloudFront is live.
+* **Encode bitrate** (Bug 373 item 3, re-measured 2026-09-09 on real delivered
+  renders): whole files came off at **8.3–9.5 Mbit/s** at 1080p30 and a 20 s
+  high-motion excerpt at **11.3**, so the original 12M cap was barely binding and we
+  were shipping roughly twice a streaming service's 1080p. `render.render.MAXRATE` is
+  now **8M / 16M**, which took the same excerpt to 8.2 Mbit/s at a cost of 0.17 dB
+  PSNR / 0.0009 SSIM against the source (a CRF 25 variant lost 1.9 dB and was
+  rejected). CRF and preset are untouched, so this clamps peaks only; `api/selfie.py` and `api/rawproxy.py` import
+  the constants rather than repeating them. **Existing renders keep their bitrate until
+  re-rendered** — the backfill in §4 is metadata-only and does not re-encode.
+* **HLS/adaptive bitrate is deliberately NOT implemented**, and the blocker is
+  specific rather than a matter of effort. The gallery page is a **single
+  self-contained HTML string with no external assets** (`api/gallery.py`) — that is
+  what lets the same renderer serve both the live `/j/{code}` route and the legacy S3
+  `gallery.html` object. HLS needs a media-source player in every non-Safari browser
+  (hls.js, ~400 KB), so adopting it means either loading a third-party script into a
+  page whose URL *is* the customer's credential, or inlining 400 KB into every gallery
+  render. On top of that: a per-job packaging step (three encodes instead of one, on a
+  box already CPU-bound per jump), ~1.6× delivery storage, and — because each segment
+  request needs its own authorization — either playlists rewritten with a signed URL
+  per segment or CloudFront **signed cookies**, which is a different auth model from
+  the one the paywall uses everywhere else.
+
+  The route that *would* fit this architecture, if far-from-edge viewers on slow links
+  still stall after the CDN is live: serve the `.m3u8` from this API
+  (`/j/{token}/hls/{name}.m3u8`, entitlement checked exactly where `public_media`
+  checks it today) with each segment URI a **deterministic CloudFront signed URL** —
+  the paywall, the edge caching and the replay-determinism all carry over unchanged.
+  The player remains the open question, not the delivery.

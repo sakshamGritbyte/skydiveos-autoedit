@@ -275,3 +275,16 @@ def test_needs_dispatch_only_while_pending_and_outside_the_window(tmp_path: Path
     # Decided (a proxy landed): no dispatch however old the marker.
     proxy_path(store, job.job_id, "GX010052.MP4").write_bytes(b"proxy")
     assert not needs_dispatch(store, job, now=now + REDISPATCH_AFTER_S + 1)
+
+
+def test_proxy_command_carries_the_deliverables_vbv_cap() -> None:
+    """Bug 373: the proxy had NO bitrate ceiling, on the one video path with no CDN.
+
+    A purchased raw master is high-motion GoPro footage end to end, streamed straight
+    out of the API process — CRF 23 alone would spend well over 15 Mbit/s on it.
+    """
+    from render.render import MAXRATE, VBV_BUFSIZE
+
+    cmd = proxy_command(Path("/in/GX010052.MP4"), Path("/out/GX010052.MP4"), max_height=1080)
+    assert cmd[cmd.index("-maxrate") + 1] == MAXRATE
+    assert cmd[cmd.index("-bufsize") + 1] == VBV_BUFSIZE

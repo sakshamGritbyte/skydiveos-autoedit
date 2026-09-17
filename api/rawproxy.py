@@ -41,6 +41,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from render.render import MAXRATE, VBV_BUFSIZE
+
 from .config import Settings
 from .jobs import Job, JobStore
 
@@ -258,6 +260,12 @@ def proxy_command(src: Path, out: Path, *, max_height: int) -> list[str]:
     * ``yuv420p`` — 10-bit GoPro HEVC (HDR / high-bitrate modes) would otherwise come out
       as ``yuv420p10le``, which Chrome will not decode either.
     * ``+faststart`` — the moov atom up front so the player starts before the download ends.
+    * ``-maxrate``/``-bufsize`` — the same VBV cap the deliverables carry (Bug 373),
+      imported from :mod:`render.render`. This encode had none, which mattered more
+      here than anywhere: a purchased raw master is high-motion GoPro footage from
+      end to end (no cards, no cuts), CRF 23 alone would spend well over 15 Mbit/s on
+      it at 1080p, and unlike a delivered video this proxy is streamed straight out of
+      the API process — never through CloudFront — so there is no edge to absorb it.
     """
     return [
         "ffmpeg", "-v", "error", "-y",
@@ -266,6 +274,7 @@ def proxy_command(src: Path, out: Path, *, max_height: int) -> list[str]:
         "-sn", "-dn",
         "-vf", f"scale=-2:'min({int(max_height)},ih)'",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-maxrate", MAXRATE, "-bufsize", VBV_BUFSIZE,
         "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "160k", "-ac", "2",
         "-movflags", "+faststart",

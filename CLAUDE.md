@@ -877,7 +877,28 @@ Two runtime media roots, with different audiences:
   streaming the master through the API or minting a browser-cache-defeating
   per-request presigned S3 URL after pruning. Locked deliverables NEVER get a CDN
   URL; `?dl=1` (the gallery's Download buttons) bypasses the CDN and serves an
-  attachment; unset → pre-CDN behaviour, byte-identical
+  attachment; unset → pre-CDN behaviour, byte-identical. **The CDN is only half of
+  Bug 373.** Every public media route also carries its own `Cache-Control`
+  (`MEDIA_CACHE_OWNED` / `MEDIA_CACHE_LOCKED` in `api/app.py`), which is what fixes
+  "the video reloads every time I play it" on the paths the CDN never covers — an
+  undelivered render, a purchased raw master and its proxy, the load video, the photo
+  grid, and every delivered video on a stack where the CDN vars are unset. `private`,
+  never `public`: the gallery's short code is the response's only credential, so no
+  shared cache may store it. A LOCKED deliverable gets 60 s, not a day, because the
+  clean master is served at the SAME URL once `/unlock` lands. On the S3 side the one
+  string is `api.delivery.DELIVERY_CACHE_CONTROL`, shared with
+  `scripts/backfill_delivery_cache_headers.py` (dry-run default) so a pre-fix object
+  is stamped byte-identically to a new one — 34 of 49 sampled delivery MP4s had no
+  lifetime at all. `scripts/cdn_healthcheck.py` proves the whole chain in five
+  isolated steps (config → object → determinism → edge cache → paywall); it is the
+  only way to tell a configured stack from an unconfigured one, since the code
+  degrades silently. The VBV cap is `render.render.MAXRATE`/`VBV_BUFSIZE` (**8M/16M**,
+  re-calibrated 2026-09-09 against real renders measuring 8.3–9.5 Mbit/s under the old
+  12M), **imported** by `api/selfie.py` and `api/rawproxy.py` — the raw proxy had no
+  cap at all, which mattered most there: end-to-end high-motion GoPro footage streamed
+  out of the API process with no edge in front of it. HLS is deliberately not
+  implemented; the blocker is the self-contained no-external-assets gallery page, not
+  effort (see `deploy/CLOUDFRONT.md` §5)
 - Under Docker the archive is a **host bind mount** (`./raw-storage:/data/raw-storage`),
   not a named volume: the container layer is wiped by `up --build`, and a bind mount can
   be rsync'd off the box without `docker exec`. Being a separate mount from the `jobs`

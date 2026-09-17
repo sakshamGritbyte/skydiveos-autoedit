@@ -48,6 +48,13 @@ So the served routes now carry `Cache-Control` of their own (`api/app.py`):
 | A locked deliverable's watermarked preview, a locked still | `private, max-age=60` | The clean file is served at the SAME URL after `/unlock` — a watermark must not outlive the payment |
 | The CDN redirect itself | `private, max-age=300` | Spares a round-trip per range request |
 
+Every player and download URL the page emits carries `?v={mtime of the file that
+request would serve}` (`api.app._media_url`). Without it the day-long cache above sits
+on a URL that never changes, so a re-render after an instructor tweak would keep serving
+the old cut from the viewer's browser for up to 24 h — the CDN path already signs this
+same value, and this is it on the paths the CDN never covers. Cache key only: the route
+ignores it, and the entitlement still picks the file.
+
 `private`, never `public`: unlike the S3 objects behind CloudFront, these responses go
 straight to the viewer with the gallery's short code as their only credential, so no
 shared or proxy cache may store them. Access control is unchanged — the raw routes still

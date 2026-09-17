@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import re
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -262,10 +265,13 @@ def test_local_streaming_answers_range_requests(gallery) -> None:
 def test_gallery_page_separates_player_and_download_urls(gallery) -> None:
     client, store, token = gallery
     html = client.get(f"/j/{token}").text
-    # The player streams the bare URL (CDN-redirectable)…
-    assert f'src="/j/{token}/media/full_video"' in html
+    # The player streams the plain media URL (CDN-redirectable), now cache-busted by
+    # the render mtime — the path is what distinguishes it, not the query string.
+    assert f'src="/j/{token}/media/full_video?v=' in html
+    assert f'src="/j/{token}/media/full_video?dl=1' not in html
     # …while every Download anchor carries the dl=1 attachment variant.
-    assert f'href="/j/{token}/media/full_video?dl=1" download' in html
+    assert f'href="/j/{token}/media/full_video?dl=1&amp;v=' in html
+    assert " download" in html
 
 
 # ---------------------------------------------------------------------------
@@ -413,3 +419,84 @@ def test_backfill_only_touches_media_and_is_idempotent() -> None:
     assert needs_stamp({})  # pre-fix object: no lifetime at all
     assert needs_stamp({"CacheControl": "max-age=60"})  # a DIFFERENT lifetime is corrected
     assert not needs_stamp({"CacheControl": DELIVERY_CACHE_CONTROL})  # second run: no-op
+
+
+# ---------------------------------------------------------------------------
+# ?v= on the LOCAL player URL — the other half of the day-long cache
+#
+# MEDIA_CACHE_OWNED lets a browser keep a deliverable for 24h at a URL that never
+# changes, so an instructor tweak that re-renders the file would otherwise go on
+# serving the OLD cut from that cache. The CDN redirect already carries the render
+# mtime as `v`; these assert the same busting on the paths the CDN never covers.
+# ---------------------------------------------------------------------------
+def _video_src(html: str, name: str = "full_video") -> str:
+    """The `src` the page gives that deliverable's player."""
+    m = re.search(rf'src="(/j/[^"]*/media/{name}[^"]*)"', html)
+    assert m, f"no player src for {name} in page"
+    return m.group(1).replace("&amp;", "&")
+
+
+def test_player_url_carries_the_render_mtime(gallery) -> None:
+    client, store, token = gallery
+    src = _video_src(client.get(f"/j/{token}").text)
+    mtime = int((store.dir("jj") / "full_video.mp4").stat().st_mtime)
+    assert f"v={mtime}" in src
+
+
+def test_rerender_changes_the_url_so_the_cached_copy_is_bypassed(gallery) -> None:
+    client, store, token = gallery
+    before = _video_src(client.get(f"/j/{token}").text)
+    # An instructor tweak: same name, same URL path, new bytes and a new mtime.
+    master = store.dir("jj") / "full_video.mp4"
+    master.write_bytes(b"RE-RENDERED, DIFFERENT CUT")
+    os.utime(master, (time.time() + 60, time.time() + 60))
+    after = _video_src(client.get(f"/j/{token}").text)
+    assert after != before, "a re-render must change the URL or the browser keeps the old cut"
+    assert client.get(after).content == b"RE-RENDERED, DIFFERENT CUT"
+
+
+def test_v_is_ignored_and_never_selects_the_file(gallery) -> None:
+    client, store, token = gallery
+    # Garbage, stale and absent `v` all stream the same current bytes: it is a cache
+    # key, never auth and never file selection.
+    for q in ("?v=not-a-number", "?v=1", ""):
+        r = client.get(f"/j/{token}/media/full_video{q}")
+        assert r.status_code == 200, f"{q} -> {r.status_code}"
+        assert r.content == b"CLEAN MASTER BYTES"
+
+
+def test_locked_card_is_versioned_by_its_PREVIEW_not_the_master(gallery) -> None:
+    client, store, token = gallery
+    job_dir = store.dir("jj")
+    (job_dir / "preview_full_video.mp4").write_bytes(b"WATERMARKED")
+    store.update("jj", entitlement=Entitlement.preview_only)
+    src = _video_src(client.get(f"/j/{token}").text)
+    preview_mtime = int((job_dir / "preview_full_video.mp4").stat().st_mtime)
+    master_mtime = int((job_dir / "full_video.mp4").stat().st_mtime)
+    assert f"v={preview_mtime}" in src
+    # Only meaningful when the two differ; make them differ and re-assert.
+    os.utime(job_dir / "full_video.mp4", (time.time() + 120, time.time() + 120))
+    master_mtime = int((job_dir / "full_video.mp4").stat().st_mtime)
+    assert master_mtime != preview_mtime
+    assert f"v={master_mtime}" not in _video_src(client.get(f"/j/{token}").text)
+
+
+def test_download_anchor_keeps_dl_and_gains_v(gallery) -> None:
+    client, store, token = gallery
+    html = client.get(f"/j/{token}").text
+    m = re.search(r'href="(/j/[^"]*/media/full_video\?dl=1[^"]*)"', html)
+    assert m, "no download anchor"
+    href = m.group(1).replace("&amp;", "&")
+    mtime = int((store.dir("jj") / "full_video.mp4").stat().st_mtime)
+    assert f"v={mtime}" in href
+    r = client.get(href)
+    assert r.status_code == 200
+    assert "attachment" in r.headers["content-disposition"]
+
+
+def test_pruned_master_still_gets_a_usable_url(gallery) -> None:
+    # No local file to stat: the URL simply carries no `v`, which is the pre-fix URL.
+    client, store, token = gallery
+    (store.dir("jj") / "full_video.mp4").unlink()
+    src = _video_src(client.get(f"/j/{token}").text)
+    assert "v=" not in src

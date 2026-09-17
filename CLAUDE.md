@@ -885,7 +885,16 @@ Two runtime media roots, with different audiences:
   grid, and every delivered video on a stack where the CDN vars are unset. `private`,
   never `public`: the gallery's short code is the response's only credential, so no
   shared cache may store it. A LOCKED deliverable gets 60 s, not a day, because the
-  clean master is served at the SAME URL once `/unlock` lands. On the S3 side the one
+  clean master is served at the SAME URL once `/unlock` lands. **A day-long cache on a
+  URL that never changes needs a cache key**, so every player/download URL the page
+  emits is stamped `?v={served file's mtime}` (`api.app._media_url`/`_media_version`,
+  the one place a `/j/{code}/media/…` URL is built) — the same value the CDN redirect
+  already signs, applied to the paths the CDN never covers, or an instructor tweak
+  would keep serving the OLD cut from the viewer's cache for 24 h. Resolved through the
+  **entitlement** like every other file decision, so a locked card is versioned by its
+  *preview*; unstattable (pruned) → no `v`, the pre-fix URL. The route leaves `v`
+  **undeclared** so a garbage value still streams rather than 422-ing: it is a cache
+  key, never auth and never file selection. On the S3 side the one
   string is `api.delivery.DELIVERY_CACHE_CONTROL`, shared with
   `scripts/backfill_delivery_cache_headers.py` (dry-run default) so a pre-fix object
   is stamped byte-identically to a new one — 34 of 49 sampled delivery MP4s had no

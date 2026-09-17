@@ -2148,6 +2148,42 @@ def create_app() -> FastAPI:
         except (ValueError, KeyError, TypeError):
             return []
 
+    def _media_version(store: JobStore, job: Job, name: str) -> int | None:
+        """The cache-busting ``v`` for this deliverable's URL: its served file's mtime.
+
+        ``MEDIA_CACHE_OWNED`` lets a viewer's browser keep a deliverable for a day and
+        the gallery link never changes — so without this, an instructor tweak that
+        re-renders ``full_video`` would go on serving the OLD cut from that cache, at the
+        same URL, for up to 24 h. The CDN redirect already carries exactly this value
+        (:func:`api.cdn.signed_delivery_url`'s ``version``); this is the same trick on
+        the paths the CDN never covers, which is most of them.
+
+        Resolved through the **entitlement**, like every other file decision here: while
+        locked the mtime is the watermarked preview's, so an unlock changes the file AND
+        the URL together. ``None`` — meaning no ``v`` at all, the pre-fix URL — when the
+        file cannot be stat'd, which is the pruned master that serves from S3.
+        """
+        owner = _media_job(store, job)
+        job_dir = store.dir(owner.job_id)
+        if entitlement_for(job, name) is Entitlement.preview_only:
+            path = preview_path(job_dir, name)
+        else:
+            path = job_dir / f"{name}.mp4"
+        try:
+            return int(path.stat().st_mtime)
+        except OSError:
+            return None
+
+    def _media_url(
+        store: JobStore, job: Job, token: str, name: str, *, dl: bool = False
+    ) -> str:
+        """This deliverable's gallery URL, cache-busted by the file the request serves."""
+        params = ["dl=1"] if dl else []
+        version = _media_version(store, job, name)
+        if version is not None:
+            params.append(f"v={version}")
+        return f"/j/{token}/media/{name}" + ("?" + "&".join(params) if params else "")
+
     def _primary_download(
         store: JobStore, job: Job, token: str, video_names: list[str]
     ) -> tuple[str | None, str | None]:
@@ -2171,7 +2207,7 @@ def create_app() -> FastAPI:
         bits.append("yours to keep")
         # dl=1: a download click, not a player fetch — served as an attachment and
         # never CDN-redirected (cross-origin redirects void the `download` attribute).
-        return f"/j/{token}/media/{name}?dl=1", "  ·  ".join(bits)
+        return _media_url(store, job, token, name, dl=True), "  ·  ".join(bits)
 
     def _poster_source(store: JobStore, job: Job, name: str) -> Path | None:
         """The video file this card's poster must be cut from, or ``None``.
@@ -2378,11 +2414,13 @@ def create_app() -> FastAPI:
             customer_name=job.customer_name,
             jump_date=job.jump_date,
             location=settings.delivery_location,
-            videos=[(n, f"/j/{token}/media/{n}") for n in video_names],
+            videos=[(n, _media_url(store, job, token, n)) for n in video_names],
             # The per-card Download anchors get the dl=1 variant of the same URL: an
             # attachment that is never CDN-redirected, so the click keeps saving the
             # file now that the bare player URL may 302 cross-origin (Bug 373).
-            download_urls={n: f"/j/{token}/media/{n}?dl=1" for n in video_names},
+            download_urls={
+                n: _media_url(store, job, token, n, dl=True) for n in video_names
+            },
             posters=posters,
             photos=[f"/j/{token}/photos/{n}" for n in photo_names],
             photos_unlocked=not locked_photos,
@@ -2521,6 +2559,14 @@ def create_app() -> FastAPI:
         ``dl=1`` marks a **download** click rather than a player fetch: it is served as
         an attachment and never redirected to the CDN (a cross-origin redirect makes the
         browser ignore the anchor's ``download`` attribute and play the file instead).
+
+        Accepts (and ignores) a ``v`` query param, exactly as the page route ignores
+        ``s``: the gallery stamps the served file's mtime there so a re-render changes
+        the URL and defeats the day-long ``MEDIA_CACHE_OWNED`` copy in the viewer's
+        browser (:func:`_media_version`). It is a cache key, never auth and never file
+        selection — the entitlement picks the file, as everywhere else — so it is left
+        undeclared rather than validated: a garbage ``v`` must still stream the video,
+        not 422.
         """
         job = _job_by_token(store, token)
         if not _is_safe_segment(name) or name not in _gallery_videos(store, job):

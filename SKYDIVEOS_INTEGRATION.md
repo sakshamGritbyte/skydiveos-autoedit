@@ -267,6 +267,36 @@ camera-side steps that happen before a job record exists; this service never emi
 
 ---
 
+### The callback does NOT put the render in your media library — pull it
+
+A `delivered` callback says the customer has their gallery; it does not move a single
+file into SkydiveOS. The finished cuts are fetched from
+`GET /jobs/{id}/deliverables` (+ `/jobs/{id}/deliverables/{name}` and
+`/jobs/{id}/photos`) and stored on your side, and that pull must be driven by a
+**durable, server-side record**, not by an open dialog and not by the callback alone:
+the callback is fire-and-forget and arrives once, so an import that fails on it is
+never retried.
+
+It also has to cover the jobs **no staff member started**. A camera/SD-card jump
+creates its job through `/api/media/raw-upload` and never touches the manual
+edit screen, so an importer keyed on the manual record imports nothing for it —
+the customer gets a working gallery link while staff see a jump folder holding only
+`raw/`. (Exactly what happened on 2026-09-18; fixed on the SkydiveOS side by
+`autoEditImportService`, the automation twin of the manual sweeper.)
+
+Two contract details the import depends on:
+
+* **A mixed job's manifest GROWS.** Each `media_ref` renders when its own camera's
+  clips are quiet, so `GET /jobs/{id}/deliverables` legitimately returns half the
+  set and then more minutes later. "Some deliverables imported" is never "this job
+  is finished" — settle on the manifest, not on the first successful pass.
+* **Import a locked deliverable too, and mark it.** `deliverable_entitlements` on
+  the callback says which ones are `preview_only`; those stream watermarked and
+  their clean bytes stay unreachable until `POST /jobs/{id}/unlock`, but the row
+  should exist either way so staff can see the whole jump.
+
+---
+
 ## 6. Entitlement: the "film it anyway" paywall (Path A / Path B)
 
 Every job carries an `entitlement`, and every job gets a customer gallery at a short link

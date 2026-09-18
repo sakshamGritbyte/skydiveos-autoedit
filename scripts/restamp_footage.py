@@ -75,32 +75,51 @@ def _creation_time(path: Path) -> datetime | None:
         return None
 
 
-def _has_gpmd(path: Path) -> bool:
-    """Whether the file still carries the GoPro telemetry track."""
+def _gpmd_index(path: Path) -> int | None:
+    """Absolute stream index of the GoPro telemetry (``gpmd``) track, if present.
+
+    Found by tag rather than mapped positionally as ``0:d:1``: the order of a file's
+    data streams is not stable across camera generations. A Hero 12 writes ``gpmd``
+    then ``tmcd`` — the reverse of the footage this was first written against — so a
+    positional map selects the *timecode* track, which the MP4 muxer refuses
+    ("Could not find tag for codec none"), failing every file in the set.
+    """
     try:
         out = subprocess.run(
             [
-                "ffprobe", "-v", "error", "-show_entries", "stream=codec_tag_string",
-                "-of", "csv=p=0", str(path),
+                "ffprobe", "-v", "error",
+                "-show_entries", "stream=index,codec_tag_string",
+                "-of", "json", str(path),
             ],
             capture_output=True, text=True, timeout=60, check=True,
         ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return "gpmd" in out
+        streams = json.loads(out).get("streams", [])
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    for stream in streams:
+        if stream.get("codec_tag_string") == "gpmd" and isinstance(stream.get("index"), int):
+            return int(stream["index"])
+    return None
 
 
-def _restamp(src: Path, dst: Path, when: datetime) -> bool:
+def _has_gpmd(path: Path) -> bool:
+    """Whether the file still carries the GoPro telemetry track."""
+    return _gpmd_index(path) is not None
+
+
+def _restamp(src: Path, dst: Path, when: datetime, gpmd_index: int | None) -> bool:
     """Remux ``src`` to ``dst`` with ``when`` as its creation time. Returns success.
 
-    Keeps video + audio + the ``gpmd`` telemetry and drops only the ``tmcd`` timecode
-    track, which ffmpeg cannot remux and the pipeline does not read. The trailing ``Z``
-    makes ffmpeg store the wall clock verbatim instead of converting it from host-local.
+    Keeps video + audio + the ``gpmd`` telemetry (mapped by its own index, see
+    :func:`_gpmd_index`) and drops only the ``tmcd`` timecode track, which ffmpeg
+    cannot remux and the pipeline does not read. The trailing ``Z`` makes ffmpeg store
+    the wall clock verbatim instead of converting it from host-local.
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "ffmpeg", "-v", "error", "-i", str(src),
-        "-map", "0:v", "-map", "0:a?", "-map", "0:d:1?",
+    cmd = ["ffmpeg", "-v", "error", "-i", str(src), "-map", "0:v", "-map", "0:a?"]
+    if gpmd_index is not None:
+        cmd += ["-map", f"0:{gpmd_index}"]
+    cmd += [
         "-c", "copy", "-copy_unknown",
         "-metadata", f"creation_time={when:%Y-%m-%dT%H:%M:%S}Z",
         "-y", str(dst),
@@ -159,10 +178,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run:
             continue
         dst = out_dir / src.name
-        if not _restamp(src, dst, when):
+        gpmd_index = _gpmd_index(src)
+        if gpmd_index is None:
+            # A QR session marker is a short clip with no telemetry; it is never
+            # segmented, so "no gpmd" is only a failure when the source HAD one.
+            print("    note: source carries no gpmd telemetry (a QR marker clip?)")
+        if not _restamp(src, dst, when, gpmd_index):
             failures += 1
             continue
-        if not _has_gpmd(dst):
+        if gpmd_index is not None and not _has_gpmd(dst):
             print(f"    WARNING: {dst.name} lost its gpmd telemetry — segmentation will fail")
             failures += 1
 

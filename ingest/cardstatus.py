@@ -1,16 +1,27 @@
 """Live per-card ingest status — what tells the operator "safe to remove".
 
 An SD-card pull is the one ingest transport where a human is standing at the
-machine waiting to take the media back: the card must stay in the reader while
-the pull is copying (and, with ``DELETE_AFTER_TRANSFER``, sweeping) it, and can
-be removed the moment the pull loop finishes — the S3 upload + SkydiveOS notify
-run *afterwards* from the local staging copy and never touch the card again
-until it is re-inserted. This module makes that moment observable:
+machine waiting to take the media back, so this module owns the moment the
+banner says they can. That moment is **not** the end of the copy loop. Two
+things still need the card after it:
+
+* the clips must reach **S3** — until the retention ledger records a key, this
+  host's disk is the only copy the pipeline has, and
+* with ``DELETE_AFTER_TRANSFER`` on, they must be **swept off the card**, which
+  happens at the start of the *next* pull (``ingest.pull._sweep_card``, the
+  first moment S3 has confirmed them). A card taken out before that sweep goes
+  back into a camera still full — which is the failure cleanup exists to
+  prevent, since a full card silently stops recording mid-day.
+
+So a copied-but-not-yet-transferred card reads ``uploading``, and
+``safe_to_remove`` is raised only once :func:`ingest.retention.card_transfer`
+says the card owes this host nothing (``api.app._sdcard_pull`` asks, each pull).
+This module makes that whole progression observable:
 
 * :class:`CardStatusRegistry` — an in-memory, thread-safe map of
   ``camera_id -> CardStatus`` that the pull path updates through its lifecycle
-  (``detected → sweeping/pulling → safe_to_remove | error``). The API serves a
-  snapshot of it at ``GET /ingest/cards``; the SkydiveOS front end polls that
+  (``detected → sweeping/pulling → uploading → safe_to_remove | error``). The
+  API serves a snapshot of it at ``GET /ingest/cards``; the SkydiveOS front end polls that
   (via its backend proxy) to drive the progress bar and the
   "safe to remove" popup.
 * :class:`TrackedCamera` — wraps the real :class:`~ingest.camera.Camera` so the
@@ -54,10 +65,21 @@ logger = logging.getLogger(__name__)
 STATE_DETECTED = "detected"
 STATE_SWEEPING = "sweeping"
 STATE_PULLING = "pulling"
+#: Copied off the card, but S3 (and, with cleanup on, the sweep) is not done with it
+#: yet — the card must stay in the reader. See the module docstring.
+STATE_UPLOADING = "uploading"
 STATE_SAFE_TO_REMOVE = "safe_to_remove"
 STATE_ERROR = "error"
 
 _TERMINAL_STATES = frozenset({STATE_SAFE_TO_REMOVE, STATE_ERROR})
+
+#: States whose row may be dropped when its card stops being seen or goes stale.
+#: ``uploading`` joins the terminal two because nothing is being written to the card
+#: in that state: its row is refreshed by every tick's idempotent re-pull, so one
+#: that goes ``_TERMINAL_LINGER_S`` without a refresh means the scan loop is gone,
+#: not that a copy is taking its time. ``pulling``/``sweeping`` are never pruned —
+#: that is the case the 2026-08-18 rule protects.
+_STALE_PRUNABLE_STATES = _TERMINAL_STATES | {STATE_UPLOADING}
 
 #: How long a terminal entry survives without being refreshed. Two jobs: an
 #: ``error`` entry outlives its card's removal by this much (a yanked or failed
@@ -84,6 +106,10 @@ class CardStatus:
     files_total: int = 0
     bytes_done: int = 0
     bytes_total: int = 0
+    #: ``uploading`` only: how many clips on the card still owe this host something
+    #: (not yet in S3, or not yet swept off the card). ONE number on purpose — it
+    #: counts down to zero, which is the moment the state becomes ``safe_to_remove``.
+    pending_files: int = 0
     current_file: str | None = None
     error: str | None = None
     #: Epoch seconds of the last transition (repo convention: seconds, floats).
@@ -118,21 +144,26 @@ class CardStatusRegistry:
     def pull_started(self, camera_id: str) -> None:
         """A pull is opening the card: reset the counters for this run.
 
-        Deliberately does NOT downgrade a ``safe_to_remove`` entry: discovery
-        re-pulls a card that lingers in the reader on every scan tick, and an
-        idempotent re-pull of a fully staged card skips everything — flapping
-        the badge back to "pulling" each tick would train the operator to
+        Deliberately does NOT downgrade a ``safe_to_remove`` (or ``uploading``)
+        entry: discovery re-pulls a card that lingers in the reader on every scan
+        tick, and an idempotent re-pull of a fully staged card skips everything —
+        flapping the badge back to "pulling" each tick would train the operator to
         ignore it. Real card activity (a sweep delete, a download) still flips
-        the state via :meth:`sweeping` / :meth:`file_started`.
+        the state via :meth:`sweeping` / :meth:`file_started`, and the end of
+        every pull re-answers the question via :meth:`uploading` /
+        :meth:`safe_to_remove`.
         """
         with self._lock:
             entry = self._cards.get(camera_id)
-            state = (
-                STATE_SAFE_TO_REMOVE
-                if entry is not None and entry.state == STATE_SAFE_TO_REMOVE
-                else STATE_PULLING
+            keep = entry is not None and entry.state in (
+                STATE_SAFE_TO_REMOVE,
+                STATE_UPLOADING,
             )
-            self._cards[camera_id] = CardStatus(camera_id, state, updated_at=self._now())
+            state = entry.state if keep and entry is not None else STATE_PULLING
+            pending = entry.pending_files if keep and entry is not None else 0
+            self._cards[camera_id] = CardStatus(
+                camera_id, state, pending_files=pending, updated_at=self._now()
+            )
 
     def totals(self, camera_id: str, files_total: int, bytes_total: int) -> None:
         """The card's listed contents: what this pull could copy at most."""
@@ -170,17 +201,40 @@ class CardStatusRegistry:
             entry.bytes_done += size
             entry.updated_at = self._now()
 
-    def safe_to_remove(self, camera_id: str) -> None:
-        """The pull loop finished and the camera closed: the card is idle.
+    def uploading(self, camera_id: str, pending: int) -> None:
+        """Copied off the card, but the card is not finished with this host yet.
 
-        This is the "remove it now" signal. It deliberately does not wait for
-        the S3 upload / SkydiveOS notify — those run from the *staged* copy on
-        local disk (``ingest.discovery._materialize``) and touch the card only
-        on its next insertion (the retention sweep).
+        Raised at the end of a pull whose card still has clips S3 has not
+        confirmed, or clips that cleanup is due to sweep off it on the next pull
+        (:func:`ingest.retention.card_transfer`). The operator must leave the
+        card in: the hand-off runs from the staged copy, but the *sweep* that
+        frees the card cannot, and a card removed here goes back into a camera
+        as full as it came out.
+
+        Not an error and not a copy: the only number it carries is
+        ``pending_files``, the count the operator watches down to zero.
+        """
+        with self._lock:
+            entry = self._ensure(camera_id)
+            entry.state = STATE_UPLOADING
+            entry.pending_files = pending
+            entry.current_file = None
+            entry.error = None
+            entry.updated_at = self._now()
+
+    def safe_to_remove(self, camera_id: str) -> None:
+        """Nothing on the card depends on this host any more: take it out.
+
+        Raised only once the pull loop has finished AND every master on the card
+        is confirmed in S3 AND (with ``DELETE_AFTER_TRANSFER``) the sweep that
+        frees the card has run — see the module docstring. The S3 hand-off of a
+        clip that is already *off* the card, and the SkydiveOS notify, do run
+        from the staged copy and are correctly not waited on here.
         """
         with self._lock:
             entry = self._ensure(camera_id)
             entry.state = STATE_SAFE_TO_REMOVE
+            entry.pending_files = 0
             entry.current_file = None
             entry.error = None
             entry.updated_at = self._now()
@@ -200,10 +254,12 @@ class CardStatusRegistry:
         """Reconcile the registry with what the scanner currently sees mounted.
 
         A new id becomes ``detected``; a ``safe_to_remove`` entry whose card is
-        gone is dropped (removal was the goal state); an ``error`` entry
-        lingers ``_TERMINAL_LINGER_S`` after removal so the operator sees the
-        failure. Entries mid-pull are left alone — the pull itself will land
-        them in a terminal state.
+        gone is dropped (removal was the goal state), and so is an ``uploading``
+        one (the operator took the card out early — the row describes a card in
+        the reader, and the staged clips finish uploading without it); an
+        ``error`` entry lingers ``_TERMINAL_LINGER_S`` after removal so the
+        operator sees the failure. Entries mid-pull are left alone — the pull
+        itself will land them in a resting state.
         """
         seen = set(mounted_ids)
         now = self._now()
@@ -215,9 +271,16 @@ class CardStatusRegistry:
                     )
             for camera_id in list(self._cards):
                 entry = self._cards[camera_id]
-                if camera_id in seen or entry.state not in _TERMINAL_STATES:
+                if camera_id in seen or entry.state not in _STALE_PRUNABLE_STATES:
                     continue
-                if entry.state == STATE_SAFE_TO_REMOVE:
+                if entry.state in (STATE_SAFE_TO_REMOVE, STATE_UPLOADING):
+                    if entry.state == STATE_UPLOADING:
+                        logger.warning(
+                            "card %s was removed with %d clip(s) still pending; the "
+                            "staged copies finish uploading without it, but the card "
+                            "was not cleared — re-insert it to free the space",
+                            camera_id, entry.pending_files,
+                        )
                     del self._cards[camera_id]
                 elif now - entry.updated_at > _TERMINAL_LINGER_S:
                     del self._cards[camera_id]
@@ -228,7 +291,7 @@ class CardStatusRegistry:
         """Every tracked card as plain dicts (JSON-ready), ordered by id.
 
         Also the backstop that keeps a wedged scan loop from freezing the
-        operator screen: a TERMINAL entry that hasn't been refreshed in
+        operator screen: a terminal or ``uploading`` entry that hasn't been refreshed in
         ``_TERMINAL_LINGER_S`` is dropped here, because both readers of the
         registry (the ``GET /ingest/cards`` route and ``publish_card_status``)
         come through this method — so even when ``observe`` has stopped
@@ -243,7 +306,7 @@ class CardStatusRegistry:
             for camera_id in list(self._cards):
                 entry = self._cards[camera_id]
                 if (
-                    entry.state in _TERMINAL_STATES
+                    entry.state in _STALE_PRUNABLE_STATES
                     and now - entry.updated_at > _TERMINAL_LINGER_S
                 ):
                     del self._cards[camera_id]

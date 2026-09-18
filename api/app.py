@@ -626,6 +626,59 @@ def _cleanup_kwargs(settings: Settings) -> dict[str, Any]:
     }
 
 
+async def _report_card_state(
+    camera_id: str, settings: Settings, card_status: CardStatusRegistry
+) -> None:
+    """Answer "can the operator take this card out?" at the end of a pull.
+
+    The copy loop finishing is NOT that answer. A clip only reaches the pipeline's
+    durable copy when S3 confirms it (``ingest.retention``), and with
+    ``DELETE_AFTER_TRANSFER`` it only leaves the card in the *next* pull's sweep —
+    so a card removed at the end of the copy goes back into a camera as full as it
+    came out, which is the failure cleanup exists to prevent. So the card's own
+    contents are re-read here and checked against the ledger: still owing → the row
+    stays ``uploading`` and the next tick's re-pull (which runs that sweep) asks
+    again; owing nothing → ``safe_to_remove``.
+
+    Never raises, and never strands the operator: any failure to work out the answer
+    falls back to the old unconditional "safe", because a banner that can never clear
+    is worse than one that clears early.
+    """
+    if not settings.card_safe_requires_upload:
+        card_status.safe_to_remove(camera_id)
+        return
+    from ingest.retention import card_transfer
+    from ingest.sdcard import SdCardCamera, mount_for
+    from ingest.storage import camera_dir, storage_root
+
+    try:
+        mount = mount_for(camera_id, settings.sdcard_mount_roots)
+        on_card = {m.filename: m.size for m in await SdCardCamera(mount).list_videos()}
+        state = card_transfer(
+            camera_dir(storage_root(), camera_id),
+            on_card,
+            cleanup=settings.delete_after_transfer,
+            min_age_s=settings.delete_after_transfer_min_age_h * 3600.0,
+            dry_run=settings.delete_after_transfer_dry_run,
+        )
+    except Exception as e:  # noqa: BLE001 - the pull succeeded; only the banner is at risk
+        logger.warning(
+            "could not check what card %s still owes (%r); reporting it safe to remove",
+            camera_id, e,
+        )
+        card_status.safe_to_remove(camera_id)
+        return
+    if state.settled:
+        card_status.safe_to_remove(camera_id)
+        return
+    logger.info(
+        "card %s staged but not settled: %d clip(s) pending (%d not in S3, %d awaiting "
+        "the cleanup sweep) — leave the card in",
+        camera_id, len(state.pending), len(state.unconfirmed), len(state.awaiting_sweep),
+    )
+    card_status.uploading(camera_id, len(state.pending))
+
+
 def _build_pull(
     settings: Settings, card_status: CardStatusRegistry | None = None
 ) -> Callable[..., Awaitable[Any]] | None:
@@ -684,10 +737,11 @@ def _build_pull(
                 if card_status is not None:
                     card_status.error(camera_id, str(e))
                 raise
-            # The pull loop is done and the camera closed: the card is idle. The S3
-            # upload + notify run later from the STAGED copy and don't need the card.
+            # The pull loop is done and the camera closed — but "copied" is not
+            # "safe to remove": S3 must hold every clip, and with cleanup on the
+            # sweep that frees the card has yet to run. Ask, rather than assume.
             if card_status is not None:
-                card_status.safe_to_remove(camera_id)
+                await _report_card_state(camera_id, settings, card_status)
             return result
 
         return _sdcard_pull
@@ -2971,11 +3025,13 @@ def create_app() -> FastAPI:
         """Per-card pull progress for the operator standing at the card reader.
 
         Populated only under ``CAMERA_SCANNER=sdcard`` with discovery enabled;
-        empty otherwise. ``safe_to_remove`` means the pull loop finished and the
-        card is idle — the S3 upload + SkydiveOS notify run from the *staged*
-        copy and no longer need the card. The route only reads the in-memory
-        registry (never the mount), so polling it is free. SkydiveOS polls it
-        via its backend proxy so the service token stays server-side.
+        empty otherwise. ``safe_to_remove`` means the card owes this host nothing:
+        copied, every clip confirmed in S3, and (with ``DELETE_AFTER_TRANSFER``)
+        already swept off the card. Until then it reads ``uploading`` — the card
+        must stay in, because the sweep that frees it runs on the next pull. The
+        route only reads the in-memory registry (never the mount), so polling it
+        is free. SkydiveOS polls it via its backend proxy so the service token
+        stays server-side.
         """
         tracker = getattr(request.app.state, "card_status", None)
         if tracker is None:

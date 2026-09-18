@@ -430,20 +430,29 @@ class CamerasResponse(BaseModel):
 class CardIngestStatus(BaseModel):
     """One SD card's ingest progress (``GET /ingest/cards``).
 
-    ``safe_to_remove`` means the pull finished and the card is idle — the S3
-    upload runs from the staged copy and no longer needs the card. Progress is
-    approximate (already-staged clips are skipped without re-copying), so the
-    terminal ``state`` is the signal, not the percentage.
+    ``safe_to_remove`` means the card owes this host nothing: the pull finished,
+    every clip on it is confirmed in S3, and — with ``DELETE_AFTER_TRANSFER`` on —
+    the sweep that frees the card has run. Between the end of the copy and that
+    point the state is ``uploading`` (``pending_files`` counting down): the card
+    must stay in the reader, because the sweep needs it even though the S3 upload
+    itself runs from the staged copy. Copy progress is approximate (already-staged
+    clips are skipped without re-copying), so the ``state`` is the signal, not the
+    percentage.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     camera_id: str = Field(examples=["1234"])
-    state: Literal["detected", "sweeping", "pulling", "safe_to_remove", "error"]
+    state: Literal[
+        "detected", "sweeping", "pulling", "uploading", "safe_to_remove", "error"
+    ]
     files_done: int = 0
     files_total: int = 0
     bytes_done: int = 0
     bytes_total: int = 0
+    #: ``uploading`` only: clips still on the card that are not yet in S3, or not yet
+    #: swept off it. Counts down to 0, which is when the state becomes ``safe_to_remove``.
+    pending_files: int = 0
     #: Master currently copying off the card (``pulling`` only).
     current_file: str | None = Field(default=None, examples=["GX010042.MP4"])
     error: str | None = None

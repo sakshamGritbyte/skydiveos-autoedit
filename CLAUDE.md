@@ -769,20 +769,33 @@ Two runtime media roots, with different audiences:
   a WARNING. Probe cards read-only with `python scripts/check_sdcard.py [--decode]`.
   **Card ingest status is observable** (`ingest/cardstatus.py` → `GET /ingest/cards`):
   in sdcard mode the pull path updates an in-memory per-card registry
-  (`detected → sweeping/pulling → safe_to_remove | error`, with file/byte progress)
-  so the operator screen can show a progress bar and a "safe to remove" popup.
-  `safe_to_remove` fires when the pull loop finishes — the S3 upload + notify run
-  from the STAGED copy and never need the card. Tracking never raises into a pull
+  (`detected → sweeping/pulling → uploading → safe_to_remove | error`, with file/byte
+  progress) so the operator screen can show a progress bar and a "safe to remove" popup.
+  **`safe_to_remove` means the card owes this host nothing** — copied, every clip
+  confirmed in S3, and (with `DELETE_AFTER_TRANSFER`) already swept off the card. It
+  used to fire at the end of the copy loop, on the reasoning that the S3 upload runs
+  from the STAGED copy and never needs the card: true of the *upload*, false of the
+  **sweep**, which runs at the start of the NEXT pull and is the only thing that frees
+  the card. So the operator took the card out on the banner's word and carried it back
+  to the camera still full — cleanup effectively never ran (2026-09-18, nine clips).
+  Now the end of every pull re-reads the card and asks
+  `ingest.retention.card_transfer` (pure: on-card names+sizes vs the ledger); still
+  owing → the row stays `uploading` with `pending_files` counting down, and the next
+  tick's re-pull (which performs that sweep) asks again. The wait can't strand anyone:
+  a confirmed file inside its cleanup grace or a dry run is never waited for, an
+  unreadable card falls back to `safe_to_remove`, and `CARD_SAFE_REQUIRES_UPLOAD=0`
+  restores the old banner wholesale. Tracking never raises into a pull
   (same never-fail rule as archiving), nothing in the pipeline reads the registry,
   and the SkydiveOS front end polls it via its backend proxy (the service token
   stays server-side). Empty list when sdcard ingest is off.
   **A removed card's row must not outlive the card**, and no single mechanism is
-  trusted with that: `observe` (the scan tick) drops a terminal row the moment the
-  scanner stops seeing its card; a card scan **degrades instead of raising** (one
+  trusted with that: `observe` (the scan tick) drops a terminal — or `uploading` —
+  row the moment the scanner stops seeing its card (a card pulled out mid-transfer
+  logs a warning: the staged clips still upload, but the card was not cleared); a card scan **degrades instead of raising** (one
   zombie mountpoint — a card yanked without ejecting — skips only itself in
   `ingest.sdcard._mounts_with_dcim`, and `SdCardScanner.scan` returns `[]` on any
   residual failure, because a scan that raises every tick silently stops `observe`
-  forever); and `snapshot()` **ages out terminal rows** not refreshed in 15 min
+  forever); and `snapshot()` **ages out terminal and `uploading` rows** not refreshed in 15 min
   (`_TERMINAL_LINGER_S` — a still-inserted card's row is refreshed every discovery
   tick by the idempotent re-pull, so that stale means the card is gone). The
   SkydiveOS consumer applies the same age filter read-side (`autoEditService.

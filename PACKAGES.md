@@ -211,7 +211,7 @@ idempotency, retention):
 |---|---|---|
 | `ble` (default) | BLE scan every `DISCOVERY_INTERVAL_SECONDS` (30 s) for *paired* cameras (allow-list = MongoDB `cameras` registry) → WiFi pull | Wireless, unattended |
 | `usb` | mDNS detect → wired pull | The kiosk path, one camera per scan |
-| `sdcard` | Card physically inserted; `SdCardScanner` polls `SDCARD_MOUNT_ROOTS` for `DCIM/` volumes | **The primary dropzone flow.** Card identity = GoPro serial from `MISC/version.txt`. Bypasses the registry allow-list (inserting a card is an operator action); per-card status is observable at `GET /ingest/cards` (`detected → pulling → safe_to_remove`) |
+| `sdcard` | Card physically inserted; `SdCardScanner` polls `SDCARD_MOUNT_ROOTS` for `DCIM/` volumes | **The primary dropzone flow.** Card identity = GoPro serial from `MISC/version.txt`. Bypasses the registry allow-list (inserting a card is an operator action); per-card status is observable at `GET /ingest/cards` (`detected → pulling → uploading → safe_to_remove`, where `safe_to_remove` means S3 has every clip and cleanup has swept the card) |
 | `static` | Simulated cameras staging `DISCOVERY_SAMPLE_MP4` | No-hardware testing, exercises the real pull path |
 
 After the pull, discovery uploads each MP4 to S3 (`raw/{camera_id}/{file}`) and POSTs

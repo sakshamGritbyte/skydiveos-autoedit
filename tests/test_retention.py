@@ -19,7 +19,13 @@ import pytest
 
 from ingest.camera import Camera, CameraError, RemoteMedia
 from ingest.pull import _sweep_card
-from ingest.retention import confirmed, deletable, ledger_path, record_uploaded
+from ingest.retention import (
+    card_transfer,
+    confirmed,
+    deletable,
+    ledger_path,
+    record_uploaded,
+)
 
 HOUR = 3600.0
 
@@ -221,3 +227,81 @@ def test_camera_base_refuses_to_delete_by_default():
 
     with pytest.raises(CameraError, match="does not support deleting"):
         asyncio.run(_Bare().delete_media(_media("GX010001.MP4")))
+
+
+class TestCardTransfer:
+    """What the "safe to remove" banner is allowed to say (:func:`card_transfer`).
+
+    The operator's question is not "has it been copied?" but "can I take this card
+    out and have the day end correctly?" — which needs S3 to hold every clip and,
+    with cleanup on, the sweep to have freed the card.
+    """
+
+    def test_freshly_copied_card_is_not_settled(self, tmp_path: Path):
+        """Nothing in the ledger: the card is still the pipeline's only source."""
+        state = card_transfer(tmp_path, _on_card("GX010001.MP4"), cleanup=False)
+        assert state.unconfirmed == ("GX010001.MP4",)
+        assert state.pending == ("GX010001.MP4",)
+        assert not state.settled
+
+    def test_confirmed_and_cleanup_off_is_settled(self, tmp_path: Path):
+        """With no cleanup, S3 holding it is the whole job — the card may go."""
+        record_uploaded(tmp_path, "GX010001.MP4", "k", size=CLIP_SIZE, now=0.0)
+        state = card_transfer(tmp_path, _on_card("GX010001.MP4"), cleanup=False)
+        assert state.confirmed == ("GX010001.MP4",)
+        assert state.settled
+
+    def test_confirmed_but_not_yet_swept_is_not_settled(self, tmp_path: Path):
+        """The regression: uploaded is not gone. The sweep runs on the NEXT pull,
+        so a card released here is carried back to the camera still full."""
+        record_uploaded(tmp_path, "GX010001.MP4", "k", size=CLIP_SIZE, now=0.0)
+        state = card_transfer(
+            tmp_path, _on_card("GX010001.MP4"), cleanup=True, min_age_s=0.0, now=10.0
+        )
+        assert state.confirmed == ("GX010001.MP4",)
+        assert state.awaiting_sweep == ("GX010001.MP4",)
+        assert not state.settled
+
+    def test_empty_card_is_settled(self, tmp_path: Path):
+        """The sweep ran: nothing is left to wait for."""
+        record_uploaded(tmp_path, "GX010001.MP4", "k", size=CLIP_SIZE, now=0.0)
+        state = card_transfer(tmp_path, {}, cleanup=True, min_age_s=0.0, now=10.0)
+        assert state.settled
+
+    def test_grace_period_is_not_something_to_wait_for(self, tmp_path: Path):
+        """A confirmed file inside its cleanup grace is *meant* to stay on the card
+        for another day — holding the banner for it would hold it for a day."""
+        record_uploaded(tmp_path, "GX010001.MP4", "k", size=CLIP_SIZE, now=0.0)
+        state = card_transfer(
+            tmp_path, _on_card("GX010001.MP4"), cleanup=True, min_age_s=24 * HOUR, now=HOUR
+        )
+        assert state.awaiting_sweep == ()
+        assert state.settled
+
+    def test_dry_run_never_waits_for_a_sweep_that_cannot_happen(self, tmp_path: Path):
+        """DRY RUN deletes nothing, so waiting for the card to empty never ends."""
+        record_uploaded(tmp_path, "GX010001.MP4", "k", size=CLIP_SIZE, now=0.0)
+        state = card_transfer(
+            tmp_path,
+            _on_card("GX010001.MP4"),
+            cleanup=True,
+            min_age_s=0.0,
+            dry_run=True,
+            now=10.0,
+        )
+        assert state.settled
+
+    def test_reused_filename_counts_as_unconfirmed(self, tmp_path: Path):
+        """Same name, different bytes: the record covers other footage, so this
+        card still owes an upload (and must never be swept on that record's word)."""
+        record_uploaded(tmp_path, "GX010001.MP4", "k", size=CLIP_SIZE, now=0.0)
+        state = card_transfer(
+            tmp_path,
+            _on_card("GX010001.MP4", size=CLIP_SIZE * 2),
+            cleanup=True,
+            min_age_s=0.0,
+            now=10.0,
+        )
+        assert state.unconfirmed == ("GX010001.MP4",)
+        assert state.awaiting_sweep == ()
+        assert not state.settled

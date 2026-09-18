@@ -184,3 +184,90 @@ def deletable(
             continue
         ready.append(rec)
     return sorted(ready, key=lambda r: r.at)
+
+
+@dataclass(frozen=True)
+class CardTransfer:
+    """What a card still owes this host — the "is it safe to remove?" answer.
+
+    The operator standing at the reader wants one thing from the banner: *can I take
+    the card out and have the day's footage end up where it belongs?* Staging a clip
+    onto local disk does not answer that. Two things still have to happen, and both
+    need the card back in the reader if they have not:
+
+    * the clip must reach **S3** (the ledger's record is the only proof — see this
+      module's docstring), and
+    * with ``DELETE_AFTER_TRANSFER`` on, it must then be **swept off the card**, which
+      happens at the start of the *next* pull. A card removed before that sweep keeps
+      every byte of the jump it just delivered and fills up exactly as if cleanup had
+      never been enabled.
+
+    Pure: names and sizes in, names out. The camera is never touched here.
+    """
+
+    #: Master filenames currently on the card.
+    on_card: tuple[str, ...]
+    #: Of those, the ones the ledger confirms are in S3 (size-matched).
+    confirmed: tuple[str, ...]
+    #: On-card files S3 has NOT confirmed — the card is still their only copy's source.
+    unconfirmed: tuple[str, ...]
+    #: Confirmed files that cleanup is due to delete but has not deleted yet.
+    awaiting_sweep: tuple[str, ...]
+
+    @property
+    def pending(self) -> tuple[str, ...]:
+        """Everything still holding the card here, sorted."""
+        return tuple(sorted(set(self.unconfirmed) | set(self.awaiting_sweep)))
+
+    @property
+    def settled(self) -> bool:
+        """Whether the card can leave the reader with nothing left undone."""
+        return not self.pending
+
+
+def card_transfer(
+    staging_dir: Path,
+    on_card: Mapping[str, int | None],
+    *,
+    cleanup: bool,
+    min_age_s: float = 0.0,
+    dry_run: bool = False,
+    now: float | None = None,
+) -> CardTransfer:
+    """Split what is on the card into confirmed / still-owed (:class:`CardTransfer`).
+
+    Args:
+        staging_dir: The camera's staging dir — where its ledger lives.
+        on_card: ``filename -> size`` as the card lists it now (post-sweep).
+        cleanup: ``DELETE_AFTER_TRANSFER``. Off means nothing is ever expected to
+            leave the card, so a confirmed file is done and the card is free.
+        min_age_s: The cleanup grace period. A confirmed file inside its grace is
+            *deliberately* still on the card, so it is not something to wait for.
+        dry_run: ``DELETE_AFTER_TRANSFER_DRY_RUN``. Nothing is ever deleted, so
+            waiting for the sweep would wait forever.
+        now: Clock, for deterministic tests.
+
+    The size check is :func:`deletable`'s, so "confirmed" here means exactly what it
+    means there: the ledger holds a record for this name *and* the file on the card is
+    still the one that record covers.
+    """
+    records = confirmed(staging_dir)
+    settled_names: list[str] = []
+    missing: list[str] = []
+    for name, size in on_card.items():
+        rec = records.get(name)
+        (settled_names if rec is not None and rec.matches(size) else missing).append(name)
+    awaiting: tuple[str, ...] = ()
+    if cleanup and not dry_run:
+        awaiting = tuple(
+            sorted(
+                r.filename
+                for r in deletable(staging_dir, on_card, min_age_s=min_age_s, now=now)
+            )
+        )
+    return CardTransfer(
+        on_card=tuple(sorted(on_card)),
+        confirmed=tuple(sorted(settled_names)),
+        unconfirmed=tuple(sorted(missing)),
+        awaiting_sweep=awaiting,
+    )

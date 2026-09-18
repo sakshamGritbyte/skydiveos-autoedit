@@ -34,13 +34,17 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-#: The three states an operator acts on, and what to do. ``sweeping`` is grouped with
+#: The states an operator acts on, and what to do. ``sweeping`` is grouped with
 #: ``pulling`` deliberately: a retention delete WRITES to the card, so it is the one
 #: moment when pulling it out can corrupt the filesystem rather than merely abort a copy.
+#: ``uploading`` is the copy-is-done-but-the-card-is-not state: the clips are staged but
+#: S3 has not confirmed them all, and the sweep that frees the card runs on the NEXT
+#: pull — take the card out here and it goes back into the camera still full.
 _ACTION = {
     "detected": ("· ", "card detected — preparing"),
     "sweeping": ("⏳", "CLEARING SPACE — DO NOT REMOVE"),
     "pulling": ("⏳", "COPYING — DO NOT REMOVE"),
+    "uploading": ("☁️ ", "TRANSFERRING TO CLOUD — DO NOT REMOVE"),
     "safe_to_remove": ("✅", "SAFE TO REMOVE"),
     "error": ("⚠️ ", "FAILED — leave the card in and check the log"),
 }
@@ -79,6 +83,9 @@ def _render(cards: list[dict[str, Any]]) -> str:
         bytes_total = int(c.get("bytes_total") or 0)
         bytes_done = int(c.get("bytes_done") or 0)
         lines.append(f"  {icon} Card {c.get('camera_id')}   {action}")
+        if state == "uploading":
+            pending = int(c.get("pending_files") or 0)
+            lines.append(f"       {pending} clip(s) still on the card")
         if state in ("pulling", "sweeping") and files_total:
             lines.append(
                 f"       {_bar(bytes_done, bytes_total)}  "

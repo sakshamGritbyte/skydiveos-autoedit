@@ -23,6 +23,7 @@ from ingest.cardstatus import (
     STATE_PULLING,
     STATE_SAFE_TO_REMOVE,
     STATE_SWEEPING,
+    STATE_UPLOADING,
     CardStatusRegistry,
     ObservingScanner,
     TrackedCamera,
@@ -120,6 +121,44 @@ def test_observe_adds_detected_and_clears_removed_cards() -> None:
     assert reg.snapshot() == []
 
 
+def test_repull_does_not_flap_uploading() -> None:
+    """Same rule for the transfer wait: the operator sees one steady "do not
+    remove", not a badge alternating with "copying" every discovery tick."""
+    reg = CardStatusRegistry(now=_Clock())
+    reg.pull_started("4313")
+    reg.uploading("4313", 9)
+
+    reg.pull_started("4313")
+    row = reg.snapshot()[0]
+    assert (row["state"], row["pending_files"]) == (STATE_UPLOADING, 9)
+
+    reg.file_started("4313", "GX010009.MP4")  # real activity still wins
+    assert reg.snapshot()[0]["state"] == STATE_PULLING
+
+
+def test_observe_drops_a_card_removed_mid_transfer() -> None:
+    """The row describes a card in the reader. Pulled out early, the staged clips
+    still upload — but there is nothing left to tell the operator about the card,
+    and the row must not outlive it (it would read "do not remove" forever)."""
+    reg = CardStatusRegistry(now=_Clock())
+    reg.uploading("4313", 3)
+    reg.observe([])
+    assert reg.snapshot() == []
+
+
+def test_stale_uploading_row_ages_out() -> None:
+    """The wedged-scan-loop backstop covers the transfer wait too: its row is
+    refreshed by every tick's re-pull, so one this stale means no scan is running
+    — unlike a mid-copy row, which legitimately goes quiet for many minutes."""
+    clock = _Clock()
+    reg = CardStatusRegistry(now=clock)
+    reg.uploading("4313", 3)
+    clock.t += 300.0
+    assert reg.snapshot()[0]["state"] == STATE_UPLOADING
+    clock.t += 700.0
+    assert reg.snapshot() == []
+
+
 def test_observe_lets_errors_linger_after_removal() -> None:
     """A failed card's entry must outlive the yank so the operator sees it."""
     clock = _Clock()
@@ -166,19 +205,29 @@ def test_snapshot_ages_out_terminal_entries_when_scans_stop() -> None:
 
 def test_operator_card_swap_cycle(tmp_path: Path) -> None:
     """The whole operator loop at one reader, with the REAL wiring end to end
-    (SdCardScanner → ObservingScanner → discovery → the sdcard pull → registry):
-    insert a card → its ingest completes and the row says SAFE TO REMOVE; take
-    the card out → the row leaves the screen; insert the NEXT card → it is
-    tracked and lands on SAFE TO REMOVE too. This is what lets staff feed cards
-    through the reader all day on the strength of the banner alone."""
+    (SdCardScanner → ObservingScanner → discovery → the sdcard pull → registry)
+    and cleanup on, as a dropzone box runs it.
+
+    Insert a card → it is copied, but S3 has not confirmed it, so the row reads
+    UPLOADING and the banner does not release the card (regression: it used to
+    say SAFE TO REMOVE the moment the copy loop ended, so the operator pulled
+    the card before the sweep could free it — the clips stayed on it and it
+    filled up exactly as if cleanup were off). Confirm the uploads → the next
+    tick's pull sweeps them off the card and the row turns SAFE TO REMOVE. Take
+    the card out → the row leaves the screen; insert the NEXT card → tracked
+    the same way. This is what lets staff feed cards through the reader all day
+    on the strength of the banner alone."""
     import dataclasses
     import json
+    import os
     import shutil
 
     from api.app import _build_pull
     from api.config import get_settings
     from ingest.discovery import CameraDiscoveryService
+    from ingest.retention import record_uploaded
     from ingest.scanner import SdCardScanner
+    from ingest.storage import camera_dir
 
     reader = tmp_path / "reader"
     reader.mkdir()
@@ -216,7 +265,12 @@ def test_operator_card_swap_cycle(tmp_path: Path) -> None:
 
     reg = CardStatusRegistry()
     settings = dataclasses.replace(
-        get_settings(), camera_scanner="sdcard", sdcard_mount_roots=(str(reader),)
+        get_settings(),
+        camera_scanner="sdcard",
+        sdcard_mount_roots=(str(reader),),
+        # The dropzone configuration: clear the card as soon as S3 confirms a clip.
+        delete_after_transfer=True,
+        delete_after_transfer_min_age_h=0.0,
     )
     service = CameraDiscoveryService(
         scanner=ObservingScanner(SdCardScanner(roots=[reader]), reg),
@@ -240,9 +294,27 @@ def test_operator_card_swap_cycle(tmp_path: Path) -> None:
         service._emitter = _DropEmitter()
 
         card_a = insert_card("CARD-A", "C0000000001111")
+        clip = card_a / "DCIM" / "100GOPRO" / "GX010001.MP4"
+
         await tick_and_settle()
         [row] = reg.snapshot()
+        # Copied, but S3 holds nothing yet and the clip is still on the card.
+        assert (row["camera_id"], row["state"]) == ("1111", STATE_UPLOADING)
+        assert row["pending_files"] == 1
+        assert clip.is_file()
+
+        # The hand-off lands: discovery records the S3 key that authorises deletion.
+        record_uploaded(
+            camera_dir(Path(os.environ["RAW_STORAGE_ROOT"]), "1111"),
+            clip.name,
+            "raw/1111/2026-09-18/GX010001.MP4",
+            size=clip.stat().st_size,
+        )
+        await tick_and_settle()  # this pull sweeps the card, THEN reports
+        [row] = reg.snapshot()
         assert (row["camera_id"], row["state"]) == ("1111", STATE_SAFE_TO_REMOVE)
+        assert row["pending_files"] == 0
+        assert not clip.exists()  # the promise the banner is now making
 
         shutil.rmtree(card_a)  # the operator takes the finished card out...
         await tick_and_settle()
@@ -251,7 +323,7 @@ def test_operator_card_swap_cycle(tmp_path: Path) -> None:
         insert_card("CARD-B", "C0000000002222")  # ...and feeds in the next one
         await tick_and_settle()
         [row] = reg.snapshot()
-        assert (row["camera_id"], row["state"]) == ("2222", STATE_SAFE_TO_REMOVE)
+        assert (row["camera_id"], row["state"]) == ("2222", STATE_UPLOADING)
 
     asyncio.run(scenario())
 
@@ -408,3 +480,34 @@ def test_endpoint_serves_the_registry_snapshot() -> None:
     assert card["state"] == STATE_PULLING
     assert card["current_file"] == "GX010001.MP4"
     assert card["bytes_total"] == 300
+
+
+def test_transfer_wait_can_be_turned_off_and_never_strands_the_operator() -> None:
+    """Two ways back to the old unconditional banner, both deliberate.
+
+    ``CARD_SAFE_REQUIRES_UPLOAD=0`` is the documented opt-out. The second is the
+    safety net: if the card's own contents cannot be read back (it was yanked
+    between the pull and the check, a reader dropped out), the answer is "safe"
+    rather than a banner that can never clear — the pull itself already
+    succeeded, and an operator frozen on "DO NOT REMOVE" has no way forward.
+    """
+    import dataclasses
+
+    from api.app import _report_card_state
+    from api.config import get_settings
+
+    settings = dataclasses.replace(
+        get_settings(), camera_scanner="sdcard", sdcard_mount_roots=("/nonexistent",)
+    )
+
+    reg = CardStatusRegistry()
+    asyncio.run(
+        _report_card_state(
+            "4313", dataclasses.replace(settings, card_safe_requires_upload=False), reg
+        )
+    )
+    assert reg.snapshot()[0]["state"] == STATE_SAFE_TO_REMOVE
+
+    reg = CardStatusRegistry()  # the check is on, but the card cannot be read
+    asyncio.run(_report_card_state("4313", settings, reg))
+    assert reg.snapshot()[0]["state"] == STATE_SAFE_TO_REMOVE

@@ -284,6 +284,13 @@ class Settings:
     #: How much of a candidate clip's head is sampled for the QR
     #: (``SDCARD_QR_SCAN_SECONDS``).
     sdcard_qr_scan_seconds: float = 8.0
+    #: Hold the "safe to remove" banner until the card owes this host nothing —
+    #: every clip confirmed into S3 and, with cleanup on, swept off the card
+    #: (``CARD_SAFE_REQUIRES_UPLOAD``, ON by default). Off restores the pre-2026-09
+    #: behaviour, where the banner fired at the end of the copy loop: the operator
+    #: then routinely pulled the card before the sweep could free it, so cleanup
+    #: never ran and the card filled up anyway. See :mod:`ingest.cardstatus`.
+    card_safe_requires_upload: bool = True
     #: Give every gallery video card a poster frame lifted from that deliverable
     #: (``GALLERY_THUMBNAILS``, on by default — see :mod:`api.thumbnail`). Off falls
     #: back to the browser's own placeholder tile, which is where the cards were
@@ -387,6 +394,7 @@ def get_settings() -> Settings:
             os.environ.get("DELETE_AFTER_TRANSFER_MIN_AGE_H") or 24.0
         ),
         delete_after_transfer_dry_run=_flag("DELETE_AFTER_TRANSFER_DRY_RUN"),
+        card_safe_requires_upload=_flag("CARD_SAFE_REQUIRES_UPLOAD", default=True),
         discovery_fake_cameras=tuple(
             c.strip()
             for c in (os.environ.get("DISCOVERY_FAKE_CAMERAS") or "").split(",")

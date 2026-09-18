@@ -159,7 +159,9 @@ bash scripts/run_sdcard_stack.sh   # worker + bridge + API, CAMERA_SCANNER=sdcar
 curl -s -H "Authorization: Bearer $AUTO_EDIT_API_KEY" localhost:8000/ingest/cards | jq
 ```
 
-Wait for `"state": "safe_to_remove"` before pulling the card out.
+Wait for `"state": "safe_to_remove"` before pulling the card out — `"uploading"`
+(with `pending_files`) means the clips are copied but not yet confirmed in S3 / not yet
+swept off the card, and removing it there leaves the card full.
 
 **Path B — old footage, load manifested for today.** Prefer manifesting the load for the
 footage's *real* date; only if you can't, re-stamp copies:

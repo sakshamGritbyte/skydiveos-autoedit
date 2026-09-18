@@ -106,25 +106,78 @@ launchctl list | grep com.skydiveos.ingest      # PID present, last exit code 0
 tail -f logs/ingest.err.log
 ```
 
-### 4b. The cloud tenants (routine, nothing to verify)
+### 4b. The media EC2 — the four auto-edit stacks
 
-Per the usual multi-tenant order — **the hub checkout pulls first**, because the tenant
-checkouts pull from it, then each tenant pulls and rebuilds:
+Host `15.223.191.11` (`ubuntu@ip-172-31-8-87`). **Nothing in this release is reachable
+here** — these stacks render, they do not read cards — so this is a keep-the-checkouts-in-sync
+deploy, not a behaviour change. There is no new env var to set, no dependency change
+(`pyproject.toml` / `uv.lock` are untouched) and no new Celery task, so the usual "restart
+the worker so it learns the task" step does not apply.
+
+| Stack | Dir | API port |
+|---|---|---|
+| dev (the git hub) | `~/skydiveos-autoedit` | 8000 |
+| demo | `~/autoedit-demo` | 8010 |
+| northshore | `~/autoedit-northshore` | 8011 |
+| southshore | `~/autoedit-southshore` | 8012 |
+
+**Order matters.** The three tenant checkouts have the *local hub* as their git `origin`,
+not GitHub, so the hub must pull from GitHub first. A tenant `git pull` that prints
+`From /home/ubuntu/skydiveos-autoedit … Already up to date` means the hub is stale: the
+tenant got nothing, and the `--build` right after redeploys the OLD code.
 
 ```bash
-# 1. hub / prod checkout
-cd <hub checkout> && git pull origin main
+ssh ubuntu@15.223.191.11
 
-# 2. each tenant
-cd <tenant checkout> && git pull && docker compose up -d --build
+# 1. HUB FIRST — this is what the tenants pull from. It is also the dev stack,
+#    so it needs its own rebuild; the tenant loop below does not touch it.
+cd ~/skydiveos-autoedit
+git pull origin main
+git rev-parse --short HEAD    # note this hash — every tenant must end up on it
+docker compose up -d --build
+
+# 2. THEN each tenant.
+for d in ~/autoedit-demo ~/autoedit-northshore ~/autoedit-southshore; do
+  echo "=== $d ==="
+  git -C "$d" fetch origin && git -C "$d" reset --hard origin/main
+  git -C "$d" log --oneline -1
+  (cd "$d" && docker compose up -d --build)
+done
 ```
 
-`docker compose restart` is not enough if you ever do add `CARD_SAFE_REQUIRES_UPLOAD` to a
-tenant `.env` — a restart does not re-read `env_file`. (You won't need to; the flag is
-inert there.)
+`reset --hard origin/main` is the safe tenant primitive here: per-tenant state lives in
+each stack's untracked `.env` (`API_PORT`/`BRIDGE_PORT`, `MONGO_DB`, bucket, key), never as
+local edits to tracked files — a tenant carrying uncommitted edits to a tracked file will
+have them silently discarded by this, which is the intended behaviour and the reason ports
+were moved into `.env` in the first place.
 
-No Celery task was added or renamed in this release, so the usual "restart the worker to
-teach it the new task" step does not apply.
+**Verify all four landed** (this is the step that catches a stale hub):
+
+```bash
+for d in ~/skydiveos-autoedit ~/autoedit-demo ~/autoedit-northshore ~/autoedit-southshore; do
+  printf '%-34s %s\n' "$d" "$(git -C "$d" log --oneline -1)"
+done
+```
+
+All four lines must show the **same** commit. A tenant sitting on an older one means its
+pull came from a stale hub — re-pull the hub and redeploy that tenant; do not assume the
+`--build` picked it up. Then check the containers and a health endpoint per stack:
+
+```bash
+for d in ~/skydiveos-autoedit ~/autoedit-demo ~/autoedit-northshore ~/autoedit-southshore; do
+  echo "=== $d ==="; (cd "$d" && docker compose ps)
+done
+
+for p in 8000 8010 8011 8012; do
+  echo -n "$p: "; curl -s -o /dev/null -w '%{http_code}\n' localhost:$p/docs
+done
+```
+
+Expect four services per stack (`api`, `worker`, `bridge`, `redis`) and `200` on each
+port.
+
+`GET /ingest/cards` returning `[]` on these stacks is correct and expected — that is what
+"the card fix is inert here" looks like.
 
 ---
 

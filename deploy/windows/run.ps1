@@ -62,6 +62,26 @@ if ($scanner -and $scanner -ne 'sdcard') {
     Out-File $outLog -Append -Encoding UTF8
 }
 
+# Task Scheduler's Stop kills the wrapper, but not always the uvicorn process the
+# wrapper started - so a restart can find the port still held by the PREVIOUS run. The
+# new instance then completes lifespan startup and dies on bind (WinError 10048), the
+# task reports exit 0, and the OLD code keeps serving. That is the worst shape of
+# failure available here: nothing looks wrong. So reclaim the port first, and only from
+# a process that is plausibly ours.
+$stale = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+foreach ($conn in $stale) {
+  $owner = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
+  if ($owner -and @('python', 'pythonw', 'uv') -contains $owner.ProcessName) {
+    "reclaiming port $Port from stale $($owner.ProcessName) PID $($owner.Id)" |
+      Out-File $outLog -Append -Encoding UTF8
+    Stop-Process -Id $owner.Id -Force -ErrorAction SilentlyContinue
+  } else {
+    "WARNING: port $Port held by PID $($conn.OwningProcess) ($(if ($owner) { $owner.ProcessName } else { 'unknown' })) - not ours, leaving it alone" |
+      Out-File $errLog -Append -Encoding UTF8
+  }
+}
+if ($stale.Count -gt 0) { Start-Sleep -Seconds 2 }
+
 # Resolve uv by full path. A Scheduled Task's PATH is not the shell the operator
 # installed it from, and uv arrives by two different routes: the astral installer
 # (%USERPROFILE%\.local\bin) or WinGet (%LOCALAPPDATA%\Microsoft\WinGet\Links).
@@ -91,5 +111,13 @@ $proc = Start-Process -FilePath $uv -PassThru -NoNewWindow -WorkingDirectory $Re
                   '--host', $BindHost, '--port', "$Port") `
   -RedirectStandardOutput $outLog -RedirectStandardError $errLog
 
-$proc.WaitForExit()
+# Kill the child if the wrapper exits first. This does not cover a forced terminate
+# (the finally never runs), which is exactly why the port pre-flight above exists.
+try {
+  $proc.WaitForExit()
+} finally {
+  if ($proc -and -not $proc.HasExited) {
+    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+  }
+}
 exit $proc.ExitCode

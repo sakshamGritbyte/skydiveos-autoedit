@@ -32,7 +32,11 @@
 param(
   [ValidateSet('install','remove','show')]
   [string]$Action = 'install',
-  [string]$TaskName = 'SkydiveOS Ingest',
+  # Matches the name the July hand-rolled install used, so -Force REPLACES that task
+  # rather than registering a second one beside it. Two ingest tasks means two uvicorns
+  # racing for port 8000 on the next boot, and the loser dies with a bind error that
+  # says nothing about there being a twin.
+  [string]$TaskName = 'SkydiveOS-Ingest',
   # The account the task runs as. Defaults to whoever is installing it.
   [string]$User = "$env:USERDOMAIN\$env:USERNAME",
   [switch]$HardenBox
@@ -71,6 +75,20 @@ switch ($Action) {
   'install' {
     if (-not (Test-Admin)) { throw "Run this from an elevated PowerShell (Right-click > Run as administrator)." }
     if (-not (Test-Path $RunScript)) { throw "Missing $RunScript" }
+
+    # Refuse to add a twin. An older install under any other name keeps its own trigger,
+    # so both would start at boot and one would lose the port - intermittently, since
+    # which one wins is a race.
+    $others = Get-ScheduledTask |
+      Where-Object { $_.TaskName -match 'ingest|skydive|gopro' -and $_.TaskName -ne $TaskName }
+    if ($others) {
+      $names = ($others | ForEach-Object { "'" + $_.TaskName + "'" }) -join ', '
+      throw @"
+Another ingest task already exists: $names
+Remove it before installing this one, or both will start at boot and race for port 8000:
+  Unregister-ScheduledTask -TaskName '<name>' -Confirm:`$false
+"@
+    }
 
     $action = New-ScheduledTaskAction `
       -Execute 'powershell.exe' `

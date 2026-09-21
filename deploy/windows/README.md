@@ -139,7 +139,7 @@ contains its `captured_at`. QR yields the staff; it cannot conjure a load.
 uv run --no-sync python scripts\check_sdcard.py --decode
 
 # 2. Service up and scanning
-Get-ScheduledTaskInfo -TaskName 'SkydiveOS Ingest'
+Get-ScheduledTaskInfo -TaskName 'SkydiveOS-Ingest'
 Get-Content logs\ingest.log -Tail 40 -Wait
 
 # 3. Operator display — bell + banner on "safe to remove"

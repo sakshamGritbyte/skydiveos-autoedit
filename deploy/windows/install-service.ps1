@@ -90,7 +90,10 @@ Remove it before installing this one, or both will start at boot and race for po
 "@
     }
 
-    $action = New-ScheduledTaskAction `
+    # NOT $action: PowerShell variable names are case-insensitive, so that would
+    # reassign the $Action PARAMETER, whose [ValidateSet] then rejects the
+    # MSFT_TaskExecAction object on assignment.
+    $taskAction = New-ScheduledTaskAction `
       -Execute 'powershell.exe' `
       -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunScript`"" `
       -WorkingDirectory $RepoRoot
@@ -113,7 +116,7 @@ Remove it before installing this one, or both will start at boot and race for po
       -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
       -MultipleInstances IgnoreNew
 
-    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers `
+    Register-ScheduledTask -TaskName $TaskName -Action $taskAction -Trigger $triggers `
       -Principal $principal -Settings $settings -Force | Out-Null
 
     Write-Host "==> Registered '$TaskName' (runs as $User, starts at boot)"

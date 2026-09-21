@@ -18,7 +18,7 @@ It is an **ingest** box, not a render box.
 | Runs | `uvicorn api.app:app` with `ENABLE_AUTO_DISCOVERY=1`, `CAMERA_SCANNER=sdcard` |
 | Does | poll drive letters for a volume with `DCIM/` → stage clips → upload to S3 → notify SkydiveOS → sweep the card |
 | Does **not** | segment, score, render, deliver, or serve a gallery — that is `~/autoedit-northshore` on the media EC2 |
-| Therefore needs | Python 3.11, FFmpeg, OpenCV (QR), an S3 key, Mongo read access |
+| Therefore needs | Python 3.12 (`.python-version`), FFmpeg, OpenCV (QR), an S3 key, Mongo read access |
 | Therefore does **not** need | Redis, a Celery worker, a GPU, the Open GoPro SDK (no radio is used), `PUBLIC_BASE_URL` |
 
 No Redis: discovery substitutes an in-process emitter (`_HoldingEventEmitter`), so
@@ -58,7 +58,7 @@ cd C:\skydiveos-autoedit
 powershell -ExecutionPolicy Bypass -File deploy\windows\install.ps1
 ```
 
-That installs Python 3.11 / FFmpeg / Git via winget, installs `uv`, runs `uv sync`,
+That installs Python 3.12 (matching `.python-version`) / FFmpeg / Git via winget, installs `uv`, runs `uv sync`,
 scaffolds `.env`, and verifies ffmpeg, `cv2`, and the mount roots.
 
 Then edit `.env`:

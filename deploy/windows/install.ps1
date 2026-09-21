@@ -10,7 +10,7 @@
   GPU (see deploy/windows/README.md).
 
   Idempotent - safe to re-run. What it does:
-    1. Installs Python 3.11, FFmpeg and Git via winget (skipped if present)
+    1. Installs Python 3.12 (matching .python-version), FFmpeg, Git via winget
     2. Installs `uv`
     3. `uv sync` - the locked deps into .venv (there is no requirements.txt)
     4. Scaffolds .env from .env.example and DEFUSES the one Windows trap in it
@@ -56,7 +56,10 @@ Add-ToPathForThisSession (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps')
 if (-not $SkipPackages) {
   if (Test-Cmd winget) {
     foreach ($pkg in @(
-      @{ Id = 'Python.Python.3.11'; Probe = 'py' },
+      # .python-version pins 3.12; `uv sync` downloads a managed CPython if none
+      # matches, so this is a convenience (a `python` on PATH for ad-hoc probing),
+      # not a requirement.
+      @{ Id = 'Python.Python.3.12'; Probe = 'py' },
       @{ Id = 'Gyan.FFmpeg';        Probe = 'ffmpeg' },
       @{ Id = 'Git.Git';            Probe = 'git' }
     )) {
@@ -71,7 +74,7 @@ if (-not $SkipPackages) {
     $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
                 [Environment]::GetEnvironmentVariable('Path','User')
   } else {
-    Write-Warning "winget not found - install Python 3.11, FFmpeg 6+ and Git by hand, then re-run with -SkipPackages"
+    Write-Warning "winget not found - install FFmpeg 6+ and Git by hand, then re-run with -SkipPackages (uv brings its own Python)"
   }
 }
 

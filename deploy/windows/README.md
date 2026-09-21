@@ -40,7 +40,7 @@ do nothing here — they belong to the worker on EC2.
 | `MONGO_DB` | `skydivingos_northshore` (same Atlas cluster / `MONGO_URL` as the other tenants) |
 | Bucket | `skydiveos-northshore-media`, region `ca-central-1`, account `878013573203` |
 | Auto-edit stack | `~/autoedit-northshore`, port 8011, `https://ai-northshore.ultimatedzm.com` |
-| `SKYDIVEOS_API_BASE` | **the North Shore SkydiveOS backend — confirm the hostname before install** |
+| `SKYDIVEOS_API_BASE` | `https://northshore-api.parachutemontreal.ultimatedzm.com` (the value `~/autoedit-northshore/.env` already uses for its callbacks) |
 | `AUTO_EDIT_API_KEY` | North Shore's own key. One value in three places: this box's `.env`, the PM box's `~/.env.northshore`, and `~/autoedit-northshore/.env`. Never reuse another tenant's — `GET /jobs` returns every customer's name, email and links |
 
 Go **direct to the SkydiveOS consumer**, as South Shore does since 2026-09-17 — do not
@@ -68,7 +68,7 @@ ENABLE_AUTO_DISCOVERY=1
 CAMERA_SCANNER=sdcard
 DISCOVERY_INTERVAL_SECONDS=30
 
-SKYDIVEOS_API_BASE=https://<northshore-skydiveos-backend>
+SKYDIVEOS_API_BASE=https://northshore-api.parachutemontreal.ultimatedzm.com
 AUTO_EDIT_API_KEY=<north shore key>
 # CARD_STATUS_URL   — leave unset; it follows SKYDIVEOS_API_BASE
 

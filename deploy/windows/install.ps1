@@ -112,11 +112,18 @@ $envLines = Get-Content .env
 $posixRoots = $envLines | Where-Object { $_ -match '^\s*SDCARD_MOUNT_ROOTS\s*=' -and $_ -notmatch '[A-Za-z]:\\' }
 if ($posixRoots) {
   Write-Host "==> Commenting out POSIX SDCARD_MOUNT_ROOTS in .env (Windows probes drive letters)"
-  ($envLines | ForEach-Object {
+  $patched = $envLines | ForEach-Object {
     if ($_ -match '^\s*SDCARD_MOUNT_ROOTS\s*=' -and $_ -notmatch '[A-Za-z]:\\') {
-      "# (disabled on Windows - the drive letters are probed, not configured)`r`n# $_"
+      "# (disabled on Windows - the drive letters are probed, not configured)"
+      "# $_"
     } else { $_ }
-  }) | Set-Content .env -Encoding UTF8
+  }
+  # UTF-8 WITHOUT a BOM. Windows PowerShell 5.1's `Set-Content -Encoding UTF8` writes
+  # one, and python-dotenv reads the file as plain utf-8 (not utf-8-sig), so the BOM
+  # becomes part of the first line's key name - a variable that is silently unset.
+  # Harmless while line 1 is a comment; invisible and confusing the moment it is not.
+  [System.IO.File]::WriteAllLines(
+    (Join-Path $RepoRoot '.env'), $patched, (New-Object System.Text.UTF8Encoding $false))
 }
 
 # -- 5. Verify what the SD-card path actually needs --------------------------
@@ -146,7 +153,7 @@ Write-Host @"
  1. Edit .env - the ingest box needs exactly these:
       ENABLE_AUTO_DISCOVERY=1
       CAMERA_SCANNER=sdcard
-      SKYDIVEOS_API_BASE=<the North Shore SkydiveOS backend>
+      SKYDIVEOS_API_BASE=https://northshore-api.parachutemontreal.ultimatedzm.com
       AUTO_EDIT_API_KEY=<North Shore's key - same value on all three hosts>
       MONGO_URL=... / MONGO_DB=skydivingos_northshore
       AWS_S3_BUCKET_NAME=skydiveos-northshore-media  (AWS_REGION=ca-central-1)

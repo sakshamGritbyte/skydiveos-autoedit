@@ -140,7 +140,7 @@ uv run --no-sync python scripts\check_sdcard.py --decode
 
 # 2. Service up and scanning
 Get-ScheduledTaskInfo -TaskName 'SkydiveOS-Ingest'
-Get-Content logs\ingest.log -Tail 40 -Wait
+Get-Content logs\ingest.err.log -Tail 40 -Wait
 
 # 3. Operator display — bell + banner on "safe to remove"
 uv run --no-sync python scripts\watch_cards.py
@@ -148,7 +148,7 @@ uv run --no-sync python scripts\watch_cards.py
 
 Then the real one: film the QR, film a jump, insert the card, and watch for
 
-1. `logs\ingest.log` — card detected, clips staged, S3 keys written
+1. `logs\ingest.err.log` — card detected, clips staged, S3 keys written
 2. `watch_cards.py` — `pulling` → `uploading` → **`safe_to_remove`**
 3. the SkydiveOS operator screen showing the same banner (that proves the pushed
    snapshot authenticated — see §6)

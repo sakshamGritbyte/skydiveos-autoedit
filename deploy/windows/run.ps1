@@ -26,20 +26,31 @@ $ErrorActionPreference = 'Stop'
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 Set-Location $RepoRoot
 
-# A Scheduled Task inherits the machine PATH only; uv installs per-user.
-$env:Path = "$env:USERPROFILE\.local\bin;$env:LOCALAPPDATA\Microsoft\WindowsApps;$env:Path"
+# A Scheduled Task inherits the machine PATH only; uv installs per-user, by either of
+# two routes (astral installer, or WinGet's Links shim directory).
+$env:Path = "$env:USERPROFILE\.local\bin;$env:LOCALAPPDATA\Microsoft\WinGet\Links;" +
+            "$env:LOCALAPPDATA\Microsoft\WindowsApps;$env:Path"
 
 $logDir = Join-Path $RepoRoot 'logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-$log = Join-Path $logDir 'ingest.log'
+$outLog = Join-Path $logDir 'ingest.out.log'
+$errLog = Join-Path $logDir 'ingest.err.log'
 
-# Crude rotation: an unattended box runs for months and this log is the only record
-# of what every card did.
-if ((Test-Path $log) -and ((Get-Item $log).Length -gt 50MB)) {
-  Move-Item $log "$log.1" -Force
+# uvicorn logs to STDERR, so ingest.err.log is the interesting one - same split as the
+# Mac's launchd plist (StandardOutPath / StandardErrorPath).
+#
+# Deliberately NOT `uv ... 2>&1 | Tee-Object`: Tee holds its file stream open for the
+# life of the pipeline, and a server pipeline never ends, so the log stayed empty while
+# the service ran perfectly (observed on the North Shore box). Start-Process hands the
+# child real file handles, so lines land as they are written.
+#
+# Start-Process truncates its redirect targets, so rotate first rather than appending.
+foreach ($f in @($outLog, $errLog)) {
+  if ((Test-Path $f) -and ((Get-Item $f).Length -gt 0)) { Move-Item $f "$f.1" -Force }
 }
 
-"=== ingest start $(Get-Date -Format o) host=$BindHost port=$Port ===" | Out-File $log -Append -Encoding UTF8
+"=== ingest start $(Get-Date -Format o) host=$BindHost port=$Port ===" |
+  Out-File $outLog -Encoding UTF8
 
 # Fail loudly on the one misconfiguration that looks exactly like "no cards today":
 # a scanner set to something other than sdcard, or discovery switched off entirely.
@@ -47,13 +58,38 @@ $scannerMatch = Select-String -Path .env -Pattern '^\s*CAMERA_SCANNER\s*=\s*(\S+
                 Select-Object -Last 1
 $scanner = if ($scannerMatch) { $scannerMatch.Matches[0].Groups[1].Value } else { $null }
 if ($scanner -and $scanner -ne 'sdcard') {
-  $msg = "WARNING: CAMERA_SCANNER=$scanner on a card-reader box - sdcard was expected"
-  Write-Warning $msg; $msg | Out-File $log -Append -Encoding UTF8
+  "WARNING: CAMERA_SCANNER=$scanner on a card-reader box - sdcard was expected" |
+    Out-File $outLog -Append -Encoding UTF8
 }
+
+# Resolve uv by full path. A Scheduled Task's PATH is not the shell the operator
+# installed it from, and uv arrives by two different routes: the astral installer
+# (%USERPROFILE%\.local\bin) or WinGet (%LOCALAPPDATA%\Microsoft\WinGet\Links).
+$uv = (Get-Command uv -ErrorAction SilentlyContinue).Source
+if (-not $uv) {
+  foreach ($candidate in @(
+    (Join-Path $env:USERPROFILE '.local\bin\uv.exe'),
+    (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links\uv.exe')
+  )) {
+    if (Test-Path $candidate) { $uv = $candidate; break }
+  }
+}
+if (-not $uv) {
+  "FATAL: uv not found. Install it, or add its directory to the machine PATH." |
+    Out-File $errLog -Append -Encoding UTF8
+  exit 9
+}
+
+# Python block-buffers stdout when it is a pipe rather than a console; without this the
+# log lags reality by however long it takes to fill a buffer.
+$env:PYTHONUNBUFFERED = '1'
 
 # --no-sync reuses the .venv install.ps1 populated, without re-resolving the lockfile
 # on every boot (a re-sync on a flaky dropzone uplink is a boot that never finishes).
-uv run --no-sync uvicorn api.app:app --host $BindHost --port $Port 2>&1 |
-  Tee-Object -FilePath $log -Append
+$proc = Start-Process -FilePath $uv -PassThru -NoNewWindow -WorkingDirectory $RepoRoot `
+  -ArgumentList @('run', '--no-sync', 'uvicorn', 'api.app:app',
+                  '--host', $BindHost, '--port', "$Port") `
+  -RedirectStandardOutput $outLog -RedirectStandardError $errLog
 
-exit $LASTEXITCODE
+$proc.WaitForExit()
+exit $proc.ExitCode

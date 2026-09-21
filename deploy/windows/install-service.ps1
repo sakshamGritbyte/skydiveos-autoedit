@@ -145,7 +145,7 @@ Remove it before installing this one, or both will start at boot and race for po
     Write-Host ""
     Write-Host "Useful:"
     Write-Host "  Get-ScheduledTaskInfo -TaskName '$TaskName'"
-    Write-Host "  Get-Content $RepoRoot\logs\ingest.log -Tail 40 -Wait"
+    Write-Host "  Get-Content $RepoRoot\logs\ingest.err.log -Tail 40 -Wait   # uvicorn logs to stderr"
     Write-Host "  uv run --no-sync python scripts\watch_cards.py     # operator display"
     Write-Host "  powershell -File deploy\windows\install-service.ps1 -Action remove"
     break

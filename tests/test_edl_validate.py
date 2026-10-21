@@ -18,7 +18,7 @@ import pytest
 
 from api import selfie
 from api.selfie import FileSignals, GpmfSignals
-from edl.validate import validate_and_repair
+from edl.validate import bookend_ranges, validate_and_repair
 
 _FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -311,8 +311,16 @@ def test_ultimum_min_shot_and_switch_rate() -> None:
     #     clamp — a sub-range trimmed inside a single original range of the same
     #     (camera, scene). A genuinely shifted clip lands outside its originals and fails
     #     both checks.
+    # Bug 441: the filmed intro/outro BOOKEND is the one clip allowed to grow past the
+    # editor's ranges — to exactly its whole source file (edl.validate.bookend_ranges).
+    bookends = {
+        (b["camera"], b["scene"], round(b["src_start"], 6), round(b["src_end"], 6))
+        for b in bookend_ranges(mbc["instructor"], mbc, multicam=True)
+    }
     for c in out:
         key = (c.get("camera"), c["scene"])
+        if (key[0], key[1], round(c["src_start"], 6), round(c["src_end"], 6)) in bookends:
+            continue
         ranges = original.get(key, [])
         starts = {round(s, 6) for s, _ in ranges}
         ends = {round(e, 6) for _, e in ranges}

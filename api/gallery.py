@@ -151,6 +151,8 @@ def render_gallery_html(
     raw_unavailable: bool = False,
     raw_play_urls: Mapping[str, str | None] | None = None,
     raw_pending: int = 0,
+    raw_included: bool = False,
+    download_everything_url: str | None = None,
     load_videos: list[tuple[str, str]] | None = None,
     purchased_addons: Sequence[str] = (),
     locked_videos: Sequence[str] = (),
@@ -224,6 +226,20 @@ def render_gallery_html(
       under the Video tab for a customer who already had a gallery and bought the load
       video as an add-on. Empty/None → no section. (A no-media customer's *child* gallery
       shows the load video as its main ``videos`` instead — it's the only video they have.)
+    * ``raw_included`` — Bug 440: the Raw Footage section was released because the
+      customer's PACKAGE includes it (no purchase). Same section, same downloads;
+      only the wording changes ("Included with your package"), so it never reads as
+      something they bought or still have to buy. Ignored without ``raw_videos``, and
+      an included-but-missing set renders nothing rather than the purchase's
+      "no longer available" note (there was no purchase to account for).
+    * ``download_all_url`` / ``download_everything_url`` — Bug 439: the photo set, and
+      every owned deliverable + the owned photos, each as ONE streamed ZIP
+      (``/j/{code}/zip/{photos|all}``). The host passes them only for what the
+      customer owns. Each button checks the ZIP with a HEAD first (so a refusal is a
+      message on the page, not a JSON tab), shows "Preparing…", ignores a second tap
+      while one is starting, then hands the URL to the browser's own download
+      manager — nothing is buffered in the page. Without JavaScript the plain anchor
+      still downloads. An iOS-only note explains that a ZIP lands in the Files app.
     * ``download_urls`` — ``{deliverable: href}`` for the per-card Download anchors when
       that must differ from the player URL. The served route passes its ``?dl=1``
       variant, which is served as an attachment and never redirected to the CDN — a
@@ -328,8 +344,17 @@ def render_gallery_html(
     )
 
     dl_btn = (
-        f'<a class="btn" href="{e(download_all_url)}" download>Download all photos (.zip)</a>'
+        f'<a class="btn" data-zip href="{e(download_all_url)}" download>'
+        "Download all photos (.zip)</a>"
         if download_all_url and photos_unlocked else ""
+    )
+    # Bug 439 — iPhone/iPad save a ZIP to Files, not to Photos; say so where the
+    # bulk buttons are (revealed by the script below on iOS only).
+    ios_note = (
+        '<p class="zipnote" data-ios-note hidden>On iPhone and iPad, ZIP files are saved '
+        "to the Files app, not to Photos. To save a single photo straight to Photos, "
+        "open it and use Share → Save Image.</p>"
+        if (download_all_url and photos_unlocked) or download_everything_url else ""
     )
     n_photos = len(photos) if photos else photo_count_teaser
     if photos_unlocked:
@@ -361,7 +386,7 @@ def render_gallery_html(
         f"""
       <section class="photos" id="tab-photos">
         <div class="shead"><h2>Photos <span>({n_photos})</span></h2>{dl_btn}</div>
-        {photo_body}
+        {photo_body}{ios_note if dl_btn else ""}
       </section>"""
         if n_photos else ""
     )
@@ -389,10 +414,16 @@ def render_gallery_html(
             f'<div class="ctasub">{e(primary_download_note)}</div>'
             if primary_download_note else ""
         )
+        everything = (
+            f'<div class="ctamore"><a class="btn2" data-zip href="{e(download_everything_url)}" '
+            'download>⬇ Download everything (.zip)</a>'
+            '<span>All your videos and photos in one file</span></div>'
+            if download_everything_url else ""
+        )
         cta_bar = (
             '<div class="cta">'
             f'<a class="ctabtn dl" href="{e(primary_download_url)}" download>⬇ Download video</a>'
-            f"{note}</div>"
+            f"{note}{everything}{ios_note if everything else ''}</div>"
         )
 
     # "Add to your day" — the same row in both entitlement states (design notes).
@@ -460,6 +491,34 @@ def render_gallery_html(
         "{sig}", html.escape(init_sig, quote=True)
     ) if poll_token else ""
 
+    # Bug 439 — the bulk-download buttons: HEAD first (a refusal is shown here, not
+    # a JSON tab), "Preparing…" while it answers, a second tap ignored, then the
+    # browser's own download manager takes the URL (nothing buffered in the page).
+    # Plain anchors without JS. Only emitted when a ZIP button exists.
+    zip_js = (
+        "<script>(function(){"
+        "var ios=/iPad|iPhone|iPod/.test(navigator.userAgent)||"
+        "(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);"
+        "if(ios)document.querySelectorAll('[data-ios-note]').forEach(function(n){n.hidden=false;});"
+        "document.querySelectorAll('a[data-zip]').forEach(function(a){"
+        "var label=a.textContent;"
+        "a.addEventListener('click',function(ev){"
+        "ev.preventDefault();if(a.getAttribute('aria-busy')==='true')return;"
+        "var err=a.parentNode.querySelector('.ziperr');if(err)err.remove();"
+        "a.setAttribute('aria-busy','true');a.textContent='Preparing your download\u2026';"
+        "var done=function(){a.removeAttribute('aria-busy');a.textContent=label;};"
+        "fetch(a.href,{method:'HEAD',cache:'no-store'}).then(function(r){"
+        "if(!r.ok)throw new Error(r.status===404?'nothing':'failed');"
+        "window.location.assign(a.href);a.textContent='Download started \u2014 check your downloads';"
+        "setTimeout(done,8000);"
+        "})['catch'](function(e){done();var m=document.createElement('span');m.className='ziperr';"
+        "m.setAttribute('role','alert');"
+        "m.textContent=e&&e.message==='nothing'?'There is nothing to download here yet.':"
+        "'We couldn\u2019t prepare your download. Please try again in a moment.';"
+        "a.insertAdjacentElement('afterend',m);});"
+        "});});})();</script>"
+    ) if (dl_btn or download_everything_url) else ""
+
     if tabbed:
         eyebrow = "We filmed it anyway" if locked else "Your jump is ready"
         eyebrow_html = f'<div class="eyebrow">{eyebrow}</div>'
@@ -494,9 +553,10 @@ def render_gallery_html(
             )
         return f'<video controls preload="metadata" playsinline src="{e(play)}"></video>'
 
+    raw_badge = "RAW · INCLUDED" if raw_included else "RAW · AS FILMED"
     raw_cards = "".join(
         f"""
-        <div class="vcard"><div class="pbadge ok">RAW · AS FILMED</div>
+        <div class="vcard"><div class="pbadge ok">{raw_badge}</div>
           {raw_player(label, url)}
           <div class="vlabel"><div class="titles">{e(label)}<span>Camera master</span></div>
           <a class="vdl" href="{e(url)}" download>Download</a></div>
@@ -504,10 +564,16 @@ def render_gallery_html(
         for label, url in raw_videos
     )
     if raw_videos:
+        included_line = (
+            '<p class="rawnote">Included with your package — your unedited camera files, '
+            "free to download. Each clip is a large file: download the ones you want one "
+            "at a time, ideally on Wi-Fi.</p>"
+            if raw_included else ""
+        )
         raw_section = f"""
-      <h2>Raw Footage <span>({len(raw_videos)})</span></h2>
+      <h2>Raw Footage <span>({len(raw_videos)})</span></h2>{included_line}
       <div class="vgrid">{raw_cards}</div>"""
-    elif raw_unavailable:
+    elif raw_unavailable and not raw_included:
         # Purchased, but the masters are gone. A paid-for section that silently
         # vanishes reads as a broken page (or a swindle); say what happened instead.
         # No download link is offered to a missing file — the honest state is text.
@@ -633,6 +699,14 @@ def render_gallery_html(
   .shead {{ display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin-bottom:20px; }}
   .shead h2 {{ margin-bottom:0; }}
   .btn {{ background:var(--red); color:#fff; padding:10px 18px; border-radius:9px; font-weight:700; font-size:13px; }}
+  .btn2 {{ display:inline-flex; align-items:center; min-height:44px; border:1px solid var(--red); color:var(--red); padding:10px 18px; border-radius:9px; font-weight:700; font-size:14px; }}
+  .btn2:hover {{ background:var(--red); color:#fff; }}
+  .ctamore {{ margin-top:16px; display:flex; flex-wrap:wrap; align-items:center; gap:10px 14px; }}
+  .ctamore span {{ color:var(--gray); font-size:13px; }}
+  [data-zip][aria-busy="true"] {{ opacity:.7; pointer-events:none; }}
+  .ziperr {{ display:block; color:#ff6b6b; font-size:13px; margin-top:8px; }}
+  .zipnote {{ color:var(--gray); font-size:12.5px; margin-top:12px; }}
+  .rawnote {{ color:var(--gray); font-size:14px; margin:-10px 0 16px; }}
   .pgrid {{ display:grid; grid-template-columns:repeat(4,1fr); gap:10px; }}
   .ptile {{ display:block; aspect-ratio:1/1; overflow:hidden; border-radius:10px; border:1px solid var(--line); background:var(--surface); }}
   .ptile img {{ width:100%; height:100%; object-fit:cover; transition:transform .2s; }}
@@ -687,6 +761,7 @@ def render_gallery_html(
     .pgrid {{ grid-template-columns:repeat(3,1fr); }}
     .utile {{ grid-template-columns:1fr; row-gap:14px; }}
     .utile .uprice {{ grid-column:1; grid-row:auto; justify-self:start; }}
+    .shead .btn, .ctamore .btn2 {{ width:100%; justify-content:center; text-align:center; min-height:44px; }}
   }}
 </style></head>
 <body>
@@ -698,4 +773,4 @@ def render_gallery_html(
   </main>
   {upsell_section}
   <footer>Powered by <span class="fmark">{_PLATFORM_MARK}</span> · {brand_e}</footer>
-{tab_js}{flip_js}</body></html>"""
+{tab_js}{flip_js}{zip_js}</body></html>"""

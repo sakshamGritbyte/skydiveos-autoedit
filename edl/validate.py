@@ -66,6 +66,12 @@ _BOARD_MIN_COVERAGE_S = 6.0
 _BOARD_BEAT_S = 3.0
 #: highlights: the intro clip must run at least this long.
 _INTRO_MIN_S = 3.0
+#: Bug 441 — the filmed intro/outro "bookends": the FIRST source file of the
+#: intro interview and the LAST source file of the outro interview play in full,
+#: untrimmed, in these deliverables (the client's edit rule). Highlights keep
+#: their short intro/outro beats on purpose (a <60 s cut cannot hold them whole).
+BOOKEND_DELIVERABLES: frozenset[str] = frozenset({"full_video"})
+_OUTRO_SCENE = "outro_interview"
 #: Clips shorter than this (source seconds) are dropped after clamping.
 _MIN_CLIP_S = 0.05
 #: Contiguity tolerance for merging adjacent fragments.
@@ -718,6 +724,137 @@ def _enforce_min_shot(clips: list[ClipDict]) -> tuple[list[ClipDict], list[str]]
 
 
 # --------------------------------------------------------------------------- #
+# Bug 441 — the filmed intro / outro bookends
+# --------------------------------------------------------------------------- #
+
+
+def _first_file_range(scene: dict[str, Any]) -> tuple[float, float]:
+    """``[0, start of the 2nd file)`` — the scene's FIRST source clip (whole scene
+    when it is one file, or an older manifest without ``file_offsets``)."""
+    dur = max(float(scene.get("duration", 0.0)), 0.0)
+    offsets = scene.get("file_offsets") or []
+    if len(offsets) >= 2:
+        return 0.0, min(float(offsets[1]["offset"]), dur)
+    return 0.0, dur
+
+
+def _last_file_range(scene: dict[str, Any]) -> tuple[float, float]:
+    """``[start of the last file, end)`` — the scene's LAST source clip."""
+    dur = max(float(scene.get("duration", 0.0)), 0.0)
+    offsets = scene.get("file_offsets") or []
+    if len(offsets) >= 2:
+        return min(float(offsets[-1]["offset"]), dur), dur
+    return 0.0, dur
+
+
+def bookend_ranges(
+    manifest: dict[str, Any],
+    manifest_by_camera: dict[str, dict[str, Any]] | None = None,
+    *,
+    multicam: bool = False,
+) -> list[dict[str, Any]]:
+    """The filmed intro/outro clips that must play IN FULL and WITHOUT music (Bug 441).
+
+    ``[{"scene", "camera", "src_start", "src_end"}]`` — the first source file of
+    ``intro_interview`` and the last source file of ``outro_interview``, in scene
+    seconds. Shared by :func:`validate_and_repair` (which guarantees them untrimmed)
+    and the renderer (which plays their original audio with the music silenced), so
+    the two can never disagree about what a bookend is. Derived from the manifest,
+    never stored on the clips (the persisted clip schema has no room for a flag, and
+    a replay re-renders a saved EDL against the same manifest).
+
+    ``multicam`` (the Ultimate combo, camera-tagged clips): ONE camera per scene,
+    instructor first — the same preference ``_require_intro`` uses — so an interview
+    filmed by both cameras is not played twice. A scene shorter than the degenerate
+    clip floor yields nothing. Pure.
+    """
+    out: list[dict[str, Any]] = []
+    for scene_name, ranger in ((_INTRO_SCENE, _first_file_range), (_OUTRO_SCENE, _last_file_range)):
+        scene: dict[str, Any] | None = None
+        camera: str | None = None
+        if multicam and manifest_by_camera:
+            for candidate in sorted(manifest_by_camera, key=lambda c: (c != "instructor", c)):
+                scene = _scene_by_name(manifest_by_camera[candidate], scene_name)
+                if scene is not None:
+                    camera = candidate
+                    break
+        else:
+            scene = _scene_by_name(manifest, scene_name)
+        if scene is None:
+            continue
+        lo, hi = ranger(scene)
+        if hi - lo < _MIN_CLIP_S:
+            continue
+        out.append({"scene": scene_name, "camera": camera, "src_start": lo, "src_end": hi})
+    return out
+
+
+def _require_bookends(
+    clips: list[ClipDict],
+    manifest: dict[str, Any],
+    manifest_by_camera: dict[str, dict[str, Any]] | None,
+    ranks: dict[str, int],
+    multicam: bool,
+) -> tuple[list[ClipDict], list[str]]:
+    """Bug 441: the first intro file and the last outro file play whole, at 1x.
+
+    Claude (the instructor/selfie editor) cut the handcam's interviews into
+    "best-scored" fragments, and the house cut trims every scene's tail once the
+    source runs past its 210 s budget — so on both paths the customer's own intro
+    and post-landing reaction lost their heads or tails. For each bookend range:
+    every clip of that (camera, scene) is cut down to the parts OUTSIDE the range
+    (so the range is never shown twice, and a slow-mo fragment inside it goes),
+    then exactly ONE real-time clip spanning the range is inserted in
+    chronological position. Already exactly present → untouched, nothing logged.
+    """
+    out = list(clips)
+    log: list[str] = []
+    for bookend in bookend_ranges(manifest, manifest_by_camera, multicam=multicam):
+        scene, cam = bookend["scene"], bookend["camera"]
+        lo, hi = float(bookend["src_start"]), float(bookend["src_end"])
+
+        overlapping = [
+            c for c in out
+            if c["scene"] == scene
+            and (c.get("camera") or None) == cam
+            and float(c["src_start"]) < hi - _EPS
+            and float(c["src_end"]) > lo + _EPS
+        ]
+        exact = [
+            c for c in overlapping
+            if abs(float(c["src_start"]) - lo) < 1e-3
+            and abs(float(c["src_end"]) - hi) < 1e-3
+            and abs(float(c.get("speed_multiplier", 1.0)) - 1.0) < _EPS
+        ]
+        if len(overlapping) == 1 and exact:
+            continue
+
+        kept: list[ClipDict] = []
+        for c in out:
+            if c not in overlapping:
+                kept.append(c)
+                continue
+            for a, b in ((float(c["src_start"]), min(float(c["src_end"]), lo)),
+                         (max(float(c["src_start"]), hi), float(c["src_end"]))):
+                if b - a >= _MIN_CLIP_S:
+                    kept.append({**c, "src_start": a, "src_end": b})
+        beat: ClipDict = {
+            "scene": scene,
+            "src_start": lo,
+            "src_end": hi,
+            "speed_multiplier": 1.0,
+            "camera": cam,
+        }
+        out = _insert_chronological(kept, beat, ranks)
+        trimmed = ", ".join(_fmt(c) for c in overlapping) or "nothing"
+        log.append(
+            f"kept {'intro' if scene == _INTRO_SCENE else 'outro'} bookend whole {_fmt(beat)} "
+            f"(replaced {trimmed}) — the first/last filmed clip is never trimmed"
+        )
+    return out, log
+
+
+# --------------------------------------------------------------------------- #
 # Orchestrator
 # --------------------------------------------------------------------------- #
 
@@ -780,6 +917,12 @@ def validate_and_repair(
         clips = _apply(_align_cross_camera(clips, manifest, manifest_by_camera, ranks))
         clips = _apply(_limit_switch_rate(clips, ranks))
         clips = _apply(_enforce_min_shot(clips))
+    if deliverable in BOOKEND_DELIVERABLES:
+        # LAST, so no later rule (dedupe, switch-rate, min-shot) can trim or drop the
+        # whole-file clip it inserts.
+        clips = _apply(
+            _require_bookends(clips, manifest, manifest_by_camera, ranks, multicam)
+        )
 
     if not clips:  # never hand back an empty deliverable (EDLResponse needs >= 1 clip)
         return [dict(c) for c in edl], [

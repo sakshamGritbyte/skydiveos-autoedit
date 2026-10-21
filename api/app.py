@@ -52,7 +52,14 @@ from typing import TYPE_CHECKING, Annotated, Any
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi import Path as PathParam
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 
 from edl.schema import EditDecisionList
 from ingest.registry import CameraRegistry
@@ -62,6 +69,7 @@ from .auth import PUBLIC_PATH_PREFIX, AdminDep, PrincipalDep, service_token_allo
 from .catalogue import PriceCatalogue, load_price_catalogue
 from .config import Settings, get_settings
 from .gallery import brand_logo_data_uri, render_gallery_html
+from .gallery_zip import ZIP_KINDS, ZipEntry, content_disposition, stream_zip
 from .jobs import (
     CAMERA_ROLE_EXTERNAL,
     CAMERA_ROLE_INSTRUCTOR,
@@ -296,6 +304,20 @@ MEDIA_CACHE_LOCKED = "private, max-age=60"
 #: has a gallery of their own (a no-media customer buys the same footage through their
 #: child gallery's ordinary ``unlock`` instead).
 PURCHASABLE_ADDONS = frozenset({"raw", "photos", LOAD_VIDEO_KEY})
+
+#: Bug 440 — SkydiveOS releases an add-on the customer's PACKAGE includes through the
+#: same ``POST /jobs/{id}/unlock`` (``item: "raw"``), with an ENTITLEMENT reference in
+#: ``payment_reference`` instead of a captured-transaction id: ``included:raw:{booking}``.
+#: No money moved. Recorded in ``Job.addons`` exactly like a purchase (so every gate —
+#: the routes, the pruner's keep-raw rule, the proxies — behaves identically) and only
+#: the gallery's WORDING reads the prefix: "Included with your package", never a sale.
+INCLUDED_REFERENCE_PREFIX = "included:"
+
+
+def addon_included(job: Job, item: str) -> bool:
+    """True when ``item`` was released because the package includes it (Bug 440)."""
+    ref = (job.addons or {}).get(item)
+    return isinstance(ref, str) and ref.startswith(INCLUDED_REFERENCE_PREFIX)
 
 #: ``POST /jobs/{id}/unlock`` items that buy ONE camera's locked deliverables — the
 #: speculative edit filmed alongside a purchased one, or either half of a jump where
@@ -1711,6 +1733,20 @@ def create_app() -> FastAPI:
             )
         if item in job.addons:
             return JobResponse.from_job(job)  # already purchased — idempotent
+        if (
+            body.payment_reference.startswith(INCLUDED_REFERENCE_PREFIX)
+            and job.job_kind is not JobKind.jump
+        ):
+            # Bug 440 — a package-included release only means something on the
+            # customer's own jump: a load master/child owns no camera masters of the
+            # customer's, so there is nothing to include (and a "raw" addon there
+            # would render a "files no longer available" section). A no-op, not 4xx,
+            # so SkydiveOS's durable queue records it as done rather than retrying.
+            logger.info(
+                "job %s included %r skipped — %s job has no own camera masters",
+                job_id, item, job.job_kind.value,
+            )
+            return JobResponse.from_job(job)
         updated = store.update(job_id, addons={**job.addons, item: body.payment_reference})
         logger.info(
             "job %s add-on %r purchased payment=%s by=%s",
@@ -2492,12 +2528,25 @@ def create_app() -> FastAPI:
             raw_videos=raw_clips,
             raw_play_urls=raw_play_urls,
             raw_pending=raw_pending,
+            # Bug 440 — included with the package (no purchase): labelled so.
+            raw_included=addon_included(job, "raw"),
             # Bought it, files gone (pruning keeps purchased masters — this is a
             # wiped volume): say so instead of dropping a section the customer
             # paid for. `/j/{token}/raw/…` already 404s, so this is display-only.
             raw_unavailable="raw" in job.addons and not raw_files,
             load_videos=load_clips,
-            download_all_url=None,
+            # Bug 439 — the photo set as ONE streamed ZIP, only while it is owned
+            # (the route refuses a locked set too), and "everything" — every
+            # deliverable the customer owns plus the owned photos — when there is
+            # more than one file to save.
+            download_all_url=(
+                f"/j/{token}/zip/photos" if photo_names and not locked_photos else None
+            ),
+            download_everything_url=(
+                f"/j/{token}/zip/all"
+                if _zip_entries(store, job, settings, "all", probe_only=True) >= 2
+                else None
+            ),
             locked=locked,
             locked_videos=locked_names,
             group_unlocks=group_unlocks,
@@ -2797,6 +2846,113 @@ def create_app() -> FastAPI:
             # reloads the page): without a lifetime, a 40-still set is re-downloaded
             # in full every time (Bug 373).
             headers={"Cache-Control": MEDIA_CACHE_OWNED},
+        )
+
+    def _zip_entries(
+        store: JobStore, job: Job, settings: Settings, kind: str, *, probe_only: bool = False
+    ) -> Any:
+        """What the ``kind`` ZIP may contain for THIS job (Bug 439) — or, with
+        ``probe_only``, just how many files that is (no openers built).
+
+        Files resolve through :func:`_media_job` (a child gallery's master) while the
+        LOCK is this job's, exactly like the per-file routes: a ``preview_only``
+        deliverable is never included, and the photo set only while
+        :func:`api.jobs.photos_locked` says it is owned. A delivered render pruned off
+        local disk streams from its S3 copy (``deliveries/{owner}/{name}.mp4``); one
+        in neither place is still listed, so the archive's MISSING-FILES.txt names it.
+        Raw camera masters are never included (multi-GB; their cards keep per-clip
+        downloads).
+        """
+        owner = _media_job(store, job)
+        owner_dir = store.dir(owner.job_id)
+        entries: list[ZipEntry] = []
+        count = 0
+
+        def _local(path: Path) -> Callable[[], Any]:
+            def _open() -> Any:
+                if not path.is_file() or not _served_under(path, owner_dir):
+                    raise FileNotFoundError(path.name)
+                return path.open("rb")
+            return _open
+
+        def _s3(filename: str) -> Callable[[], Any]:
+            def _open() -> Any:
+                if not settings.s3_bucket:
+                    raise FileNotFoundError(filename)
+                from .delivery import _default_s3_client  # noqa: PLC0415 - lazy boto3
+
+                obj = _default_s3_client(settings).get_object(
+                    Bucket=settings.s3_bucket, Key=f"deliveries/{owner.job_id}/{filename}"
+                )
+                return obj["Body"]
+            return _open
+
+        if kind == "all":
+            for name in _gallery_videos(store, job):
+                if entitlement_for(job, name) is Entitlement.preview_only:
+                    continue  # never a locked deliverable — its only address is the preview
+                count += 1
+                if probe_only:
+                    continue
+                path = owner_dir / f"{name}.mp4"
+                opener = (
+                    _local(path)
+                    if path.is_file() or owner.status is not JobStatus.delivered
+                    else _s3(f"{name}.mp4")
+                )
+                entries.append(ZipEntry(f"{name}.mp4", opener))
+        if not photos_locked(job):
+            photos_dir = owner_dir / "photos"
+            for filename in _gallery_photo_names(store, job):
+                if not _is_safe_segment(filename):
+                    continue
+                count += 1
+                if probe_only:
+                    continue
+                arc = f"photos/{filename}" if kind == "all" else filename
+                path = photos_dir / filename
+
+                def _photo(p: Path = path) -> Any:
+                    if not p.is_file() or not _served_under(p, photos_dir):
+                        raise FileNotFoundError(p.name)
+                    return p.open("rb")
+
+                entries.append(ZipEntry(arc, _photo))
+        return count if probe_only else entries
+
+    # GET + HEAD: the gallery page's buttons send a HEAD first (cheap — no archive is
+    # built) so a refusal is shown on the page instead of navigating the customer to
+    # a JSON error; the GET is then a plain navigation the browser's own download
+    # manager saves, which is what keeps a large archive out of the page's memory.
+    @app.api_route(
+        "/j/{token}/zip/{kind}", methods=["GET", "HEAD"], include_in_schema=False
+    )
+    def public_zip(
+        token: str, kind: str, request: Request, store: StoreDep, settings: SettingsDep
+    ) -> Response:
+        """Bug 439 — the gallery's "Download all photos" / "Download everything" ZIP.
+
+        Streamed (:func:`api.gallery_zip.stream_zip`), named after the customer, and
+        holding only what this job OWNS — see :func:`_zip_entries`. Nothing owned to
+        zip → 404, never an empty archive. Same credential as every ``/j/`` route:
+        the unguessable code, never logged.
+        """
+        job = _job_by_token(store, token)
+        if kind not in ZIP_KINDS:
+            raise HTTPException(status_code=404, detail="no such download")
+        entries = _zip_entries(store, job, settings, kind)
+        if not entries:
+            raise HTTPException(status_code=404, detail="nothing to download yet")
+        headers = {
+            "Content-Disposition": content_disposition(job.customer_name, kind),
+            # The code is the credential: no shared cache may keep this response.
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        }
+        if request.method == "HEAD":
+            return Response(status_code=200, media_type="application/zip", headers=headers)
+        return StreamingResponse(
+            stream_zip(entries), media_type="application/zip", headers=headers
         )
 
     @app.get("/j/{token}/load/{name}", include_in_schema=False, response_class=FileResponse)

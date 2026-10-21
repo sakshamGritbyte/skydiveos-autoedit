@@ -42,7 +42,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from analysis.proxy import analysis_source
 from edl.storage import job_dir
-from edl.validate import validate_and_repair
+from edl.validate import BOOKEND_DELIVERABLES, bookend_ranges, validate_and_repair
 from render.render import MAXRATE as _MAXRATE
 from render.render import VBV_BUFSIZE as _VBV_BUFSIZE
 
@@ -1170,6 +1170,9 @@ prefer omitting a beat over inserting a zero-value clip.
 full_video:
   All present scenes in order. Trim to stay under 4 minutes. Slow-mo the exit (at
   exit_offset), the top freefall smiles, and the deployment (at deploy_offset).
+  NEVER trim the customer's filmed intro or outro: the FIRST source file of
+  intro_interview and the LAST source file of outro_interview each play WHOLE, at 1x,
+  as one clip (trim the middle of the jump instead to stay under 4 minutes).
 
 The EXIT SEQUENCE is mandatory and must be a CONTINUOUS block, not a short snippet: the
 door/exit-prep (the seconds just before exit_offset) followed by the first several
@@ -2231,6 +2234,7 @@ def render_selfie_video(
     music_path: str | None = None,
     music_only: bool = True,
     deploy_offset: float = 0.0,
+    bookends: Sequence[dict[str, Any]] | None = None,
     width: int = _OUT_W,
     height: int = _OUT_H,
     fps: int = _OUT_FPS,
@@ -2247,6 +2251,13 @@ def render_selfie_video(
       and is the only audio through the exit/freefall (original muted there), then at
       the canopy opening the original audio is re-enabled with the music ducked
       underneath. Slow-mo clips still contribute no stretched audio (music covers).
+
+    ``bookends`` (Bug 441, :func:`edl.validate.bookend_ranges` — passed for
+    ``full_video`` only) are the filmed intro/outro clips the client wants played
+    in full and WITHOUT music: a real-time clip lying inside one keeps its ORIGINAL
+    audio whatever the mix above says, and the backing track is gated to silence
+    over its output window (through the logo card when it is the final clip, so the
+    music doesn't pop back in for 2.5 s). ``None``/empty → byte-identical to before.
     """
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -2284,6 +2295,21 @@ def render_selfie_video(
     inf = float("inf")
     mute_lo = music_start if not music_only else 0.0
     mute_hi = canopy_start if (not music_only and canopy_start is not None) else inf
+    bookend_keys = [
+        (f"{b['camera']}/{b['scene']}" if b.get("camera") else b["scene"],
+         float(b["src_start"]), float(b["src_end"]))
+        for b in (bookends or [])
+    ]
+
+    def _is_bookend(clip: Clip) -> bool:
+        key = _scene_key(clip)
+        return clip.speed_multiplier == 1.0 and any(
+            key == k and clip.src_start >= lo - 1e-3 and clip.src_end <= hi + 1e-3
+            for k, lo, hi in bookend_keys
+        )
+
+    # Output-time windows where the music must be silent (Bug 441).
+    silent_windows: list[tuple[float, float]] = []
 
     with tempfile.TemporaryDirectory(prefix=f"selfie-{out.stem}-") as tmp:
         chains: list[str] = []
@@ -2301,12 +2327,12 @@ def render_selfie_video(
             # Original audio plays only when: not a music-only edit, the source has
             # audio, the clip is real-time (no stretched slow-mo audio), and we're
             # outside the boarding→canopy "music takes over" window.
-            use_original = (
-                not music_only
-                and has_audio[i]
-                and clip.speed_multiplier == 1.0
-                and not (mute_lo <= out_t < mute_hi)
+            bookend = _is_bookend(clip)
+            use_original = has_audio[i] and clip.speed_multiplier == 1.0 and (
+                bookend or (not music_only and not (mute_lo <= out_t < mute_hi))
             )
+            if bookend:
+                silent_windows.append((out_t, out_t + dur))
             if use_original:
                 chains.append(
                     f"[{i}:a]atrim={clip.src_start:.3f}:{clip.src_end:.3f},"
@@ -2347,7 +2373,19 @@ def render_selfie_video(
                     f"volume='if(lt(t,{rel_calm:.3f}),{_MUSIC_SOLO},{_MUSIC_UNDER})':eval=frame,"
                     f"{delay}apad=whole_dur={total:.3f}[mus]"
                 )
-            chains.append("[amb][mus]amix=inputs=2:duration=longest:normalize=0[aout]")
+            if silent_windows:
+                # Gate the backing track off over every bookend (t = output time here:
+                # adelay/apad already ran). The outro bookend that ends the edit keeps
+                # the music off through the logo card too.
+                last_end = sum(_clip_out_dur(c) for c in clips)
+                spans = [
+                    (lo, total if abs(hi - last_end) < 1e-3 else hi) for lo, hi in silent_windows
+                ]
+                gate = "+".join(f"between(t,{lo:.3f},{hi:.3f})" for lo, hi in spans)
+                chains.append(f"[mus]volume='if({gate},0,1)':eval=frame[musg]")
+                chains.append("[amb][musg]amix=inputs=2:duration=longest:normalize=0[aout]")
+            else:
+                chains.append("[amb][mus]amix=inputs=2:duration=longest:normalize=0[aout]")
             audio_label = "aout"
 
         cmd = ["ffmpeg", "-v", "error", "-y"]
@@ -2498,6 +2536,8 @@ def render_outputs(
             # share it.
             music_path=music_paths.get(base), music_only=music_only,
             deploy_offset=deploy_offset,
+            # Bug 441 — the filmed intro/outro play whole with their own sound.
+            bookends=bookend_ranges(manifest) if base in BOOKEND_DELIVERABLES else None,
         )
         outputs[name] = str(out)
     return outputs
@@ -3356,6 +3396,7 @@ def run_ultimum_pipeline(
         jd / "full_video.mp4", edls.full_video, combo_paths,
         booking=booking, music_path=music["full_video"],
         music_only=False, deploy_offset=deploy_offset,
+        bookends=bookend_ranges(combo_manifest, role_manifests, multicam=True),
     )
     outputs["full_video"] = str(jd / "full_video.mp4")
     # highlights: music only.
@@ -3445,6 +3486,10 @@ def replay_ultimum(
         jd / "full_video.mp4", _cut(_clips(ULTIMUM_EDL_FILES["full_video"])),
         combo_paths, booking=booking, music_path=music["full_video"],
         music_only=False, deploy_offset=deploy_offset,
+        bookends=bookend_ranges(
+            role_manifests.get("instructor") or next(iter(role_manifests.values()), {}),
+            role_manifests, multicam=True,
+        ),
     )
     outputs["full_video"] = str(jd / "full_video.mp4")
     render_selfie_video(

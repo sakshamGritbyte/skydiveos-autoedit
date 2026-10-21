@@ -427,6 +427,44 @@ Two runtime media roots, with different audiences:
   is gated exactly like `/raw/`. `RAW_WEB_PROXIES=0` turns it off (player = master, as
   before). **The Celery worker must be restarted to learn the task** — uvicorn reloads,
   the worker does not. Tests: `test_rawproxy`, §raw-web in `test_api`.
+- **Raw footage can be INCLUDED, not bought** (Bug 440). SkydiveOS releases raw footage
+  a package includes through the same `POST /jobs/{id}/unlock` (`item: "raw"`) with an
+  ENTITLEMENT reference in `payment_reference` — `included:raw:{booking}` — instead of a
+  captured-transaction id (no money moved; SkydiveOS writes no Payment). It lands in
+  `Job.addons` exactly like a purchase, so every gate (the `/raw` routes, the pruner's
+  keep-raw rule, the proxies) is unchanged; only the gallery WORDING reads the prefix
+  (`api.app.addon_included`): "RAW · INCLUDED" + "Included with your package", and an
+  included-but-missing set renders nothing instead of the purchase's "no longer available"
+  note. An included release on a `load_master`/`load_child` (no own masters) is a 200
+  no-op. `UnlockRequest` is `extra="forbid"`, which is why this rides the reference rather
+  than a new field — an older pipeline still releases the footage, just unlabelled.
+- **The gallery's bulk download is ONE streamed ZIP** (Bug 439, `api/gallery_zip.py`).
+  `GET|HEAD /j/{code}/zip/photos` and `/zip/all` (every OWNED deliverable + the owned photo
+  set — never a `preview_only` deliverable, never a locked photo set, never raw masters,
+  which keep per-clip downloads because they are GBs each). Built by `stream_zip` through a
+  non-seekable sink, so bytes leave as each file is written and at most one source is open;
+  a pruned delivered render streams from `deliveries/{owner}/`; an unopenable file is named
+  in `MISSING-FILES.txt`; nothing owned → 404, never an empty archive; named after the
+  customer (`filename*` keeps accents). **Deflate level 1, never ZIP_STORED** — streamed
+  entries carry data descriptors and STORED + descriptor trips some unzippers (macOS/iOS
+  Archive Utility). The page's buttons HEAD the URL first (refusal shown inline, not a JSON
+  tab), show "Preparing…", ignore a second tap, then hand the URL to the browser's download
+  manager; plain anchors without JS; an iOS-only note says ZIPs go to the Files app.
+- **The filmed intro/outro BOOKENDS play whole, without music** (Bug 441, client rule).
+  `edl.validate.bookend_ranges(manifest[, manifest_by_camera, multicam])` = the FIRST
+  source file of `intro_interview` (`[0, file_offsets[1])`, whole scene when one file) and
+  the LAST file of `outro_interview` — never the branded cards. For `full_video` only
+  (`BOOKEND_DELIVERABLES`; highlights keep their 8 s / 2 s beats), `validate_and_repair`
+  runs `_require_bookends` LAST: same-(camera, scene) clips are cut to the parts outside
+  the range and ONE 1x clip spanning it is inserted chronologically (exactly present →
+  untouched). The cause it fixes: selfie/instructor jobs compose through Claude, which
+  fragmented the interviews; the house cut (external) kept them whole only under its 210 s
+  budget. `render_selfie_video(bookends=…)` (passed by `render_outputs` and both Ultimate
+  render sites for `full_video`) keeps a bookend clip's ORIGINAL audio whatever the mix
+  says and gates the music to 0 over it — through the logo card when the outro ends the
+  edit. Derived from the manifest, never stored on clips (`Clip` is `extra="forbid"`), so
+  a replay renders it too — but an already-composed EDL keeps its trimmed interviews until
+  RE-PROCESSED (replay does not re-validate). Multi-cam: one camera, instructor first.
 - **Every video card opens on a frame from that very video** (`api/thumbnail.py` →
   `GET /j/{code}/poster/{name}`). A `<video>` with no `poster` is drawn by the browser
   — a grey box or iOS's generic cloud tile — so five cards read as one stock page, on

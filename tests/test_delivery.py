@@ -761,6 +761,8 @@ def test_status_callback_hits_skydiveos_route_with_links_and_token(
     posted: dict[str, object] = {}
 
     class _Resp:
+        status_code = 200
+
         def raise_for_status(self) -> None:
             pass
 
@@ -809,6 +811,7 @@ def test_status_callback_omits_token_when_unset(
     def _fake_post(url, *, json, headers, timeout):  # noqa: ANN001
         posted.update(headers=headers, json=json)
         class _R:
+            status_code = 200
             def raise_for_status(self) -> None: ...
         return _R()
 
@@ -1320,6 +1323,8 @@ def test_status_callback_forwards_entitlement_and_gallery_url(
     posted: dict[str, object] = {}
 
     class _Resp:
+        status_code = 200
+
         def raise_for_status(self) -> None:
             pass
 
@@ -1354,6 +1359,8 @@ def test_status_callback_omits_gallery_url_without_a_public_base(
     posted: dict[str, object] = {}
 
     class _Resp:
+        status_code = 200
+
         def raise_for_status(self) -> None:
             pass
 
@@ -1405,6 +1412,7 @@ def test_status_callback_carries_the_booking_and_customer_identity(
     def _fake_post(url, *, json, headers, timeout):  # noqa: ANN001
         posted.update(json=json)
         class _R:
+            status_code = 200
             def raise_for_status(self) -> None: ...
         return _R()
 
@@ -1436,6 +1444,7 @@ def test_status_callback_omits_identity_it_does_not_know(
     def _fake_post(url, *, json, headers, timeout):  # noqa: ANN001
         posted.update(json=json)
         class _R:
+            status_code = 200
             def raise_for_status(self) -> None: ...
         return _R()
 

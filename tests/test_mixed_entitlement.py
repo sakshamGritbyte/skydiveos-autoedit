@@ -1088,6 +1088,7 @@ def test_status_callback_carries_the_resolved_per_deliverable_lock(
         @staticmethod
         def post(url: str, json: dict[str, object], headers: dict[str, str], timeout: float):
             sent.update(json)
+            return type("_R", (), {"status_code": 200})()
 
     monkeypatch.setattr(
         tasks, "get_settings", lambda: _settings(skydiveos_api_base="http://sos.test")
@@ -1124,6 +1125,7 @@ def test_status_callback_is_unchanged_for_a_single_product_job(
         @staticmethod
         def post(url: str, json: dict[str, object], headers: dict[str, str], timeout: float):
             sent.update(json)
+            return type("_R", (), {"status_code": 200})()
 
     monkeypatch.setattr(
         tasks, "get_settings", lambda: _settings(skydiveos_api_base="http://sos.test")

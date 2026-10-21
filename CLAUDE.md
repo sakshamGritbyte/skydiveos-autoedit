@@ -532,6 +532,42 @@ Two runtime media roots, with different audiences:
   His WHOLE card is the master. `resolve_load_for_staff` raises
   `ingest.match.NotSpecFlight` for a flyer holding a jumper slot — that path never
   softens (an assigned cameraman's card is his customer's product, never a master).
+- **A load's flight window is SkydiveOS's, and a closed one makes the load matchable
+  (BUGS 417/418).** SkydiveOS closes each window at takeoff +
+  `mediaconfigs.autoEdit.flightWindowCloseOffsetMinutes` (−30…120, default 5) and
+  publishes it on the load: `flightWindow.closesAt` (planned), `flightWindow.closedAt`
+  (claimed once). `ingest.match.load_is_matchable` is the ONE eligibility rule: a status
+  in `_MATCHABLE_STATUSES` OR `flight_window_closed` (claim, or `closesAt` already
+  passed) on a non-cancelled load. It is the mirror of SkydiveOS's
+  `isLoadFootageEligible`; change both or neither. Do not re-derive the close instant
+  here, and do not touch `Load.status`.
+- **The bridge HOLDS a clip whose load is still in the air; it does not flag it**
+  (`Bridge._defer`, `state["deferred"]`, durable). Before this, a clip from a load staff
+  had not landed failed both matches and was flagged TERMINALLY. Nothing retried it
+  until a human closed the load (the reported 108-minute window). `open_window_hold`
+  answers "is there an in-air load with an open window that could own this clip?"; the
+  held clip is re-matched every `DEFER_RETRY_S` and flagged with that reason after
+  `DEFER_MAX_S` (6 h). Weak ownership (`out_of_window_same_day`) while such a load
+  exists is held too: it would otherwise attach the clip to the flyer's PREVIOUS
+  customer. A re-notify of a held key is a duplicate.
+- **`actualTakeoffTime` / `landingTime` are TRUE UTC instants** (SkydiveOS stamps them
+  with `new Date()`); read them with `FootageMatcher._instant_local`, never
+  `_naive_local`. Read as local wall clock, the recorded window sat 4–5 h off in
+  Quebec, and on-flight clips survived only on the lone-candidate fallback.
+  `departureTime` / `businessDate` are still read as naive DZ-local. That convention
+  is unverified against live data; SkydiveOS's manifest writes `departureTime` as an
+  instant, so settle it on both sides before relying on the scheduled window.
+- **The SkydiveOS status callback is retried until it lands (BUG 419).** It is the
+  ONLY carrier of `gallery_url`. `_notify_skydiveos` used to ignore the response, so a
+  401/5xx or a timeout silently lost the customer's notification. Now a non-2xx or a
+  network error is recorded on the job (`Job.pending_callback`) and retried on
+  `CALLBACK_RETRY_DELAYS_S` (about 24 h, bounded) by `retry_status_callback_job`.
+  `GET /jobs/{id}` re-arms a due retry (`kick_due_status_callback`; the countdown
+  message can be lost) and exposes the owed state as `status_callback`. Only the
+  job's CURRENT status is ever owed: SkydiveOS applies a callback's status
+  unconditionally, so replaying an older one would move it backwards. A delivered
+  callback without `gallery_url` (`PUBLIC_BASE_URL` unset) is logged at ERROR.
+  Tests: `tests/test_flight_window_callbacks.py`.
 
 ## Bash Commands
 - `uv sync` — install Python deps into `.venv`. **There is no `requirements.txt`** —

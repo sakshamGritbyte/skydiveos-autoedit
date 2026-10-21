@@ -48,7 +48,7 @@ class _StubBridge:
 
         self.settings: Any = get_settings()
         self.pending: dict[str, Any] = {}
-        self.state: dict[str, dict[str, Any]] = {"handled": {}, "flagged": {}}
+        self.state: dict[str, dict[str, Any]] = {"handled": {}, "flagged": {}, "deferred": {}}
         self.seen: list[dict[str, Any]] = []
 
     async def raw_upload(self, notice: dict[str, Any]) -> dict[str, Any]:
@@ -105,6 +105,8 @@ def test_healthz_reports_the_bridge_counters() -> None:
         "pending_jumps": 1,
         "handled": 1,
         "flagged": 0,
+        # BUG 417 — clips held while their load is still in the air.
+        "deferred": 0,
         # The temporary compatibility path's counter (ownership accepted on
         # same-day-lone-candidate rather than a flight window) — reviewed after a week.
         "out_of_window_accepts": 0,

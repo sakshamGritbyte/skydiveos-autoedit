@@ -23,6 +23,7 @@ from .jobs import (
     LoadRosterEntry,
     MediaRef,
     Package,
+    PendingCallback,
     deliverable_names,
     entitlement_for,
     primary_ref_of,
@@ -206,6 +207,10 @@ class JobResponse(BaseModel):
     delivery_links: dict[str, str] | None
     created_at: float
     updated_at: float
+    #: BUG 419 — a SkydiveOS status callback this job still owes (attempts, last error,
+    #: whether retries ran out). ``None`` when every callback landed. Lets SkydiveOS's
+    #: reconcile say WHY it never heard about a delivery ("HTTP 401 …") instead of guessing.
+    status_callback: PendingCallback | None = None
 
     @classmethod
     def from_job(cls, job: Job) -> JobResponse:
@@ -246,6 +251,7 @@ class JobResponse(BaseModel):
             delivery_links=job.delivery_links,
             created_at=job.created_at,
             updated_at=job.updated_at,
+            status_callback=job.pending_callback,
         )
 
 

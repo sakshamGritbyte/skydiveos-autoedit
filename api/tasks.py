@@ -46,6 +46,7 @@ from .jobs import (
     JobStatus,
     JobStore,
     LoadRosterEntry,
+    PendingCallback,
     RoleIngest,
     deliverable_names,
     entitlement_for,
@@ -93,18 +94,17 @@ def _jump_date(job: Job) -> str:
 STATUS_CALLBACK_PATH = "/api/media/auto-edit/jobs/{job_id}/status"
 
 
-def _notify_skydiveos(job: Job) -> None:
-    """Best-effort callback to the SkydiveOS web layer on a state change.
+#: BUG 419 — retry schedule for a status callback that did not get a 2xx (seconds after
+#: each failed attempt), and the hard stop. ~24 h in all: long enough to ride out a
+#: SkydiveOS deploy, an expired token or an overnight outage, short enough that a
+#: misconfigured stack is noticed. After it the record stays on the job (``gave_up_at``).
+CALLBACK_RETRY_DELAYS_S = (60, 120, 300, 900, 1800, 3600, 3600, 7200, 7200, 14400, 14400, 28800)
+CALLBACK_RETRY_MAX_S = 24 * 3600
+CALLBACK_TIMEOUT_S = 15.0
 
-    CLAUDE.md: "pipeline calls back here on job state changes." Fire-and-forget —
-    a delivery must never fail because the web layer is briefly unreachable. Posts to
-    SkydiveOS's ``/api/media/auto-edit/jobs/{id}/status`` receiver (deduped there per
-    ``{jobId}:{status}``); on ``delivered`` the presigned customer links ride along.
-    """
-    settings = get_settings()
-    base = settings.skydiveos_api_base
-    if not base:
-        return
+
+def _status_payload(job: Job, settings: Settings) -> dict[str, object]:
+    """The status-callback body for ``job`` as it stands now."""
     payload: dict[str, object] = {
         "job_id": job.job_id,
         "status": job.status.value,
@@ -171,16 +171,162 @@ def _notify_skydiveos(job: Job) -> None:
         payload["customer_email"] = job.customer_email
     if job.customer_name:
         payload["customer_name"] = job.customer_name
+    return payload
+
+
+def _post_status_callback(job: Job, settings: Settings) -> tuple[bool, str | None]:
+    """POST one callback. ``(True, None)`` only on a 2xx — anything else is an error."""
+    payload = _status_payload(job, settings)
+    if job.status == JobStatus.delivered and "gallery_url" not in payload:
+        # Without the link SkydiveOS can only HOLD the customer's notification.
+        logger.error(
+            "job %s delivered but no gallery_url was sent (PUBLIC_BASE_URL unset or no "
+            "gallery token) — SkydiveOS cannot notify the customer", job.job_id,
+        )
     headers: dict[str, str] = {}
     if settings.auto_edit_callback_token:
         headers["X-Auto-Edit-Token"] = settings.auto_edit_callback_token
-    url = f"{base.rstrip('/')}{STATUS_CALLBACK_PATH.format(job_id=job.job_id)}"
+    base = (settings.skydiveos_api_base or "").rstrip("/")
+    url = f"{base}{STATUS_CALLBACK_PATH.format(job_id=job.job_id)}"
     try:
         import httpx
 
-        httpx.post(url, json=payload, headers=headers, timeout=5.0)
-    except Exception as e:  # noqa: BLE001 - never let a callback blip fail the task
-        logger.warning("SkydiveOS status callback failed for %s: %r", job.job_id, e)
+        resp = httpx.post(url, json=payload, headers=headers, timeout=CALLBACK_TIMEOUT_S)
+    except Exception as e:  # noqa: BLE001 - recorded and retried, never raised
+        return False, f"network: {e!r}"[:300]
+    if 200 <= resp.status_code < 300:
+        return True, None
+    detail = (resp.text or "")[:200]
+    if resp.status_code == 401:
+        detail = (
+            "token rejected — AUTO_EDIT_CALLBACK_TOKEN differs between the two sides "
+            f"({detail})"
+        )
+    return False, f"HTTP {resp.status_code}: {detail}"
+
+
+def _notify_skydiveos(job: Job) -> None:
+    """Callback to the SkydiveOS web layer on a state change — retried until it lands.
+
+    CLAUDE.md: "pipeline calls back here on job state changes." Posts to SkydiveOS's
+    ``/api/media/auto-edit/jobs/{id}/status`` receiver (deduped there per
+    ``{jobId}:{status}``, so a repeat is harmless); on ``delivered`` the gallery link and
+    presigned customer links ride along.
+
+    It never raises — a delivery must not fail because the web layer is briefly
+    unreachable. But it is no longer fire-and-forget (BUG 419): it used to ignore the
+    response entirely, so a 401/5xx or a timeout silently lost the one message that
+    carries the customer's gallery link. Now a non-2xx is recorded on the job
+    (:class:`~api.jobs.PendingCallback`) and retried on :data:`CALLBACK_RETRY_DELAYS_S`
+    by :func:`retry_status_callback_job`; the stuck-job reconcile re-arms a due retry
+    whenever the job is polled, so a lost countdown message cannot strand it.
+    """
+    settings = get_settings()
+    if not settings.skydiveos_api_base:
+        return
+    ok, error = _post_status_callback(job, settings)
+    try:
+        _record_callback_outcome(job.job_id, job.status.value, ok, error, settings)
+    except Exception:  # noqa: BLE001 - bookkeeping must never fail the task
+        logger.exception("could not record the status-callback outcome for %s", job.job_id)
+
+
+def _record_callback_outcome(
+    job_id: str, status: str, ok: bool, error: str | None, settings: Settings
+) -> None:
+    store = _store()
+    if not store.exists(job_id):
+        return
+    job = store.load(job_id)
+    pending = job.pending_callback
+    if ok:
+        if pending is not None:
+            store.update(job_id, pending_callback=None)
+            logger.info("job %s: status callback %r delivered after %d failed attempt(s)",
+                        job_id, status, pending.attempts if pending.status == status else 0)
+        return
+    now = time.time()
+    if pending is None or pending.status != status:
+        # A new status supersedes any older owed one (see PendingCallback).
+        pending = PendingCallback(status=status, first_failed_at=now)
+    attempts = pending.attempts + 1
+    exhausted = (
+        attempts > len(CALLBACK_RETRY_DELAYS_S)
+        or now - pending.first_failed_at >= CALLBACK_RETRY_MAX_S
+    )
+    delay = 0 if exhausted else CALLBACK_RETRY_DELAYS_S[attempts - 1]
+    record = pending.model_copy(update={
+        "attempts": attempts,
+        "last_error": error,
+        "next_at": None if exhausted else now + delay,
+        "gave_up_at": now if exhausted else None,
+    })
+    store.update(job_id, pending_callback=record)
+    if exhausted:
+        logger.error(
+            "job %s: status callback %r FAILED %d times over %.1fh — giving up (%s). "
+            "SkydiveOS still has the old state; fix the callback URL/token and re-send.",
+            job_id, status, attempts, (now - pending.first_failed_at) / 3600, error,
+        )
+        return
+    logger.warning("job %s: status callback %r failed (attempt %d, retry in %ds): %s",
+                   job_id, status, attempts, delay, error)
+    _schedule_callback_retry(job_id, status, delay)
+
+
+def _schedule_callback_retry(job_id: str, status: str, countdown: float) -> None:
+    """Arm one retry. Skipped in eager mode (a countdown would run inline, at once)."""
+    if celery_app.conf.task_always_eager:
+        return
+    try:
+        retry_status_callback_job.apply_async((job_id, status), countdown=max(0.0, countdown))
+    except Exception as e:  # noqa: BLE001 - the reconcile kick is the backstop
+        logger.warning("could not schedule status-callback retry for %s: %r", job_id, e)
+
+
+def kick_due_status_callback(job: Job) -> bool:
+    """Re-arm an owed callback whose retry is due — called on every job poll.
+
+    The countdown message in :func:`_schedule_callback_retry` lives in a worker's memory
+    and can be lost (restart, deploy, broker flush). The status poll is the channel
+    guaranteed to be alive for a job somebody is waiting on — SkydiveOS polls exactly
+    the jobs whose delivery it never heard about — so it doubles as the recovery signal,
+    the same idea as :func:`api.reconcile.reconcile_stuck_job`. Never raises.
+    """
+    pc = job.pending_callback
+    if pc is None or pc.gave_up_at is not None or pc.status != job.status.value:
+        return False
+    if pc.next_at is not None and time.time() < pc.next_at:
+        return False
+    _schedule_callback_retry(job.job_id, pc.status, 0)
+    return True
+
+
+@celery_app.task(name="api.retry_status_callback_job")
+def retry_status_callback_job(job_id: str, status: str) -> str:
+    """One retry of an owed status callback (BUG 419). Idempotent and self-limiting.
+
+    Re-sends only while the job is still in the owed ``status`` (a newer state's own
+    callback supersedes it), only when the retry is due (a duplicate message is a
+    no-op), and never after :data:`CALLBACK_RETRY_MAX_S`.
+    """
+    store = _store()
+    if not store.exists(job_id):
+        return "unknown job"
+    job = store.load(job_id)
+    pc = job.pending_callback
+    if pc is None or pc.status != status:
+        return "nothing owed"
+    if pc.gave_up_at is not None:
+        return "gave up"
+    if job.status.value != status:
+        store.update(job_id, pending_callback=None)
+        return "superseded"
+    if pc.next_at is not None and time.time() < pc.next_at - 1:
+        return "not due"
+    _notify_skydiveos(job)
+    after = store.load(job_id).pending_callback
+    return "delivered" if after is None else f"failed (attempt {after.attempts})"
 
 
 def _archive_deliverables(store: JobStore, job_id: str) -> None:

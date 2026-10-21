@@ -446,6 +446,26 @@ class JobStatus(StrEnum):
 REVIEWABLE = {JobStatus.ready_for_review, JobStatus.approved, JobStatus.delivered}
 
 
+class PendingCallback(BaseModel):
+    """One SkydiveOS status callback still owed (BUG 419).
+
+    Only the job's CURRENT status is ever owed: SkydiveOS applies a callback's status
+    unconditionally, so replaying an older one after a newer one landed would move its
+    record backwards. A new status therefore replaces this record, and a retry whose
+    status no longer matches the job is dropped.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    attempts: int = 0
+    first_failed_at: float
+    next_at: float | None = None
+    last_error: str | None = None
+    #: Set once retries ran out — kept (not deleted) so the failure stays visible.
+    gave_up_at: float | None = None
+
+
 class Job(BaseModel):
     """The persisted state record for one jump.
 
@@ -594,6 +614,12 @@ class Job(BaseModel):
     #: Paired with the atomic claim in :meth:`JobStore.claim_email_send` so two workers
     #: racing the same job cannot both send.
     email_sent_at: float | None = None
+    #: BUG 419 — a SkydiveOS status callback that did not get a 2xx, kept until it does.
+    #: The callback is the ONLY carrier of the customer's ``gallery_url`` (``GET /jobs/{id}``
+    #: deliberately omits it), so a dropped ``delivered`` callback used to mean the
+    #: customer was never told. ``None`` = nothing owed.
+    #: See ``api.tasks.retry_status_callback_job``.
+    pending_callback: PendingCallback | None = None
 
     # Rendered deliverables, set when status == ready (selfie package). Maps a
     # deliverable name (full_video / highlights / freefall / photos) to its path.

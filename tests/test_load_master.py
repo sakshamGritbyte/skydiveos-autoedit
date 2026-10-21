@@ -629,6 +629,7 @@ def test_callback_carries_job_kind_and_the_load_grouping_fields(
         posted.update(json)
 
         class _R:
+            status_code = 200
             def raise_for_status(self) -> None: ...
 
         return _R()

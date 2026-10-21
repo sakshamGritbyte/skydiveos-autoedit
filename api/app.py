@@ -1518,6 +1518,15 @@ def create_app() -> FastAPI:
             logger.exception(
                 "job %s: stuck-job reconcile failed; returning current state", job_id
             )
+        # BUG 419 — the poll also re-arms an owed SkydiveOS status callback whose
+        # countdown message was lost. SkydiveOS polls exactly the jobs it never heard
+        # were delivered, so this is the backstop that closes that loop.
+        try:
+            from .tasks import kick_due_status_callback
+
+            kick_due_status_callback(job)
+        except Exception:  # noqa: BLE001 — never fail the poll
+            logger.exception("job %s: status-callback re-arm failed", job_id)
         return JobResponse.from_job(job)
 
     @app.get(

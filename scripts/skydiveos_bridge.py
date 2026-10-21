@@ -40,6 +40,13 @@ Behaviour:
   job (no customer, no email) that the pipeline fans out to everybody on that load. A
   flyer who *did* have an assigned customer is refused (``NotSpecFlight``) on this path —
   that footage is their product. See ``CLAUDE.md``.
+* **Hold, don't flag, while the load is still flying** (BUG 417) — a clip whose load
+  staff have not landed yet is refused by the match (the load is not matchable while its
+  flight window is open). It is DEFERRED instead of flagged, re-matched every
+  ``DEFER_RETRY_S`` and accepted the moment SkydiveOS closes the window (takeoff + the
+  configured ``flightWindowCloseOffsetMinutes``). Bounded by ``DEFER_MAX_S``, after which
+  it is flagged with that reason. The same hold applies when the clip only matched on the
+  weak same-day evidence while an in-air load could own it.
 * **Refuse-and-flag** — an unmatchable clip (no load fits, ambiguous, unmappable
   purchase) is logged + recorded and acknowledged with 200: mis-delivery is worse
   than a human follow-up, and a 5xx would make discovery retry forever. A flag is
@@ -93,6 +100,13 @@ OWNERSHIP_AUDIT_FILENAME = "_ownership_audit.jsonl"
 #: The production settle window. Long on purpose — see the module docstring.
 PRODUCTION_DEBOUNCE_S = 900.0
 
+#: BUG 417 — a clip held while its load's flight window is still open is re-matched this
+#: often, and flagged (with that reason) once it has waited this long. Six hours outlasts
+#: any real flight plus a forgotten "landed"; SkydiveOS closes windows on its own at
+#: takeoff + the configured offset, so a hold normally lasts minutes.
+DEFER_RETRY_S = 60.0
+DEFER_MAX_S = 6 * 3600.0
+
 #: Dev-only escape hatch for the settle window (see ``resolve_debounce``).
 DEV_DEBOUNCE_ENV = "BRIDGE_DEV_DEBOUNCE_SECONDS"
 
@@ -124,6 +138,10 @@ def load_state(path: Path) -> dict[str, Any]:
         state = {}
     state.setdefault("handled", {})
     state.setdefault("flagged", {})
+    # ``s3_key -> {notice, since, next_at, attempts, reason, load_id, load_number,
+    # closes_at}``: clips HELD while their load's flight window is open (BUG 417). Durable
+    # so a restart resumes the hold instead of forgetting the clip.
+    state.setdefault("deferred", {})
     # ``"{load_id}:{jumper_index}" -> job_id``: the job a jump ALREADY has. A mixed
     # jumper's two cards are plugged in minutes or hours apart, so the second card
     # arrives long after the first flushed — without this record it would create a
@@ -288,14 +306,18 @@ class Bridge:
 
     # -- the notify endpoint ---------------------------------------------- #
 
-    async def raw_upload(self, notice: dict[str, Any]) -> dict[str, Any]:
-        from ingest.match import FootageMatchError, NoBookingMatch
+    async def raw_upload(self, notice: dict[str, Any], *, retry: bool = False) -> dict[str, Any]:
+        from ingest.match import EVIDENCE_WINDOW, FootageMatchError, NoBookingMatch
 
         s3_key = notice.get("s3_key")
         if not s3_key:
             return {"status": "ignored", "reason": "no s3_key"}
         if s3_key in self.state["handled"] or s3_key in self.state["flagged"]:
             return {"status": "duplicate", "s3_key": s3_key}
+        # A held clip is the bridge's own to retry; a re-notify from discovery while it
+        # waits is a duplicate, never a second attempt racing the hold.
+        if s3_key in self.state["deferred"] and not retry:
+            return {"status": "duplicate", "s3_key": s3_key, "deferred": True}
 
         captured_at = notice.get("captured_at")
         if not captured_at:
@@ -330,11 +352,14 @@ class Bridge:
                     )
                 )
             except FootageMatchError as load_e:
-                return self._flag(
-                    s3_key,
+                reason = (
                     f"{type(e).__name__}: {e}; not a spec flight either "
-                    f"({type(load_e).__name__}: {load_e})",
+                    f"({type(load_e).__name__}: {load_e})"
                 )
+                hold = self._open_window_hold(notice, captured_at, staff_id)
+                if hold is not None:
+                    return self._defer(s3_key, notice, reason, hold)
+                return self._flag(s3_key, reason)
             return self._accept(
                 s3_key, notice, captured_at, load_match,
                 key=(load_match.load_id, "load"),
@@ -352,6 +377,20 @@ class Bridge:
             )
         if not match.customer_email:
             return self._flag(s3_key, f"customer {match.customer_name!r} has no email")
+
+        # BUG 417 — weak ownership (not established by a flight window) while a load this
+        # staff member is on is still in the air: the clip very likely belongs to THAT
+        # load, which is not matchable until its window closes. Hold it rather than
+        # attach it to the earlier jump (the previous customer).
+        if getattr(match, "evidence", EVIDENCE_WINDOW) != EVIDENCE_WINDOW:
+            hold = self._open_window_hold(notice, captured_at, staff_id)
+            if hold is not None:
+                return self._defer(
+                    s3_key, notice,
+                    f"matched load {match.load_number} only on {match.evidence} evidence "
+                    "while a load in the air could own it",
+                    hold,
+                )
 
         # Ownership that rested on the temporary compatibility path is recorded durably,
         # not only logged: the one-week review needs to count and inspect the real
@@ -380,6 +419,7 @@ class Bridge:
         load_evidence: str = "flight_window",
     ) -> dict[str, Any]:
         """Add a matched clip to its pending jump and (re)arm the settle timer."""
+        self.state["deferred"].pop(s3_key, None)
         jump = self.pending.get(key)
         if jump is None:
             jump = self.pending[key] = PendingJump(
@@ -454,9 +494,93 @@ class Bridge:
 
     def _flag(self, s3_key: str, reason: str) -> dict[str, Any]:
         logger.warning("FLAGGED %s: %s", s3_key, reason)
+        self.state["deferred"].pop(s3_key, None)
         self.state["flagged"][s3_key] = reason
         self._save_state()
         return {"status": "flagged", "s3_key": s3_key, "reason": reason}
+
+    # -- BUG 417: hold while the load is still in the air ------------------ #
+
+    def _open_window_hold(
+        self, notice: dict[str, Any], captured_at: str, staff_id: Any
+    ) -> dict[str, Any] | None:
+        """The in-air load this clip should wait for, or ``None``. Never raises."""
+        try:
+            return self.matcher.open_window_hold(
+                captured_at,
+                staff_id=staff_id or None,
+                camera_id=None if staff_id else str(notice.get("camera_id", "")) or None,
+            )
+        except Exception as e:  # noqa: BLE001 - a lookup blip must not turn into a hold or a crash
+            logger.warning("open-window check failed for %s: %r", notice.get("s3_key"), e)
+            return None
+
+    def _defer(
+        self, s3_key: str, notice: dict[str, Any], reason: str, hold: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Hold a clip until its load's flight window closes; flag it past the cap."""
+        now = time.time()
+        entry = self.state["deferred"].get(s3_key) or {"since": now, "attempts": 0}
+        if now - float(entry.get("since", now)) >= DEFER_MAX_S:
+            return self._flag(
+                s3_key,
+                f"{reason}; held {DEFER_MAX_S / 3600:.0f}h for load {hold.get('load_number')}'s "
+                "flight window to close and it never did — check the load's status and "
+                "takeoff time in SkydiveOS",
+            )
+        closes_at = hold.get("closes_at")
+        entry.update(
+            notice=notice,
+            reason=reason,
+            load_id=hold.get("load_id"),
+            load_number=hold.get("load_number"),
+            closes_at=closes_at.isoformat() if hasattr(closes_at, "isoformat") else closes_at,
+            attempts=int(entry.get("attempts", 0)) + 1,
+            next_at=now + DEFER_RETRY_S,
+        )
+        self.state["deferred"][s3_key] = entry
+        self._save_state()
+        logger.info(
+            "HELD %s for load %s (flight window open%s): %s",
+            s3_key, hold.get("load_number"),
+            f", closes {entry['closes_at']}" if entry.get("closes_at") else "", reason,
+        )
+        return {
+            "status": "deferred", "s3_key": s3_key, "load_number": hold.get("load_number"),
+            "closes_at": entry.get("closes_at"),
+        }
+
+    async def retry_deferred(self, now: float | None = None) -> dict[str, int]:
+        """Re-match every held clip whose retry is due. Returns the outcome counts."""
+        now = time.time() if now is None else now
+        out = {"accepted": 0, "flagged": 0, "deferred": 0, "other": 0}
+        for s3_key, entry in list(self.state["deferred"].items()):
+            if float(entry.get("next_at", 0)) > now:
+                continue
+            notice = entry.get("notice") or {"s3_key": s3_key}
+            try:
+                result = await self.raw_upload(notice, retry=True)
+            except Exception as e:  # noqa: BLE001 - one bad clip must not stop the others
+                logger.warning("held clip %s retry failed: %r", s3_key, e)
+                entry["next_at"] = now + DEFER_RETRY_S
+                out["other"] += 1
+                continue
+            status = result.get("status")
+            out[status if status in out else "other"] += 1
+        if any(out.values()):
+            self._save_state()
+        return out
+
+    async def run_deferred_retries(self) -> None:
+        """Background loop for :meth:`retry_deferred` (started with the app)."""
+        while True:
+            await asyncio.sleep(DEFER_RETRY_S)
+            try:
+                result = await self.retry_deferred()
+                if result["accepted"] or result["flagged"]:
+                    logger.info("held-clip retry: %s", result)
+            except Exception:  # noqa: BLE001 - keep the loop alive
+                logger.exception("held-clip retry loop failed")
 
     # -- job creation ------------------------------------------------------ #
 
@@ -656,6 +780,13 @@ def create_app(bridge: Bridge) -> Any:
 
     app = FastAPI(title="SkydiveOS raw-upload bridge (local stand-in)")
 
+    # BUG 417 — re-match held clips once their load's flight window closes.
+    @app.on_event("startup")
+    async def _start_deferred_retries() -> None:
+        runner = getattr(bridge, "run_deferred_retries", None)
+        if runner is not None:
+            app.state.deferred_retries = asyncio.create_task(runner())
+
     # This endpoint is reachable from the public internet (the dropzone's ingest
     # machine POSTs to it), and ONE accepted notification is enough to create a job,
     # render it and email a customer. A security-group /32 was the only gate, which
@@ -714,6 +845,8 @@ def create_app(bridge: Bridge) -> Any:
             "pending_jumps": len(bridge.pending),
             "handled": len(bridge.state["handled"]),
             "flagged": len(bridge.state["flagged"]),
+            # Clips held while their load is still in the air (BUG 417).
+            "deferred": len(bridge.state.get("deferred", {})),
             # The temporary-compatibility-path counter: how many clips were attached on
             # same-day-lone-candidate evidence rather than a flight window. Reviewed after
             # ~a week to decide whether the window becomes strict.

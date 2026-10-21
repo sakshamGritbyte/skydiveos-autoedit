@@ -139,6 +139,65 @@ EVIDENCE_CAUSAL_TIEBREAK = "causal_tiebreak"
 #: matched (footage can land before manifest closes it); a cancelled one never.
 _MATCHABLE_STATUSES = {"planned", "closed", "landed", "completed"}
 
+#: Statuses of a load that has gone to the aircraft but that staff have not landed yet.
+#: Footage for it is HELD (the bridge defers it) rather than refused, while its flight
+#: window is still open — see :func:`window_still_open`.
+_IN_FLIGHT_STATUSES = {"boarding", "gate-closed", "in-air"}
+
+
+def _utc_naive(value: Any) -> datetime | None:
+    """A stored Mongo instant → naive UTC (pymongo hands back naive UTC by default)."""
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is not None:
+        value = value.astimezone(UTC)
+    return value.replace(tzinfo=None)
+
+
+def flight_window_closed(load: dict[str, Any], now: datetime | None = None) -> bool:
+    """Has SkydiveOS closed this load's auto-edit flight window? (BUGS 417/418)
+
+    SkydiveOS owns the rule (``backend/src/utils/flightWindow.js``): the window closes at
+    the load's takeoff + ``MediaConfig.autoEdit.flightWindowCloseOffsetMinutes`` and is
+    published on the load as ``flightWindow.closesAt``, then claimed once as
+    ``flightWindow.closedAt`` by its 60 s sweep. Either one answers "closed" here, so a
+    lagging sweep never holds footage past the configured instant. A load written before
+    the field existed has neither, and keeps the pre-existing status rule.
+
+    These are real instants (UTC), unlike ``departureTime``, which this module reads as a
+    naive DZ-local wall clock.
+    """
+    fw = load.get("flightWindow") or {}
+    if not isinstance(fw, dict):
+        return False
+    if _utc_naive(fw.get("closedAt")) is not None:
+        return True
+    closes_at = _utc_naive(fw.get("closesAt"))
+    if closes_at is None:
+        return False
+    now_utc = _utc_naive(now) or datetime.now(UTC).replace(tzinfo=None)
+    return now_utc >= closes_at
+
+
+def load_is_matchable(load: dict[str, Any], now: datetime | None = None) -> bool:
+    """The ONE eligibility rule — mirror of SkydiveOS's ``isLoadFootageEligible``.
+
+    Matchable = a status in :data:`_MATCHABLE_STATUSES`, OR a closed flight window on any
+    non-cancelled load. Without the second half, a clip from a load staff left ``in-air``
+    is invisible here — and on the jumper-keyed path it can resolve to the camera flyer's
+    PREVIOUS landed load, i.e. the previous customer (BUG 417).
+    """
+    status = str(load.get("status", "")).lower()
+    if status == "cancelled":
+        return False
+    return status in _MATCHABLE_STATUSES or flight_window_closed(load, now)
+
+
+def window_still_open(load: dict[str, Any], now: datetime | None = None) -> bool:
+    """Is this load in the air with its flight window still open? (footage → HOLD)"""
+    status = str(load.get("status", "")).lower()
+    return status in _IN_FLIGHT_STATUSES and not flight_window_closed(load, now)
+
 #: Candidate types :func:`_narrow_by_time` accepts — both expose ``business_day`` and
 #: ``departure_local``, which is all the time narrowing reads.
 _Timed = TypeVar("_Timed", "Candidate", "LoadCandidate")
@@ -1113,6 +1172,16 @@ class FootageMatcher:
         )
         return dict(matches[0])
 
+    def _instant_local(self, value: Any) -> datetime | None:
+        """A stored TRUE-UTC instant → naive DZ-local wall clock (like :meth:`_to_local`)."""
+        if not isinstance(value, datetime):
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        if self._tz is not None:
+            value = value.astimezone(self._tz)
+        return value.replace(tzinfo=None)
+
     @staticmethod
     def _naive_local(value: Any) -> datetime | None:
         """A stored Mongo datetime → naive local (best effort; ``None`` if not a date)."""
@@ -1206,7 +1275,7 @@ class FootageMatcher:
         )
         candidates: list[Candidate] = []
         for load in cursor:
-            if str(load.get("status", "")).lower() not in _MATCHABLE_STATUSES:
+            if not load_is_matchable(load):
                 continue
             biz = self._naive_local(load.get("businessDate"))
             dep = self._naive_local(load.get("departureTime"))
@@ -1214,8 +1283,15 @@ class FootageMatcher:
             # window from the scheduled ±2.5 h to the ~25 min the plane was actually up,
             # which is what stops a clip filmed between loads being claimed by one of
             # them (see ``flight_window``).
-            takeoff = self._naive_local(load.get("actualTakeoffTime"))
-            landing = self._naive_local(load.get("landingTime"))
+            # These two are TRUE instants — SkydiveOS stamps them with `new Date()` when
+            # staff set the load In Air / Landed — unlike departureTime/businessDate,
+            # which are stored as DZ-local wall clock. Reading them as local put the
+            # recorded window off by the DZ's UTC offset (4–5 h in Quebec), so a clip
+            # filmed on the flight fell outside it and was only kept by the lone-
+            # candidate fallback (BUG 417 QA, 2026-10-21). SkydiveOS's own matcher
+            # (`capturedWithinLoadWindow`) has always compared them as instants.
+            takeoff = self._instant_local(load.get("actualTakeoffTime"))
+            landing = self._instant_local(load.get("landingTime"))
             for idx, jumper in enumerate(load.get("jumpers", [])):
                 if jumper.get("instructor") in staff_ids:
                     role = "instructor"
@@ -1295,7 +1371,7 @@ class FootageMatcher:
         )
         candidates: list[LoadCandidate] = []
         for load in cursor:
-            if str(load.get("status", "")).lower() not in _MATCHABLE_STATUSES:
+            if not load_is_matchable(load):
                 continue
             biz = self._naive_local(load.get("businessDate"))
             candidates.append(
@@ -1322,6 +1398,77 @@ class FootageMatcher:
                     )
 
         return self._build_load_result(db, staff_id, staff_name, chosen)
+
+    def open_window_hold(
+        self,
+        captured_at: datetime | str,
+        *,
+        staff_id: Any | None = None,
+        camera_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Should this clip WAIT rather than be refused? (BUG 417)
+
+        A clip filmed on a load staff have not landed yet is refused by both matches —
+        the load is not :func:`load_is_matchable` while its flight window is open — and
+        the bridge used to flag it TERMINALLY, so it stayed unmatched until a human
+        stepped in. This answers whether such a load exists for the clip: one in the air
+        (:func:`window_still_open`) that either carries this staff member in a camera
+        slot, or (spec flight) whose departure window contains the capture instant. The
+        caller then HOLDS the clip and asks again once the window closes, which
+        SkydiveOS does at takeoff + the configured offset with no staff action.
+
+        Returns ``{load_id, load_number, closes_at}`` for the soonest such load, or
+        ``None`` (nothing to wait for — refuse as before). Never raises for a missing
+        staff member or camera: that is not a reason to wait.
+        """
+        if not self.enabled:
+            return None
+        db = self._database()
+        if staff_id is not None:
+            staff_ids = _staff_id_variants(staff_id)
+        elif camera_id:
+            try:
+                staff_ids = _staff_id_variants(self._staff_for_camera(db, camera_id)["_id"])
+            except FootageMatchError:
+                return None
+        else:
+            return None
+
+        captured_local = self._to_local(captured_at)
+        cursor = db[LOADS].find(
+            {
+                "status": {"$in": sorted(_IN_FLIGHT_STATUSES)},
+                "$or": [
+                    {"jumpers.instructor": {"$in": staff_ids}},
+                    {"jumpers.assignedCameraman": {"$in": staff_ids}},
+                    {
+                        "departureTime": {
+                            "$gte": captured_local - WINDOW_POST,
+                            "$lte": captured_local + WINDOW_PRE,
+                        }
+                    },
+                ],
+            }
+        )
+        holds: list[dict[str, Any]] = []
+        for load in cursor:
+            if not window_still_open(load):
+                continue
+            dep = self._naive_local(load.get("departureTime"))
+            if dep is not None and not (dep - WINDOW_PRE <= captured_local <= dep + WINDOW_POST):
+                continue  # this staff's slot is on a load that cannot hold this clip
+            fw = load.get("flightWindow") or {}
+            holds.append(
+                {
+                    "load_id": str(load["_id"]),
+                    "load_number": load.get("loadNumber"),
+                    "closes_at": _utc_naive(fw.get("closesAt")) if isinstance(fw, dict) else None,
+                }
+            )
+        if not holds:
+            return None
+        holds.sort(key=lambda h: (h["closes_at"] is None, h["closes_at"] or datetime.max))
+        return holds[0]
 
     def _build_load_result(
         self,

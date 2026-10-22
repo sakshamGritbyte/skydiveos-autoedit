@@ -21,3 +21,19 @@ silent video, and the variety comes from having several tracks here to draw from
 Drop **2–4 licensed tracks** in this folder (`.mp3`/`.m4a`/`.aac`/`.wav`/`.flac`/`.ogg`).
 They must be cleared for customer delivery. The random default picks from whatever is
 here — with a single track it always uses that one, so add a few for real variety.
+
+## Beat drop (freefall sync)
+
+The freefall cut starts a few seconds before the aircraft exit so the exit lands on
+the track's **beat drop** (`render/beatdrop.py`). The drop is detected automatically.
+To pin it by hand, put a sidecar next to the track with the same stem:
+
+```json
+// "Free Fallin'.json" beside "Free Fallin'.mp3"
+{"beat_drop": 10.0}
+```
+
+`{"beat_drop": null}` means "this track has no drop": the freefall cut then starts at
+the exit and the music plays from its start. Use it for songs that only build gradually.
+A per-job uploaded track (`jobs/<id>/music/<deliverable>.<ext>`) takes a sidecar the
+same way (`jobs/<id>/music/<deliverable>.json`).

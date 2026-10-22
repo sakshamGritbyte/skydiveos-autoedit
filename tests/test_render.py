@@ -14,6 +14,7 @@ Layered like the rest of the suite so as much as possible runs everywhere:
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import time
@@ -315,3 +316,112 @@ def test_vbv_cap_is_imported_not_repeated() -> None:
         assert "from render.render import" in src, rel
         for literal in (f'"{MAXRATE}"', f'"{VBV_BUFSIZE}"', '"12M"', '"24M"'):
             assert literal not in src, f"{rel} hardcodes {literal}; import render.render's cap"
+
+
+# --------------------------------------------------------------------------- #
+# The intro/outro cards play whole and WITHOUT music (client rule, 2026-10-22).
+# --------------------------------------------------------------------------- #
+
+
+def _music_chain(fc: str) -> str:
+    return next(part for part in fc.split(";") if part.endswith("[mus]"))
+
+
+def test_music_spans_the_footage_only(edl: EditDecisionList) -> None:
+    """The music is cut to the footage, faded out at its end, and delayed past the intro."""
+    g = build_filtergraph(
+        edl, "src.mp4", has_audio=False, music_path="m.mp3",
+        intro_path="intro.mp4", intro_duration=2.5,
+        outro_path="outro.mp4", outro_duration=3.0,
+    )
+    footage = edl.output_duration
+    chain = _music_chain(g.filter_complex)
+    assert f"atrim=0:{round(footage, 3):g}," in chain
+    # Not trimmed to the whole timeline (intro + footage + outro) any more.
+    assert f"atrim=0:{round(2.5 + footage + 3.0, 3):g}," not in chain
+    # Starts on the first footage frame, after the intro card...
+    assert "adelay=2500:all=1" in chain
+    # ...and has faded out completely by the outro card's first frame.
+    assert f"afade=t=out:st={round(footage - 1.0, 3):g}:d=1" in chain
+    assert chain.index("afade=") < chain.index("adelay=")  # fade on the footage axis
+    # The cards still keep their full length: the audio is padded to the whole video.
+    assert f"apad=whole_dur={round(2.5 + footage + 3.0, 3):g}" in g.filter_complex
+
+
+def test_music_without_an_intro_starts_at_zero(edl: EditDecisionList) -> None:
+    g = build_filtergraph(edl, "src.mp4", has_audio=True, music_path="m.mp3")
+    chain = _music_chain(g.filter_complex)
+    assert "adelay" not in chain
+    assert "afade=t=out" in chain
+
+
+def test_cards_are_never_trimmed(edl: EditDecisionList) -> None:
+    """The intro/outro cards enter the concat whole — no trim, no setpts."""
+    g = build_filtergraph(
+        edl, "src.mp4", has_audio=True, music_path="m.mp3",
+        intro_path="intro.mp4", intro_duration=2.0,
+        outro_path="outro.mp4", outro_duration=2.0,
+    )
+    for part in g.filter_complex.split(";"):
+        if part.endswith("[vintro]") or part.endswith("[voutro]"):
+            assert "trim=" not in part and "setpts" not in part, part
+
+
+def _silences(path: Path, band: str) -> list[tuple[float, float]]:
+    err = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-i", str(path), "-vn", "-af",
+         f"{band},silencedetect=noise=-45dB:d=0.3", "-f", "null", "-"],
+        capture_output=True, text=True, check=True,
+    ).stderr
+    starts = [float(x) for x in re.findall(r"silence_start: ([\d.]+)", err)]
+    ends = [float(x) for x in re.findall(r"silence_end: ([\d.]+)", err)]
+    return [(s, ends[i] if i < len(ends) else float("inf")) for i, s in enumerate(starts)]
+
+
+def test_rendered_cards_have_no_music(tmp_path: Path) -> None:
+    """Real FFmpeg: 2 s intro + 8 s footage + 2 s outro; a 3 kHz bed is silent over both cards."""
+    _require_ffmpeg()
+    from render.render import _build_command
+
+    def lavfi(name: str, color: str, dur: float, tone: bool) -> Path:
+        out = tmp_path / name
+        cmd = ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+               "-i", f"color=c={color}:size=320x180:duration={dur}:rate=30"]
+        if tone:
+            cmd += ["-f", "lavfi", "-i", f"sine=frequency=300:sample_rate=44100:duration={dur}",
+                    "-c:a", "aac", "-shortest"]
+        cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", str(out)]
+        subprocess.run(cmd, check=True)
+        return out
+
+    src = lavfi("src.mp4", "lime", 12, tone=True)
+    intro = lavfi("intro.mp4", "navy", 2, tone=False)
+    outro = lavfi("outro.mp4", "black", 2, tone=False)
+    music = tmp_path / "music.wav"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    "sine=frequency=3000:sample_rate=44100:duration=30", str(music)], check=True)
+
+    cut = EditDecisionList(
+        clips=[Clip(src_start=0.0, src_end=4.0), Clip(src_start=6.0, src_end=10.0)],
+    )
+    graph = build_filtergraph(
+        cut, str(src), has_audio=True, music_path=str(music),
+        intro_path=str(intro), intro_duration=2.0,
+        outro_path=str(outro), outro_duration=2.0,
+        width=320, height=180,
+    )
+    out = tmp_path / "final.mp4"
+    subprocess.run(_build_command(graph, out, preset="ultrafast", crf=30), check=True)
+
+    dur = float(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(out)],
+        capture_output=True, text=True, check=True,
+    ).stdout)
+    assert dur == pytest.approx(12.0, abs=0.15)  # cards kept their full length
+
+    music_silences = _silences(out, "highpass=f=2000,highpass=f=2000")
+    covers = lambda a, b: any(s <= a + 0.35 and e >= b - 0.35 for s, e in music_silences)  # noqa: E731
+    assert covers(0.0, 2.0), music_silences       # no music over the intro card
+    assert covers(10.0, 12.0), music_silences     # none over the outro card
+    # ...and the music plays across the footage in between.
+    assert not any(s < 8.5 and e > 2.5 for s, e in music_silences), music_silences

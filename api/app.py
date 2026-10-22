@@ -968,6 +968,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 # A physically inserted card is an operator action; the QR + load
                 # match is the real gate, so unregistered cards are welcome.
                 require_registered=(settings.camera_scanner != "sdcard"),
+                # An operator is standing at the reader waiting for "safe to remove":
+                # re-pull the moment the last clip reaches S3, so the sweep frees the
+                # card right away instead of on the next DISCOVERY_INTERVAL tick.
+                rescan_after_handoff=(settings.camera_scanner == "sdcard"),
             )
             await service.start()
             app.state.discovery = service

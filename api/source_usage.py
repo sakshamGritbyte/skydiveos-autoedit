@@ -191,6 +191,7 @@ def build_source_usage(
         _owns_photos,
         _scene_paths,
         apply_exclusions,
+        exclude_freefall_head,
         load_exclusions,
     )
 
@@ -225,16 +226,18 @@ def build_source_usage(
             logger.warning("job %s: unreadable EDL %s (%s)", job_id, filename, e)
             return None
 
-    # (deliverable name, EDL filename, resolution context). Context is a camera role,
-    # None for the plain single-camera scene set, or "combo" for the multi-cam merge.
-    specs: list[tuple[str, str, str | None]] = []
+    # (deliverable name, EDL filename, resolution context, freefall-only cut). Context is
+    # a camera role, None for the plain single-camera scene set, or "combo" for the
+    # multi-cam merge. A freefall-only cut takes exclusions at its head only, as the
+    # render does (api.selfie.exclude_freefall_head).
+    specs: list[tuple[str, str, str | None, bool]] = []
     if job.package.is_ultimum:
         specs = [
-            ("full_video", ULTIMUM_EDL_FILES["full_video"], "combo"),
-            ("highlights", ULTIMUM_EDL_FILES["highlights"], "combo"),
+            ("full_video", ULTIMUM_EDL_FILES["full_video"], "combo", False),
+            ("highlights", ULTIMUM_EDL_FILES["highlights"], "combo", False),
         ]
         specs += [
-            (deliverable, ULTIMUM_EDL_FILES[deliverable], role)
+            (deliverable, ULTIMUM_EDL_FILES[deliverable], role, True)
             for deliverable, role in ULTIMUM_FREEFALL_ROLE.items()
         ]
     elif job.is_multi_ref:
@@ -243,15 +246,20 @@ def build_source_usage(
                 continue
             prefix = "" if _owns_photos(job, ref.role) else f"{ref.role}_"
             specs += [
-                (deliverable_name(job, ref.role, base), f"{prefix}{fname}", ref.role)
+                (
+                    deliverable_name(job, ref.role, base), f"{prefix}{fname}", ref.role,
+                    base == "freefall",
+                )
                 for base, fname in _EDL_SHORT.items()
             ]
     else:
-        specs = [(base, fname, None) for base, fname in _EDL_SHORT.items()]
+        specs = [
+            (base, fname, None, base == "freefall") for base, fname in _EDL_SHORT.items()
+        ]
 
     deliverables: dict[str, list[dict[str, Any]]] = {}
     used_manifests: dict[tuple[str | None, int], tuple[str | None, dict[str, Any]]] = {}
-    for name, edl_filename, context in specs:
+    for name, edl_filename, context, freefall_only in specs:
         clips = _load_clips(edl_filename)
         if clips is None:
             continue
@@ -278,9 +286,13 @@ def build_source_usage(
 
         # Replay the render's own post-persistence transforms, in its order: the
         # exclusion cuts, then the playable-duration clamp against the same files.
-        clips = apply_exclusions(
-            EDLResponse(full_video=clips, highlights=clips, freefall=clips), exclusions
-        ).full_video
+        clips = (
+            exclude_freefall_head(clips, exclusions)
+            if freefall_only
+            else apply_exclusions(
+                EDLResponse(full_video=clips, highlights=clips, freefall=clips), exclusions
+            ).full_video
+        )
         clips = _clamp_clips_to_scenes(clips, scene_paths)
         deliverables[name] = _usage_entries(clips, lookup, job)
 

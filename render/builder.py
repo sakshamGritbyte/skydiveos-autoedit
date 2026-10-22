@@ -16,8 +16,12 @@ The graph it builds, stage for stage (matching the Render spec):
 2. **Intro / outro cards** are normalised and concatenated on the front and back of
    the footage. The intro additionally gets the customer caption overlaid (see
    ``caption_path``).
-3. **Music + ducking.** The backing track is looped/trimmed to the full timeline
-   and, *when the source has its own audio*, side-chain compressed so it ducks
+3. **Music + ducking.** The backing track is looped/trimmed to the FOOTAGE — it
+   starts on the first frame after the intro card and fades out to end on the
+   last frame before the outro card, so it never plays over either (client rule,
+   2026-10-22: the intro and outro play whole and without music; the cards keep
+   their length, the music is what adjusts). *When the source has its own audio*,
+   it is side-chain compressed so it ducks
    under the original ambience (the exit scream, the instructor's voice) via
    ``sidechaincompress`` keyed by that ambience; the two are then ``amix``-ed. With
    a silent source (the common GoPro case — the proxy/master often carry no audio
@@ -49,6 +53,10 @@ AUDIO_LAYOUT = "stereo"
 # pumping. Overridable per-call for A/B tests.
 DEFAULT_MUSIC_GAIN = 0.7
 _DUCK = "threshold=0.03:ratio=8:attack=20:release=300"
+
+# The music fades out over this long so it has stopped by the outro card's first
+# frame (clamped to half the footage on a very short edit).
+_MUSIC_TAIL_FADE_SECONDS = 1.0
 
 # Short fade applied at a clip boundary that carries a transition. Real crossfades
 # (overlapping clips) are out of scope for the first render pass; a fade in/out on
@@ -275,6 +283,7 @@ def build_filtergraph(
         has_audio=has_audio,
         music_path=music_path,
         intro_duration=intro_duration,
+        footage_duration=edl.output_duration,
         total_duration=total_duration,
         music_gain=music_gain,
     )
@@ -333,6 +342,7 @@ def _build_audio(
     has_audio: bool,
     music_path: str | None,
     intro_duration: float,
+    footage_duration: float,
     total_duration: float,
     music_gain: float,
 ) -> str | None:
@@ -340,6 +350,12 @@ def _build_audio(
 
     Four cases: ambient + music (duck + mix), music only (straight), ambient only,
     or neither (a silent, video-only render).
+
+    The music spans the FOOTAGE only — ``[intro_duration, intro_duration +
+    footage_duration)`` — never the intro or outro card (client rule,
+    2026-10-22). It is cut to the footage length, faded out over its last
+    ``_MUSIC_TAIL_FADE_SECONDS`` so it has stopped by the outro's first frame, and
+    delayed by the intro length; the final ``apad`` fills the cards with silence.
     """
     ambient = _build_ambient(state, edl, src, intro_duration) if has_audio else None
 
@@ -347,10 +363,15 @@ def _build_audio(
         return ambient  # ambient-only, or None when the source was silent too
 
     music_idx = state.add_input(music_path, ("-stream_loop", "-1"))
+    footage = max(float(footage_duration), 0.0)
+    tail = min(_MUSIC_TAIL_FADE_SECONDS, footage / 2)
+    fade = f",afade=t=out:st={_num(footage - tail)}:d={_num(tail)}" if tail > 0 else ""
+    delay_ms = int(round(intro_duration * 1000))
+    delay = f",adelay={delay_ms}:all=1" if delay_ms > 0 else ""
     state.chains.append(
-        f"[{music_idx}:a]atrim=0:{_num(total_duration)},asetpts=PTS-STARTPTS,"
+        f"[{music_idx}:a]atrim=0:{_num(footage)},asetpts=PTS-STARTPTS,"
         f"aresample={AUDIO_RATE},aformat=channel_layouts={AUDIO_LAYOUT},"
-        f"volume={music_gain:.4f}[mus]"
+        f"volume={music_gain:.4f}{fade}{delay}[mus]"
     )
 
     if ambient is None:
@@ -361,8 +382,9 @@ def _build_audio(
     # the full timeline first: sidechaincompress ends its output when the *key*
     # ends, so an un-padded key (ambient stops with the footage) would truncate the
     # ducked music — and thus all audio — at the end of the footage. Padding the key
-    # with trailing silence lets the music run the whole length, ducking under the
-    # footage and playing at full level under the (silent-key) outro.
+    # with trailing silence keeps the compressor from cutting the music short; the
+    # music itself already ends (faded) with the footage, so nothing plays under
+    # the outro card.
     state.chains.append(f"[{ambient}]asplit=2[amb_mix][amb_key_raw]")
     state.chains.append(
         f"[amb_key_raw]apad=whole_dur={_num(total_duration)}[amb_key]"

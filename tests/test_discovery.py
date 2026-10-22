@@ -1467,3 +1467,141 @@ def test_the_notify_carries_the_service_token(tmp_path: Path, monkeypatch) -> No
         assert "Authorization" not in posted["headers"]
     finally:
         get_settings.cache_clear()
+
+
+# --------------------------------------------------------------------------- #
+# Rescan after hand-off: the card is cleared as soon as S3 holds every clip
+# --------------------------------------------------------------------------- #
+#
+# The retention sweep that frees an SD card runs at the START of a pull, so after the
+# last upload the card waited out the rest of DISCOVERY_INTERVAL (30 s in production)
+# before anything was deleted and before the banner could go green. With
+# ``rescan_after_handoff`` the drained hand-off queue triggers that re-pull at once.
+
+
+def _counting_pull(staged_mp4: Path):
+    """``_make_pull`` that also counts how many pulls ran."""
+    inner = _make_pull(staged_mp4)
+    calls: list[str] = []
+
+    async def _pull(camera_id: str, *, emitter=None) -> list[object]:
+        calls.append(camera_id)
+        return await inner(camera_id, emitter=emitter)
+
+    return _pull, calls
+
+
+def _rescan_service(tmp_path: Path, *, rescan: bool, upload=None):
+    pull, calls = _counting_pull(_staged(tmp_path, "GX010001.MP4"))
+    uploads = upload or _RecordingUploader()
+    service = CameraDiscoveryService(
+        scanner=StaticCameraScanner(["1234"]),
+        registry=FakeRegistry([CameraRecord(camera_id="1234", paired_at=1.0)]),
+        upload=uploads,
+        pull=pull,
+        interval=30.0,  # production-like: only an early wake can explain a 2nd pull
+        handoff_retry_delay=30.0,
+        rescan_after_handoff=rescan,
+    )
+    return service, calls, uploads
+
+
+def test_drained_handoff_queue_triggers_an_immediate_rescan(tmp_path: Path) -> None:
+    service, calls, uploads = _rescan_service(tmp_path, rescan=True)
+
+    async def scenario() -> bool:
+        await service.start()
+        await _wait_for(lambda: bool(uploads.calls))
+        rescanned = await _wait_for(lambda: len(calls) >= 2, timeout=2.0)
+        await service.stop()
+        return rescanned
+
+    assert asyncio.run(scenario()) is True
+    # The re-pull emits nothing new, so it does not wake the loop again.
+    assert len(calls) == 2
+
+
+def test_without_the_flag_the_loop_keeps_its_interval(tmp_path: Path) -> None:
+    """BLE/USB modes (flag off) are unchanged: no extra scan after a hand-off."""
+    service, calls, uploads = _rescan_service(tmp_path, rescan=False)
+
+    async def scenario() -> None:
+        await service.start()
+        await _wait_for(lambda: bool(uploads.calls))
+        await asyncio.sleep(0.5)
+        await service.stop()
+
+    asyncio.run(scenario())
+    assert calls == ["1234"]
+
+
+def test_a_failed_handoff_does_not_trigger_a_rescan(tmp_path: Path) -> None:
+    """A failed upload retries on its own timer; the card is not done, so no early scan."""
+    attempts: list[str] = []
+
+    def failing(mp4_path, camera_id, instructor_id, camera_role=None, **_kw):
+        attempts.append(mp4_path)
+        raise RuntimeError("S3 unreachable")
+
+    service, calls, _ = _rescan_service(tmp_path, rescan=True, upload=failing)
+
+    async def scenario() -> None:
+        await service.start()
+        await _wait_for(lambda: bool(attempts))
+        await asyncio.sleep(0.5)
+        await service.stop()
+
+    asyncio.run(scenario())
+    assert calls == ["1234"]
+
+
+def test_card_is_swept_right_after_the_last_upload(tmp_path: Path) -> None:
+    """End to end through the REAL pull, ledger and sweep (cleanup on, no grace).
+
+    Three clips are pulled, handed off (the uploader returns an S3 key, so the ledger
+    records each one), and the immediate rescan's pull deletes all three off the card —
+    well inside the 30 s interval that used to stand between the upload and the sweep.
+    """
+    sample = tmp_path / "sample.mp4"
+    sample.write_bytes(b"\x00\x11\x22\x33" * 64)
+    cam = LocalSampleCamera(sample, filename="GX010001.MP4", count=3)
+    root = tmp_path / "raw"
+
+    async def pull(camera_id: str, *, emitter=None) -> object:
+        return await pull_camera(
+            camera_id, camera=cam, root=root, emitter=emitter,
+            cleanup=True, cleanup_min_age_s=0.0,
+        )
+
+    def upload(mp4_path, camera_id, instructor_id, camera_role=None, **_kw):
+        return f"raw/{camera_id}/{Path(mp4_path).name}"
+
+    def build(rescan: bool) -> CameraDiscoveryService:
+        return CameraDiscoveryService(
+            scanner=StaticCameraScanner(["1234"]),
+            registry=FakeRegistry([CameraRecord(camera_id="1234", paired_at=1.0)]),
+            upload=upload,
+            pull=pull,
+            interval=30.0,
+            rescan_after_handoff=rescan,
+        )
+
+    async def on_card() -> int:
+        return len(await cam.list_videos())
+
+    async def scenario() -> bool:
+        service = build(rescan=True)
+        await service.start()
+
+        async def card_empty() -> bool:
+            for _ in range(150):
+                if await on_card() == 0:
+                    return True
+                await asyncio.sleep(0.02)
+            return False
+
+        cleared = await card_empty()
+        await service.stop()
+        return cleared
+
+    assert asyncio.run(scenario()) is True

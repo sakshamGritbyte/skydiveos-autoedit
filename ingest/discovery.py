@@ -571,6 +571,7 @@ class CameraDiscoveryService:
         role_resolver: RoleResolver | None = None,
         identity_resolver: IdentityResolver | None = None,
         require_registered: bool = True,
+        rescan_after_handoff: bool = False,
     ) -> None:
         self._scanner = scanner
         self._registry = registry
@@ -581,6 +582,12 @@ class CameraDiscoveryService:
         #: action (not a BLE stranger in range), and the QR + load match is the real
         #: gate — unmatchable footage is flagged downstream, never delivered.
         self._require_registered = require_registered
+        #: SD-card mode sets this True: once every pulled clip has been handed off
+        #: (S3 confirmed, ledger written), scan again NOW instead of sleeping out the
+        #: rest of the interval. That re-pull is what runs the retention sweep and
+        #: re-answers "safe to remove", so without it an operator standing at the
+        #: reader waits up to a whole ``interval`` after the last upload for nothing.
+        self._rescan_after_handoff = rescan_after_handoff
         self._pull = pull if pull is not None else _default_pull
         self._interval = interval
         self._install_signal_handlers = install_signal_handlers
@@ -597,6 +604,10 @@ class CameraDiscoveryService:
         #: Sleeping hand-off retries (see :meth:`_schedule_handoff_retry`).
         self._retry_tasks: set[asyncio.Task[None]] = set()
         self._stopping = asyncio.Event()
+        #: Set when the hand-off queue drains (see ``rescan_after_handoff``); ends the
+        #: scan loop's sleep early. Cleared right before each scan, so a wake that
+        #: lands DURING a scan still buys exactly one more.
+        self._rescan = asyncio.Event()
         self._started = False
 
     async def start(self) -> None:
@@ -635,11 +646,12 @@ class CameraDiscoveryService:
 
     async def _scan_loop(self) -> None:
         while not self._stopping.is_set():
+            self._rescan.clear()
             try:
                 await self._scan_once()
             except Exception as e:  # noqa: BLE001 - a bad scan must not kill the loop
                 logger.exception("camera scan failed: %r", e)
-            await self._sleep_interruptibly(self._interval)
+            await self._sleep_until_next_scan(self._interval)
 
     async def _scan_once(self) -> None:
         # A pull owns the radios for its whole duration (BLE control + the camera's WiFi
@@ -708,6 +720,15 @@ class CameraDiscoveryService:
                 await asyncio.to_thread(self._materialize, event)
             except Exception as e:  # noqa: BLE001 - a bad event must not stop the loop
                 self._schedule_handoff_retry(event, e)
+                continue
+            # The last queued clip just reached S3: the card's ledger is complete, so
+            # the sweep can run and the banner can go green — scan now, don't wait.
+            # Only on a DRAINED queue (one re-pull per card, not one per clip), and
+            # only after a success (a failed hand-off retries on its own timer). A
+            # re-pull of a staged card emits nothing, so this cannot loop.
+            if self._rescan_after_handoff and self._events.empty():
+                logger.info("hand-off queue drained; rescanning now to clear the card")
+                self._rescan.set()
 
     def _schedule_handoff_retry(self, event: dict[str, Any], error: Exception) -> None:
         """Requeue a failed hand-off with backoff instead of dropping it.
@@ -857,6 +878,19 @@ class CameraDiscoveryService:
             )
 
     # --- helpers ----------------------------------------------------------- #
+
+    async def _sleep_until_next_scan(self, seconds: float) -> None:
+        """Sleep between scans; wake early on :meth:`stop` or a drained hand-off queue."""
+        waits = [
+            asyncio.ensure_future(self._stopping.wait()),
+            asyncio.ensure_future(self._rescan.wait()),
+        ]
+        try:
+            await asyncio.wait(waits, timeout=seconds, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for w in waits:
+                w.cancel()
+            await asyncio.gather(*waits, return_exceptions=True)
 
     async def _sleep_interruptibly(self, seconds: float) -> None:
         """Sleep, but wake immediately when :meth:`stop` is called."""

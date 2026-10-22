@@ -465,6 +465,57 @@ Two runtime media roots, with different audiences:
   edit. Derived from the manifest, never stored on clips (`Clip` is `extra="forbid"`), so
   a replay renders it too — but an already-composed EDL keeps its trimmed interviews until
   RE-PROCESSED (replay does not re-validate). Multi-cam: one camera, instructor first.
+- **The whole freefall plays without cuts** (client rule, 2026-10-22). In `full_video`,
+  `freefall`, `external_freefall` and `chute_libre_selfie`
+  (`edl.validate.CONTINUOUS_FREEFALL_DELIVERABLES`), `_require_continuous_freefall`
+  replaces every freefall-scene clip with ONE run over `[exit − _EXIT_LEAD_S,
+  deploy + _DEPLOY_TAIL_S]`: every second once, in order, nothing skipped, nothing
+  replayed. The editor's slow-mo beats stay at their own seconds (the renderer
+  hard-concats, so a speed change inside the run is not a cut); a beat that would replay
+  seconds already shown is dropped and logged. Every composer chopped the jump before
+  (exit block + "best moment" windows + a replayed deploy beat; the full video trimmed
+  freefall proportionally), so the VALIDATOR owns this, not the prompt or the house cut —
+  `_FREEFALL_MAX_OUTPUT_S` no longer bounds the freefall cut. **The Ultimate combo is the
+  one exception:** its freefall is the same continuous run on the exit-anchored timeline
+  of the instructor's window, ALTERNATING instructor / external every
+  `_MULTICAM_FF_SHOT_S` (5 s), each camera only inside its own aerial window, the other
+  angle covering where one has no footage, and no switch closer than
+  `_SWITCH_SPACING_OUT_S`. It runs AFTER dedupe / switch-rate / min-shot (they would
+  break the run) and before the bookends. `highlights` keeps short freefall beats on
+  purpose (< 1 min cannot hold a 40–80 s freefall). No exit/deploy anchors → untouched.
+  Like bookends, an already-composed EDL keeps its old cut until RE-PROCESSED (replay does
+  not re-validate). Tests: `tests/test_freefall_uncut.py`.
+- **The freefall cut's exit lands on the music's beat drop** (client rule, 2026-10-22:
+  "never cut up in the middle; it may only be shortened at the beginning, so that the
+  moment of exit lines up with the beat drop"). Applies to the freefall-ONLY cuts
+  (`freefall`, `external_freefall`, `chute_libre_selfie`); `full_video` / `highlights`
+  are untouched. The drop per track is `render/beatdrop.py → beat_drop_for`: a sidecar
+  `<track stem>.json` beside the track wins (`{"beat_drop": 31.2}` pins it,
+  `{"beat_drop": null}` = no drop, don't sync — use it for songs that build gradually),
+  else detection (low-band + full-band energy rise over 4 s windows, earliest rise ≥ 75 %
+  of the biggest, in the first 120 s, snapped to the sharpest bass onset; a fade-in from
+  silence never counts). Cached per (path, size, mtime); never raises — no music / no
+  drop / any error = the pre-rule behaviour (cut starts at the exit, music from 0).
+  **Compose** (`_freefall_lead`) picks the pre-exit lead = the drop, bounded by the
+  footage before the exit and `FREEFALL_MAX_LEAD_S` (15 s), and passes it as
+  `validate_and_repair(freefall_lead=)`, which widens ONLY those three deliverables'
+  window to `[exit − lead, deploy + 3]` — the continuity rule above then fills it whole.
+  **Render** (`_freefall_music_offset`) re-derives the music offset from the EDL it is
+  given: `offset = drop − exit's output time` (`>0` enters the track mid-way via `atrim`
+  on the looped input, `<0` delays it with `adelay`, `0` = byte-identical graph), so a
+  hand-edited head or an `exclude.json` head trim still lands the exit on the drop.
+  `exclude.json` on a freefall-only cut trims the HEAD only (`exclude_freefall_head`);
+  a mid-jump or tail range is ignored with a warning, never split — `source_usage`
+  mirrors that. Pre-rule EDLs keep their start until re-processed, but a replay still
+  syncs the music to wherever their exit plays. Tests: `tests/test_beatdrop.py`
+  (incl. a real ffmpeg render that measures the drop on the exit).
+- **The house cut's intro/outro CARDS play whole and without music** (client rule,
+  2026-10-22). `render/builder.py` cuts the music to the FOOTAGE
+  (`edl.output_duration`), fades it out over its last `_MUSIC_TAIL_FADE_SECONDS`
+  so it has stopped by the outro card's first frame, and delays it by the intro
+  length; the final `apad` fills both cards with silence. The cards are never
+  trimmed. Before this, the bed ran `atrim=0:total` from t=0, straight over both
+  cards. Pinned by `test_render.py` (graph + a real-FFmpeg render).
 - **Every video card opens on a frame from that very video** (`api/thumbnail.py` →
   `GET /j/{code}/poster/{name}`). A `<video>` with no `poster` is drawn by the browser
   — a grey box or iOS's generic cloud tile — so five cards read as one stock page, on

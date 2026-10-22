@@ -51,9 +51,10 @@ def test_deploy_beat_injected() -> None:
 
     out, log = validate_and_repair(edl, "freefall", manifest)
     assert _covers(out, "freefall", 74.08, 77.08)
-    beat = out[-1]  # chronologically last
-    assert beat["scene"] == "freefall" and beat["speed_multiplier"] == 0.4
-    assert beat["src_start"] == pytest.approx(74.08)
+    # The beat sits inside the uncut freefall run (its 1x tail to D+3 follows it).
+    beat = next(c for c in out if c["speed_multiplier"] == 0.4
+                and c["src_start"] == pytest.approx(74.08))
+    assert beat["scene"] == "freefall"
     assert any("injected deployment beat" in line for line in log)
 
     # Ultimate external cameraman freefall cut: deploy_offset = 97.1, EDL stops at 62.0.
@@ -321,6 +322,11 @@ def test_ultimum_min_shot_and_switch_rate() -> None:
         key = (c.get("camera"), c["scene"])
         if (key[0], key[1], round(c["src_start"], 6), round(c["src_end"], 6)) in bookends:
             continue
+        # The freefall is REBUILT as one uncut run (client rule 2026-10-22), so its 1x
+        # fill legitimately reaches past the editor's ranges — pinned by the
+        # test_*uncut* tests below.
+        if c["scene"] == "freefall":
+            continue
         ranges = original.get(key, [])
         starts = {round(s, 6) for s, _ in ranges}
         ends = {round(e, 6) for _, e in ranges}
@@ -339,14 +345,22 @@ def test_ultimum_min_shot_and_switch_rate() -> None:
 
 
 def test_noop_on_compliant_edl() -> None:
-    # d15c2e42's freefall EDL is already compliant: in [E-8, D+3], deploy beat present,
-    # no foreign scenes, chronological, with intentional slow-mo sub-windows that must
-    # NOT be treated as duplicates.
+    # d15c2e42's freefall EDL was compliant before the uncut-freefall rule: in the
+    # window, deploy beat present, no foreign scenes, chronological — but it skips
+    # seconds between its beats, so it is now rebuilt once. Its intentional slow-mo
+    # sub-windows must survive (NOT treated as duplicates), and the repaired EDL is a
+    # fixed point: a second pass changes and logs nothing.
     manifest = _fx("selfie_d15c2e42/scene_manifest.json")
     edl = _fx("selfie_d15c2e42/edl_freefall.json")
-    out, log = validate_and_repair(edl, "freefall", manifest)
-    assert log == []
-    assert out == edl
+    once, log = validate_and_repair(edl, "freefall", manifest)
+    assert any("freefall plays whole" in line for line in log)
+    slow_in = [(c["src_start"], c["src_end"]) for c in edl if c["speed_multiplier"] == 0.4]
+    slow_out = [(c["src_start"], c["src_end"]) for c in once if c["speed_multiplier"] == 0.4]
+    assert slow_out == slow_in
+
+    twice, log2 = validate_and_repair(once, "freefall", manifest)
+    assert log2 == []
+    assert twice == once
 
 
 # --------------------------------------------------------------------------- #

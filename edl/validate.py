@@ -34,6 +34,15 @@ ClipDict = dict[str, Any]
 FREEFALL_DELIVERABLES: frozenset[str] = frozenset(
     {"freefall", "external_freefall", "chute_libre_selfie"}
 )
+#: Deliverables whose freefall plays WHOLE and UNCUT (client rule, 2026-10-22): every
+#: second of the aerial window ``[exit - lead, deploy + tail]`` appears exactly once, in
+#: order — nothing skipped, nothing replayed. Slow-mo beats the editor chose stay where
+#: they are: the renderer hard-concats clips with no transitions, so a speed change
+#: inside a continuous run is not a cut. ``highlights`` keeps its short freefall beats on
+#: purpose (a < 1 min cut cannot hold a 40-80 s freefall), like its Bug 441 bookends.
+CONTINUOUS_FREEFALL_DELIVERABLES: frozenset[str] = frozenset(
+    {"full_video", *FREEFALL_DELIVERABLES}
+)
 #: Deliverables that must carry the boarding entry (and, for highlights, the intro).
 _STORY_DELIVERABLES: frozenset[str] = frozenset({"full_video", "highlights"})
 
@@ -53,6 +62,10 @@ _DEPLOY_BEAT_POST_S = 2.0
 _MIN_SHOT_OUT_S = 1.5
 #: Minimum output seconds between camera switches in a multi-cam combo.
 _SWITCH_SPACING_OUT_S = 3.0
+#: Ultimate combo: the uncut freefall holds each camera this long (output seconds)
+#: before switching to the other angle. >= _SWITCH_SPACING_OUT_S, so the switch-rate
+#: rule holds by construction wherever a slow-mo beat does not force the angle.
+_MULTICAM_FF_SHOT_S = 5.0
 #: Max |anchored-time| jump allowed across a camera switch (exit_offset anchored).
 _ANCHOR_TOL_S = 4.0
 #: Same-(camera, scene, speed) clips overlapping a kept clip by more than this
@@ -246,8 +259,13 @@ def _clamp_freefall_window(
     clips: list[ClipDict],
     manifest: dict[str, Any],
     manifest_by_camera: dict[str, dict[str, Any]] | None,
+    lead: float = _EXIT_LEAD_S,
 ) -> tuple[list[ClipDict], list[str]]:
-    """Clamp freefall clips to ``[E - 8, D + 3]`` (door/exit-prep to opening shock).
+    """Clamp freefall clips to ``[E - lead, D + 3]`` (door/exit-prep to opening shock).
+
+    ``lead`` is :data:`_EXIT_LEAD_S` (the exit itself) except for a freefall-only cut
+    synced to its music, which may keep that much door footage before the exit so the
+    exit lands on the beat drop (see ``validate_and_repair(freefall_lead=)``).
 
     Only clips *of the freefall scene* are clamped — every other scene passes through
     untouched. Freefall-only cuts run ``_drop_non_freefall`` first (so this is a no-op
@@ -264,7 +282,7 @@ def _clamp_freefall_window(
             kept.append(c)
             continue
         exit_off, deploy_off, dur = anchors
-        lo = max(0.0, exit_off - _EXIT_LEAD_S)
+        lo = max(0.0, exit_off - lead)
         hi = min(dur, deploy_off + _DEPLOY_TAIL_S)
         start, end = float(c["src_start"]), float(c["src_end"])
         if end <= lo or start >= hi:
@@ -724,6 +742,255 @@ def _enforce_min_shot(clips: list[ClipDict]) -> tuple[list[ClipDict], list[str]]
 
 
 # --------------------------------------------------------------------------- #
+# The whole freefall plays without cuts (client rule, 2026-10-22)
+# --------------------------------------------------------------------------- #
+
+
+def _camera_ff_windows(
+    manifest: dict[str, Any],
+    manifest_by_camera: dict[str, dict[str, Any]] | None,
+    multicam: bool,
+    lead: float = _EXIT_LEAD_S,
+) -> list[tuple[str | None, float, float, float]]:
+    """``[(camera, exit_offset, lo, hi)]`` — each camera's aerial window in EXIT-ANCHORED
+    seconds (``t = src - exit_offset``), instructor first. Single-cam: one ``None`` entry.
+    A camera without anchors has no window and is left out."""
+    cams: list[str | None]
+    if multicam and manifest_by_camera:
+        cams = sorted(manifest_by_camera, key=lambda c: (c != "instructor", c))
+    else:
+        cams = [None]
+    out: list[tuple[str | None, float, float, float]] = []
+    for cam in cams:
+        m = manifest_by_camera[cam] if cam and manifest_by_camera else manifest
+        anchors = _ff_anchors(m)
+        if anchors is None:
+            continue
+        exit_off, deploy_off, dur = anchors
+        lo = max(0.0, exit_off - lead)
+        hi = min(dur, deploy_off + _DEPLOY_TAIL_S)
+        if hi - lo < _MIN_CLIP_S:
+            continue
+        out.append((cam, exit_off, lo - exit_off, hi - exit_off))
+    return out
+
+
+def _same_clip(a: ClipDict, b: ClipDict) -> bool:
+    return (
+        a["scene"] == b["scene"]
+        and (a.get("camera") or None) == (b.get("camera") or None)
+        and abs(float(a["src_start"]) - float(b["src_start"])) < 1e-6
+        and abs(float(a["src_end"]) - float(b["src_end"])) < 1e-6
+        and abs(float(a.get("speed_multiplier", 1.0)) - float(b.get("speed_multiplier", 1.0)))
+        < _EPS
+    )
+
+
+def _require_continuous_freefall(
+    clips: list[ClipDict],
+    manifest: dict[str, Any],
+    manifest_by_camera: dict[str, dict[str, Any]] | None,
+    ranks: dict[str, int],
+    multicam: bool,
+    lead: float = _EXIT_LEAD_S,
+) -> tuple[list[ClipDict], list[str]]:
+    """The whole freefall plays once, in order, with no cuts.
+
+    Every composer chopped the jump: the house cut and Claude build it from an exit
+    block, a few "best moment" windows and a deploy beat (seconds skipped between them,
+    the deploy replayed), and the full video trims each scene proportionally. This rule
+    replaces every freefall-scene clip with ONE continuous run over the aerial window
+    ``[exit - lead, deploy + tail]``:
+
+    * the editor's slow-mo (any non-1x) beats inside the window are kept in place —
+      chronologically, the first wins where two overlap, so no second is shown twice;
+    * every gap between them is filled at 1x, so no second is skipped.
+
+    Multicam (the Ultimate combo — the one exception to "no cuts"): the run lives on
+    the exit-anchored timeline of the instructor's window and ALTERNATES the two angles
+    every :data:`_MULTICAM_FF_SHOT_S`, so time never jumps; only the camera changes.
+    A camera is only used inside its own aerial window (never the cameraman's canopy or
+    the aircraft); where neither camera has footage the gap is logged, not invented.
+
+    No anchors (exit/deploy undetected) → no window to fill → untouched. Already
+    continuous → untouched, nothing logged.
+    """
+    windows = _camera_ff_windows(manifest, manifest_by_camera, multicam, lead)
+    if not windows:
+        return list(clips), []
+    by_cam = {cam: (exit_off, lo, hi) for cam, exit_off, lo, hi in windows}
+    order = [cam for cam, *_ in windows]
+    story_lo, story_hi = windows[0][2], windows[0][3]
+
+    def _covers_at(cam: str | None, t: float) -> bool:
+        _, lo, hi = by_cam[cam]
+        return lo - _EPS <= t < hi - _EPS
+
+    # --- 1. The editor's speed beats, on the anchored timeline, non-overlapping. ---
+    ff_idx = [i for i, c in enumerate(clips) if c["scene"] == _FREEFALL_SCENE]
+    existing = [clips[i] for i in ff_idx]
+    log: list[str] = []
+    beats: list[tuple[float, float, ClipDict]] = []
+    candidates = []
+    for c in existing:
+        if abs(float(c.get("speed_multiplier", 1.0)) - 1.0) < _EPS:
+            continue
+        cam = (c.get("camera") or None) if multicam else None
+        if cam not in by_cam:
+            continue
+        exit_off, lo, hi = by_cam[cam]
+        a0 = max(float(c["src_start"]) - exit_off, lo, story_lo)
+        a1 = min(float(c["src_end"]) - exit_off, hi, story_hi)
+        if a1 - a0 < _MIN_CLIP_S:
+            continue
+        candidates.append((a0, a1, order.index(cam), c))
+    candidates.sort(key=lambda x: (x[0], x[2]))
+    cursor = story_lo
+    for a0, a1, _, c in candidates:
+        if a0 < cursor - 1e-6:
+            log.append(f"dropped slow-mo {_fmt(c)} — it would replay seconds already shown")
+            continue
+        cam = (c.get("camera") or None) if multicam else None
+        exit_off = by_cam[cam][0]
+        beat = dict(c)
+        if abs(a0 - (float(c["src_start"]) - exit_off)) > 1e-9:
+            beat["src_start"] = a0 + exit_off
+        if abs(a1 - (float(c["src_end"]) - exit_off)) > 1e-9:
+            beat["src_end"] = a1 + exit_off
+        beats.append((a0, a1, beat))
+        cursor = a1
+
+    # --- 2. Fill every gap at 1x; multicam alternates the angles. ---
+    pieces: list[tuple[float, float, str | None, ClipDict | None]] = []
+    cur_cam: str | None = None
+    since = 0.0  # output seconds the current angle has been on screen
+
+    def _emit(a0: float, a1: float, cam: str | None, beat: ClipDict | None) -> None:
+        nonlocal cur_cam, since
+        out_len = (a1 - a0) / float(beat.get("speed_multiplier", 1.0)) if beat else a1 - a0
+        if pieces and pieces[-1][2] != cam:
+            since = 0.0
+        cur_cam = cam
+        since += out_len
+        pieces.append((a0, a1, cam, beat))
+
+    def _fill(g0: float, g1: float, next_cam: str | None) -> None:
+        nonlocal since
+        t = g0
+        while g1 - t > _EPS:
+            cur = cur_cam
+            remaining = g1 - t
+            stay = (
+                cur in by_cam
+                and _covers_at(cur, t)
+                and (
+                    len(order) == 1
+                    or since < _MULTICAM_FF_SHOT_S - _EPS
+                    or remaining < _SWITCH_SPACING_OUT_S
+                )
+            )
+            if stay:
+                cam = cur
+                hold = g1 if len(order) == 1 else t + max(_MULTICAM_FF_SHOT_S - since, 0.0)
+                if remaining < _SWITCH_SPACING_OUT_S or hold <= t + _EPS:
+                    hold = g1
+            else:
+                # Switch: the next angle in rotation that has footage at t. A stretch too
+                # short to earn its own angle (< the switch spacing) goes to the next
+                # beat's camera instead, so it never becomes a sliver between two cuts.
+                rotation = order[order.index(cur) + 1:] + order[: order.index(cur) + 1] \
+                    if cur in order else list(order)
+                if remaining < _SWITCH_SPACING_OUT_S and next_cam in by_cam:
+                    rotation = [next_cam, *[c for c in rotation if c != next_cam]]
+                cam = next((c for c in rotation if _covers_at(c, t)), None)
+                if cam is None:
+                    starts = [by_cam[c][1] for c in order if by_cam[c][1] > t + _EPS]
+                    nxt = min([*starts, g1])
+                    log.append(
+                        f"no camera has freefall footage at anchored [{t:.2f}, {nxt:.2f}]"
+                        " — left as a gap"
+                    )
+                    t = nxt
+                    continue
+                hold = g1 if len(order) == 1 else t + _MULTICAM_FF_SHOT_S
+            end = min(hold, g1, by_cam[cam][2])
+            if pieces and pieces[-1][2] == cam and pieces[-1][3] is None \
+                    and abs(pieces[-1][1] - t) < 1e-6:
+                # extend the running 1x shot instead of cutting it
+                pieces[-1] = (pieces[-1][0], end, cam, None)
+                since += end - t
+            else:
+                _emit(t, end, cam, None)
+            t = end
+
+    cursor = story_lo
+    for a0, a1, beat_clip in beats:
+        beat_cam = (beat_clip.get("camera") or None) if multicam else None
+        _fill(cursor, a0, beat_cam)
+        _emit(a0, a1, beat_cam, beat_clip)
+        cursor = a1
+    _fill(cursor, story_hi, None)
+
+    # --- 3. Back to source-time clips; 1x pieces snap onto their beats' exact edges. ---
+    template: ClipDict = dict(existing[0]) if existing else {}
+    for key in ("transition_in", "transition_out"):
+        if key in template:
+            template[key] = None
+    block: list[ClipDict] = []
+    for a0, a1, cam, piece_beat in pieces:
+        if piece_beat is not None:
+            block.append(piece_beat)
+            continue
+        exit_off = by_cam[cam][0]
+        clip = {
+            **template,
+            "scene": _FREEFALL_SCENE,
+            "src_start": a0 + exit_off,
+            "src_end": a1 + exit_off,
+            "speed_multiplier": 1.0,
+            "camera": cam,
+        }
+        if block and (block[-1].get("camera") or None) == cam \
+                and abs(float(block[-1]["src_end"]) - clip["src_start"]) < 1e-6:
+            clip["src_start"] = block[-1]["src_end"]
+        block.append(clip)
+    for prev, nxt in zip(block, block[1:], strict=False):
+        if (prev.get("camera") or None) == (nxt.get("camera") or None) \
+                and abs(float(prev.get("speed_multiplier", 1.0)) - 1.0) < _EPS \
+                and abs(float(prev["src_end"]) - float(nxt["src_start"])) < 1e-6:
+            prev["src_end"] = nxt["src_start"]
+    block = [c for c in block if _src_len(c) >= _MIN_CLIP_S or c.get("speed_multiplier") != 1.0]
+    if not block:
+        return list(clips), log
+
+    if len(block) == len(existing) and all(
+        _same_clip(a, b) for a, b in zip(block, existing, strict=True)
+    ) and (not ff_idx or ff_idx == list(range(ff_idx[0], ff_idx[0] + len(ff_idx)))):
+        return list(clips), log
+
+    if ff_idx:
+        at = ff_idx[0]
+    else:
+        ff_rank = ranks.get(_FREEFALL_SCENE, len(ranks))
+        at = next((i for i, c in enumerate(clips) if _rank(c, ranks) > ff_rank), len(clips))
+    ff_set = set(ff_idx)
+    rest = [c for i, c in enumerate(clips) if i not in ff_set]
+    at -= sum(1 for i in ff_idx if i < at)
+    out = [*rest[:at], *block, *rest[at:]]
+    lo_src = story_lo + windows[0][1]
+    hi_src = story_hi + windows[0][1]
+    angles = ""
+    if multicam:
+        used = sorted({c.get("camera") for c in block}, key=lambda c: order.index(c))
+        angles = f", alternating {' / '.join(str(c) for c in used)}"
+    log.append(
+        f"freefall plays whole: [{lo_src:.2f}, {hi_src:.2f}] as {len(block)} continuous "
+        f"clip(s){angles} (replaced {len(existing)} clip(s)) — the jump is never cut"
+    )
+    return out, log
+
+
+# --------------------------------------------------------------------------- #
 # Bug 441 — the filmed intro / outro bookends
 # --------------------------------------------------------------------------- #
 
@@ -865,6 +1132,7 @@ def validate_and_repair(
     manifest: dict[str, Any],
     *,
     manifest_by_camera: dict[str, dict[str, Any]] | None = None,
+    freefall_lead: float = 0.0,
 ) -> tuple[list[ClipDict], list[str]]:
     """Validate a composed EDL against the mandatory story/shot rules; repair in place.
 
@@ -874,9 +1142,21 @@ def validate_and_repair(
     Ultimate combo pass ``manifest_by_camera`` so camera-tagged clips resolve their
     own camera's ``exit_offset``/``deploy_offset``.
 
+    ``freefall_lead`` (freefall-only cuts — :data:`FREEFALL_DELIVERABLES`): seconds of
+    door/aircraft footage kept BEFORE the exit, chosen by the caller from the music so
+    the exit lands on the beat drop (client rule, 2026-10-22: the freefall clip is never
+    cut in the middle; it may only be shortened at its beginning). The aerial window
+    becomes ``[exit - lead, deploy + 3]`` and the continuity rule fills it whole. 0 (the
+    default) and every other deliverable keep ``[exit, deploy + 3]``.
+
     Returns the repaired clip list (input untouched) and human-readable repair log
     entries, one per repair — empty when the EDL was already compliant.
     """
+    lead = (
+        max(_EXIT_LEAD_S, float(freefall_lead))
+        if deliverable in FREEFALL_DELIVERABLES
+        else _EXIT_LEAD_S
+    )
     clips = [dict(c) for c in edl]
     if not clips:
         return [], []
@@ -898,7 +1178,7 @@ def validate_and_repair(
         # must not show pre-exit aircraft footage or post-opening scenery either.
         # _clamp_freefall_window only clamps freefall-scene clips, so intro/boarding/landing/
         # outro clips in story cuts pass through untouched.
-        clips = _apply(_clamp_freefall_window(clips, manifest, manifest_by_camera))
+        clips = _apply(_clamp_freefall_window(clips, manifest, manifest_by_camera, lead))
     clips = _apply(_dedupe(clips))
     clips = _apply(_sort_chronological(clips, ranks, multicam))
     if deliverable in FREEFALL_DELIVERABLES or deliverable in _STORY_DELIVERABLES:
@@ -917,6 +1197,15 @@ def validate_and_repair(
         clips = _apply(_align_cross_camera(clips, manifest, manifest_by_camera, ranks))
         clips = _apply(_limit_switch_rate(clips, ranks))
         clips = _apply(_enforce_min_shot(clips))
+    if deliverable in CONTINUOUS_FREEFALL_DELIVERABLES:
+        # After dedupe / switch-rate / min-shot, which would otherwise drop or reorder
+        # pieces of the uncut run (they never touch it again); before the bookends, which
+        # only touch the intro/outro scenes.
+        clips = _apply(
+            _require_continuous_freefall(
+                clips, manifest, manifest_by_camera, ranks, multicam, lead
+            )
+        )
     if deliverable in BOOKEND_DELIVERABLES:
         # LAST, so no later rule (dedupe, switch-rate, min-shot) can trim or drop the
         # whole-file clip it inserts.

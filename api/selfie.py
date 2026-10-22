@@ -43,6 +43,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from analysis.proxy import analysis_source
 from edl.storage import job_dir
 from edl.validate import BOOKEND_DELIVERABLES, bookend_ranges, validate_and_repair
+from render.beatdrop import (
+    FREEFALL_MAX_LEAD_S,
+    beat_drop_for,
+    music_offset_for,
+    plan_exit_lead,
+)
 from render.render import MAXRATE as _MAXRATE
 from render.render import VBV_BUFSIZE as _VBV_BUFSIZE
 
@@ -1170,6 +1176,9 @@ prefer omitting a beat over inserting a zero-value clip.
 full_video:
   All present scenes in order. Trim to stay under 4 minutes. Slow-mo the exit (at
   exit_offset), the top freefall smiles, and the deployment (at deploy_offset).
+  NEVER cut the freefall: it plays WHOLE, from exit_offset to 3 s after deploy_offset,
+  as one continuous run — no skipped seconds, no replays (slow-mo beats sit inside the
+  run at their own seconds). Trim the other scenes instead.
   NEVER trim the customer's filmed intro or outro: the FIRST source file of
   intro_interview and the LAST source file of outro_interview each play WHOLE, at 1x,
   as one clip (trim the middle of the jump instead to stay under 4 minutes).
@@ -1186,12 +1195,11 @@ highlights:
   top peaks. Always lead with a >=3 s intro_interview beat when that scene exists.
 
 freefall:
-  Under 1:15, and ENTIRELY within the aerial window. Lead with the door/exit-prep (the
-  seconds just before exit_offset), then the continuous exit sequence (freefall starting
-  AT exit_offset, ~12 s, slow-mo the exit), then short windows around the best freefall
-  moments BETWEEN exit_offset and deploy_offset, then the deployment (at deploy_offset,
-  slow-mo). Do NOT use any in-aircraft footage before exit_offset, any canopy footage
-  after deploy_offset, or any general boarding/canopy-flight/landing/outro footage.\
+  ENTIRELY within the aerial window, and UNCUT: the whole freefall from exit_offset to
+  3 s after deploy_offset as one continuous run — no skipped seconds, no replays. Slow-mo
+  the exit, the best freefall smiles and the deployment as short beats INSIDE that run, at
+  their own seconds. Do NOT use any in-aircraft footage before exit_offset, any canopy
+  footage after deploy_offset, or any general boarding/canopy-flight/landing/outro footage.\
 """
 
 
@@ -1554,6 +1562,7 @@ def compose_edls(
     target_duration: float = 90.0,
     use_ai: bool = True,
     prefix: str = "",
+    freefall_music: str | None = None,
 ) -> EDLResponse:
     """Produce the three EDLs (Claude when available, else an offline house cut).
 
@@ -1571,6 +1580,10 @@ def compose_edls(
     mis-sequences them. The house cut instead guarantees a complete, in-order edit
     (every scene contributes a proportional chunk; all milestones present), which is
     what that footage needs. The selfie (close-cam) product keeps the AI editor.
+
+    ``freefall_music`` is the freefall cut's backing track: its beat drop decides how
+    much footage leads into the exit (:func:`_freefall_lead`), so the exit lands on the
+    drop. ``None`` → the cut starts at the exit, as before.
     """
     if not use_ai or (client is None and not os.environ.get("ANTHROPIC_API_KEY")):
         if use_ai:
@@ -1595,12 +1608,16 @@ def compose_edls(
     # deliverable against the mandatory milestones + shot rules BEFORE persisting.
     repairs: dict[str, list[str]] = {}
     fixed: dict[str, list[Clip]] = {}
+    lead = _freefall_lead(manifest.get("scenes", []), freefall_music)
     for deliverable, field in (
         ("full_video", "full_video"),
         ("highlights", "highlights"),
         ("freefall", "freefall"),
     ):
-        clips, log = _validated(getattr(edls, field), deliverable, manifest)
+        clips, log = _validated(
+            getattr(edls, field), deliverable, manifest,
+            freefall_lead=lead if deliverable == "freefall" else 0.0,
+        )
         fixed[field] = clips
         repairs[deliverable] = log
     edls = edls.model_copy(update=fixed)
@@ -1614,6 +1631,8 @@ def _validated(
     deliverable: str,
     manifest: dict[str, Any],
     manifest_by_camera: dict[str, dict[str, Any]] | None = None,
+    *,
+    freefall_lead: float = 0.0,
 ) -> tuple[list[Clip], list[str]]:
     """Run :func:`edl.validate.validate_and_repair` over a deliverable's clips.
 
@@ -1627,6 +1646,7 @@ def _validated(
         deliverable,
         manifest,
         manifest_by_camera=manifest_by_camera,
+        freefall_lead=freefall_lead,
     )
     for line in log:
         logger.info("EDL validation repair [%s]: %s", deliverable, line)
@@ -2225,6 +2245,75 @@ def _audio_markers(
     return (music_start or 0.0), canopy_start
 
 
+# --------------------------------------------------------------------------- #
+# The freefall cut puts the aircraft exit on the music's beat drop (client rule,
+# 2026-10-22): the clip is never cut in the middle — it may only be shortened at its
+# BEGINNING, i.e. how much door/aircraft footage leads into the exit. Compose picks that
+# lead from the track's drop (:func:`_freefall_lead`); render derives the music offset
+# from the EDL it is actually given (:func:`_freefall_music_offset`), so a hand-edited
+# head or an exclude.json head trim still lands the exit on the drop.
+# --------------------------------------------------------------------------- #
+
+
+def _freefall_lead(scenes: Sequence[dict[str, Any]], music_path: str | None) -> float:
+    """Seconds of footage the freefall-only cut keeps before the exit.
+
+    The track's drop when the footage before the exit and :data:`FREEFALL_MAX_LEAD_S`
+    allow it (the music then plays from its first second); less when they don't (the
+    render then starts the music later). 0 with no music, no detectable drop, or no
+    detected exit — the cut starts at the exit, as it did before this rule.
+    """
+    if not music_path:
+        return 0.0
+    ff = _scene_by_name(scenes, "freefall")
+    if ff is None or ff.get("exit_offset") is None or ff.get("deploy_offset") is None:
+        return 0.0  # no aerial window to anchor the cut to; nothing to sync
+    try:
+        exit_off = max(0.0, float(ff["exit_offset"]))
+        return plan_exit_lead(beat_drop_for(music_path), exit_off, FREEFALL_MAX_LEAD_S)
+    except Exception as e:  # noqa: BLE001 - music is optional; never fail a job on it
+        logger.warning("freefall music sync skipped (%r); the cut starts at the exit", e)
+        return 0.0
+
+
+def _exit_output_time(clips: Sequence[Clip], exit_offset: float) -> float | None:
+    """Output-timeline seconds at which the aircraft exit plays, or ``None``.
+
+    The first freefall-scene clip whose source window holds ``exit_offset`` (a clip
+    starting exactly on it counts). ``None`` when no clip shows the exit — e.g. an
+    exclude.json range trimmed past it — so nothing is synced to a moment that isn't
+    there.
+    """
+    t = 0.0
+    for c in clips:
+        if c.scene == "freefall" and c.src_start - 1e-3 <= exit_offset < c.src_end:
+            return t + max(0.0, exit_offset - c.src_start) / c.speed_multiplier
+        t += _clip_out_dur(c)
+    return None
+
+
+def _freefall_music_offset(
+    clips: Sequence[Clip], scenes: Sequence[dict[str, Any]], music_path: str | None
+) -> float:
+    """Where in the track a freefall cut's music starts so its drop lands on the exit.
+
+    0 (play from the top, as before) when there is no music, no drop, or no exit.
+    """
+    if not music_path:
+        return 0.0
+    ff = _scene_by_name(scenes, "freefall")
+    if ff is None:
+        return 0.0
+    try:
+        exit_t = _exit_output_time(clips, float(ff.get("exit_offset") or 0.0))
+        if exit_t is None:
+            return 0.0
+        return music_offset_for(beat_drop_for(music_path), exit_t)
+    except Exception as e:  # noqa: BLE001 - music is optional; never fail a render on it
+        logger.warning("freefall music sync skipped (%r); music plays from its start", e)
+        return 0.0
+
+
 def render_selfie_video(
     out_path: str | Path,
     clips: Sequence[Clip],
@@ -2235,6 +2324,7 @@ def render_selfie_video(
     music_only: bool = True,
     deploy_offset: float = 0.0,
     bookends: Sequence[dict[str, Any]] | None = None,
+    music_offset: float = 0.0,
     width: int = _OUT_W,
     height: int = _OUT_H,
     fps: int = _OUT_FPS,
@@ -2258,6 +2348,11 @@ def render_selfie_video(
     audio whatever the mix above says, and the backing track is gated to silence
     over its output window (through the logo card when it is the final clip, so the
     music doesn't pop back in for 2.5 s). ``None``/empty → byte-identical to before.
+
+    ``music_offset`` (music-only edits — the freefall cuts) is where in the track the
+    music is at output time 0, so the beat drop lands on the aircraft exit
+    (:func:`_freefall_music_offset`): positive skips the track's head, negative starts
+    the music that much later. 0 → byte-identical to before.
     """
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -2356,10 +2451,20 @@ def render_selfie_video(
         if music_path:
             music_idx = add_input(music_path, ("-stream_loop", "-1"))
             if music_only:
-                # Constant solo music for the whole edit.
+                # Constant solo music for the whole edit. A freefall cut may enter the
+                # track mid-way (offset > 0: the drop comes later than the cut's lead)
+                # or hold it back (offset < 0) so the drop lands on the exit. The looped
+                # input's timestamps run on across loops, so atrim can start anywhere.
+                off = music_offset if abs(music_offset) >= 0.001 else 0.0
+                head, late = max(off, 0.0), max(-off, 0.0)
+                trim = (
+                    f"atrim={head:.3f}:{head + max(0.1, total - late):.3f}"
+                    if off else f"atrim=0:{total:.3f}"
+                )
+                delay = f"adelay={int(round(late * 1000))}:all=1," if late else ""
                 chains.append(
-                    f"[{music_idx}:a]atrim=0:{total:.3f},asetpts=PTS-STARTPTS,{_STEREO},"
-                    f"volume={_MUSIC_SOLO},apad=whole_dur={total:.3f}[mus]"
+                    f"[{music_idx}:a]{trim},asetpts=PTS-STARTPTS,{_STEREO},"
+                    f"volume={_MUSIC_SOLO},{delay}apad=whole_dur={total:.3f}[mus]"
                 )
             else:
                 # Solo from boarding until canopy, then ducked under the original audio.
@@ -2538,6 +2643,11 @@ def render_outputs(
             deploy_offset=deploy_offset,
             # Bug 441 — the filmed intro/outro play whole with their own sound.
             bookends=bookend_ranges(manifest) if base in BOOKEND_DELIVERABLES else None,
+            # The freefall cut's exit lands on the music's beat drop.
+            music_offset=(
+                _freefall_music_offset(clips, manifest["scenes"], music_paths.get(base))
+                if base == "freefall" else 0.0
+            ),
         )
         outputs[name] = str(out)
     return outputs
@@ -2785,6 +2895,7 @@ def run_selfie_pipeline(
     # spec-flight load master is the same footage from the same distance (it IS a camera
     # flyer's card, just with no assigned customer), so it takes the house cut too.
     if package.makes_videos:
+        music_paths = _music_paths(booking, job_id, jobs_root)
         edls = compose_edls(
             scores, manifest, booking, job_id, jobs_root,
             client=client, target_duration=job.target_duration,
@@ -2792,12 +2903,12 @@ def run_selfie_pipeline(
                 package != Package.external
                 and job.job_kind is not JobKind.load_master
             ),
+            freefall_music=music_paths.get("freefall"),
         )
         edls = apply_exclusions(edls, load_exclusions(job_id, jobs_root))
         outputs.update(
             render_outputs(
-                job_id, edls, manifest, booking, jobs_root,
-                music_paths=_music_paths(booking, job_id, jobs_root),
+                job_id, edls, manifest, booking, jobs_root, music_paths=music_paths,
             )
         )
 
@@ -2939,6 +3050,7 @@ def run_media_ref_pipeline(
 
     outputs: dict[str, str] = {}
     if package.makes_videos:
+        music_paths = _music_paths(booking, job_id, jobs_root)
         edls = compose_edls(
             scores, manifest, booking, job_id, jobs_root,
             client=client, target_duration=job.target_duration,
@@ -2948,13 +3060,13 @@ def run_media_ref_pipeline(
             # gets the AI edit.
             use_ai=(package != Package.external),
             prefix=prefix,
+            freefall_music=music_paths.get("freefall"),
         )
         edls = apply_exclusions(edls, load_exclusions(job_id, jobs_root))
         outputs.update(
             render_outputs(
                 job_id, edls, manifest, booking, jobs_root,
-                music_paths=_music_paths(booking, job_id, jobs_root),
-                prefix=prefix,
+                music_paths=music_paths, prefix=prefix,
             )
         )
 
@@ -3412,15 +3524,20 @@ def run_ultimum_pipeline(
         role_manifest = role_manifests[role]
         clips = _curated_freefall(role_manifest["scenes"], role_scores[role])
         # These cuts are single-camera (clips carry no camera tag); the role manifest
-        # supplies that camera's exit/deploy offsets for the freefall-window rules.
-        clips, repairs[deliverable] = _validated(clips, deliverable, role_manifest)
+        # supplies that camera's exit/deploy offsets for the freefall-window rules. The
+        # lead before the exit comes from THIS deliverable's track (beat drop on exit).
+        clips, repairs[deliverable] = _validated(
+            clips, deliverable, role_manifest,
+            freefall_lead=_freefall_lead(role_manifest["scenes"], music[deliverable]),
+        )
         _persist_clips(jd, ULTIMUM_EDL_FILES[deliverable], clips)
-        clips = apply_exclusions(
-            EDLResponse(full_video=clips, highlights=clips, freefall=clips), exclusions
-        ).freefall
+        clips = exclude_freefall_head(clips, exclusions)
         render_selfie_video(
             jd / f"{deliverable}.mp4", clips, _scene_paths(role_manifest),
             booking=booking, music_path=music[deliverable], music_only=True,
+            music_offset=_freefall_music_offset(
+                clips, role_manifest["scenes"], music[deliverable]
+            ),
         )
         outputs[deliverable] = str(jd / f"{deliverable}.mp4")
 
@@ -3469,9 +3586,10 @@ def replay_ultimum(
         return [Clip.model_validate(c) for c in json.loads((jd / filename).read_text())]
 
     def _cut(clips: list[Clip]) -> list[Clip]:
+        # The combo cuts take every exclusion; the freefall cuts only a head trim.
         return apply_exclusions(
             EDLResponse(full_video=clips, highlights=clips, freefall=clips), exclusions
-        ).freefall
+        ).full_video
 
     role_manifests = {
         role: json.loads((jd / _ULTIMUM_ROLE_MANIFEST[role]).read_text())
@@ -3500,10 +3618,14 @@ def replay_ultimum(
 
     for deliverable, role in ULTIMUM_FREEFALL_ROLE.items():
         role_manifest = role_manifests[role]
+        clips = exclude_freefall_head(_clips(ULTIMUM_EDL_FILES[deliverable]), exclusions)
         render_selfie_video(
-            jd / f"{deliverable}.mp4", _cut(_clips(ULTIMUM_EDL_FILES[deliverable])),
+            jd / f"{deliverable}.mp4", clips,
             _scene_paths(role_manifest), booking=booking,
             music_path=music[deliverable], music_only=True,
+            music_offset=_freefall_music_offset(
+                clips, role_manifest["scenes"], music[deliverable]
+            ),
         )
         outputs[deliverable] = str(jd / f"{deliverable}.mp4")
 
@@ -3657,6 +3779,9 @@ def apply_exclusions(
     A clip overlapping an excluded range is split around it (its speed is preserved);
     fully-excluded clips are dropped. A deliverable never empties (the EDL needs at
     least one clip), so if exclusions would remove everything the originals are kept.
+
+    The ``freefall`` cut is the exception: it is never cut in the middle, so it only
+    takes a trim at its head (:func:`exclude_freefall_head`).
     """
     if not exclusions:
         return edls
@@ -3678,8 +3803,49 @@ def apply_exclusions(
     return EDLResponse(
         full_video=_filter(edls.full_video),
         highlights=_filter(edls.highlights),
-        freefall=_filter(edls.freefall),
+        freefall=exclude_freefall_head(edls.freefall, exclusions),
     )
+
+
+def exclude_freefall_head(
+    clips: Sequence[Clip], exclusions: dict[str, list[tuple[float, float]]]
+) -> list[Clip]:
+    """``exclude.json`` for a freefall-only cut: the HEAD may be trimmed, nothing else.
+
+    Client rule (2026-10-22): the freefall clip is never cut up in the middle; it may
+    only be shortened at the beginning. So an excluded range that covers the start of
+    the cut moves the start past it (dropping a leading clip it swallows whole), and any
+    other range — mid-jump or at the tail — is ignored with a warning rather than
+    splitting the jump. The render recomputes the music offset from the trimmed cut, so
+    the exit still lands on the beat drop. Never empties the cut.
+    """
+    out = list(clips)
+    if not exclusions or not out:
+        return out
+    while out:
+        first = out[0]
+        start = first.src_start
+        for a, b in sorted(exclusions.get(first.scene, [])):
+            if a <= start + 1e-6 and b > start:
+                start = b
+        if start <= first.src_start:
+            break
+        if first.src_end - start < 0.05:
+            out.pop(0)  # the head trim swallowed this clip whole; try the next one
+            continue
+        out[0] = first.model_copy(update={"src_start": start})
+        break
+    if not out:
+        return list(clips)
+    for c in out:
+        for a, b in exclusions.get(c.scene, []):
+            if a < c.src_end and b > c.src_start and not (a <= c.src_start + 1e-6):
+                logger.warning(
+                    "exclude.json range [%.2f, %.2f] on %s ignored for a freefall cut: it "
+                    "is only ever shortened at its start, never cut in the middle",
+                    a, b, c.scene,
+                )
+    return out
 
 
 def replay_selfie(

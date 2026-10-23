@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 from functools import lru_cache
 from pathlib import Path
@@ -68,9 +69,33 @@ _SNAP_S = 0.75
 #: Sidecar key.
 SIDECAR_KEY = "beat_drop"
 #: The most door/aircraft footage a freefall-only cut may carry before the exit. Enough
-#: for an 8-bar build at 128 BPM (15 s); past it the music starts later instead, so the
-#: freefall cut never turns into a plane ride.
+#: for an 8-bar build at 128 BPM (15 s); past it the music starts later instead (the exit
+#: still lands on the drop, the track's head is skipped), so the freefall cut never turns
+#: into a plane ride. This is the product expectation QA tests against (bug reopen
+#: 2026-10-23: "at most 15 s of plane before the exit"). Override per deployment with
+#: ``$FREEFALL_MAX_LEAD_S`` (seconds); read at use through :func:`freefall_max_lead_s`.
 FREEFALL_MAX_LEAD_S = 15.0
+_MAX_LEAD_ENV = "FREEFALL_MAX_LEAD_S"
+
+
+def freefall_max_lead_s() -> float:
+    """The lead cap in force: ``$FREEFALL_MAX_LEAD_S`` (>= 0), else
+    :data:`FREEFALL_MAX_LEAD_S`. A value that isn't a non-negative number is logged and
+    ignored — never raises, like everything else here."""
+    raw = os.environ.get(_MAX_LEAD_ENV)
+    if raw is None or not raw.strip():
+        return FREEFALL_MAX_LEAD_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not (value >= 0.0):  # NaN fails this too
+        logger.warning(
+            "beat drop: %s=%r is not a non-negative number of seconds; using %.1f",
+            _MAX_LEAD_ENV, raw, FREEFALL_MAX_LEAD_S,
+        )
+        return FREEFALL_MAX_LEAD_S
+    return value
 
 
 def sidecar_path(track: str | Path) -> Path:

@@ -511,7 +511,10 @@ Two runtime media roots, with different audiences:
   silence never counts). Cached per (path, size, mtime); never raises — no music / no
   drop / any error = the pre-rule behaviour (cut starts at the exit, music from 0).
   **Compose** (`_freefall_lead`) picks the pre-exit lead = the drop, bounded by the
-  footage before the exit and `FREEFALL_MAX_LEAD_S` (15 s), and passes it as
+  footage before the exit and the lead cap (`$FREEFALL_MAX_LEAD_S`, default 15 s —
+  `beatdrop.freefall_max_lead_s`; QA's stated expectation is "at most 15 s of plane
+  before the exit", so a later drop — `sample2.mp3` drops at 28.4 s — enters the track
+  mid-way rather than lengthening the plane ride), and passes it as
   `validate_and_repair(freefall_lead=)`, which widens ONLY those three deliverables'
   window to `[exit − lead, deploy + 3]` — the continuity rule above then fills it whole.
   **Render** (`_freefall_music_offset`) re-derives the music offset from the EDL it is
@@ -522,7 +525,25 @@ Two runtime media roots, with different audiences:
   a mid-jump or tail range is ignored with a warning, never split — `source_usage`
   mirrors that. Pre-rule EDLs keep their start until re-processed, but a replay still
   syncs the music to wherever their exit plays. Tests: `tests/test_beatdrop.py`
-  (incl. a real ffmpeg render that measures the drop on the exit).
+  (incl. a real ffmpeg render that measures the drop on the exit, and a per-track check
+  that every shipped `templates/music` track yields a drop). **The exit is searched in
+  EVERY file of the freefall scene** (`api.selfie.detect_scene_exit_offset`, offsets from
+  `file_offsets`), not just the first: a scene of several GoPro files whose exit lived in a
+  later file got `exit_offset: 0.0` — the same value as "starts in freefall" — so the
+  freefall cut opened on the whole plane ride with the drop playing over the aircraft. A
+  scene with NO detected exit is now logged at WARNING and recorded in the manifest's
+  `flagged` list (`EXIT_NOT_DETECTED_FLAG`). **A tumbling tandem exit is found by a
+  fallback** (`api.selfie._tumbling_exit`, bug reopen 2026-10-23, job `ba5fade8…`, a camera
+  with no GPS): rolling out of the door keeps the per-payload mean ~1 g and its near-0 g
+  samples are vetoed by the door-shake guard, so the payload rule saw nothing. The
+  fallback runs ONLY when that rule finds nothing, and takes the first quarter-second
+  that is weightless (mean < 0.7 g with a sample < 0.25 g) which comes after a calm
+  on-board second and starts >= 30 s with no quiet second (all samples 0.6–1.45 g) —
+  freefall never goes quiet, the cabin always does. Tests: `tests/test_exit_tumbling.py`,
+  built from that file's real record. Triage a reported miss with
+  `python scripts/diagnose_freefall_sync.py <job_id> --exit-at 0:19` (the real exit as
+  seen in the delivered video): it prints the lead vs the cap, the detected exit vs the
+  real one, the track's drop and the music offset, and the accelerometer around both.
 - **The house cut's intro/outro CARDS play whole and without music** (client rule,
   2026-10-22). `render/builder.py` cuts the music to the FOOTAGE
   (`edl.output_duration`), fades it out over its last `_MUSIC_TAIL_FADE_SECONDS`
@@ -826,6 +847,19 @@ Two runtime media roots, with different audiences:
   label fallback), and with `--decode` the QR markers + per-clip session attribution
   (+ `resolve_for_staff` against `MONGO_URL`). Exit 0/1, like `check_match.py`
 - `python scripts/diagnose_ultimum.py <job_id>` — read-only diagnostic for an Ultimate job: per-camera scene classification, combo clip selection by `(camera, scene)`, video-vs-audio stream-duration sync on scene files + rendered outputs (catches the "video freezes, audio continues" desync), per-camera freefall cuts, and photo count — with findings flagging a camera collapsed to one scene, the cameraman absent from a scene, or any desync
+- `python scripts/diagnose_freefall_sync.py <job_id> [--exit-at 0:19] [--deliverable freefall|external_freefall|chute_libre_selfie]`
+  — read-only triage for "the freefall video opens on the plane / the music didn't hit on
+  the exit": proves whether the continuity rule ran on the job (`validation_report.json`),
+  prints the freefall scene's files + detected `exit_offset`/`deploy_offset`, the EDL as
+  rendered (head, lead vs the `FREEFALL_MAX_LEAD_S` cap, any mid-jump skip/replay), the
+  track + its drop + the music offset, and — given the real exit as seen in the delivered
+  video — maps it back to scene time, says how late/early the detector was, and dumps the
+  accelerometer (mean/min g per second) around both instants from the staged masters.
+  `--telemetry` adds the freefall file's whole sensor record (accel mean/min/max, gyro
+  peak, GPS altitude + 3D speed per second, and quarter-second bins near the exit) — the
+  evidence for tuning the exit detector. Runs on older deployed code too (copy it into
+  the worker container: the jobs live in the Docker volume).
+  Exit 1 on a finding, 2 when the job's artifacts are missing
 - `ffmpeg -version` — must be 6.0+ for our speed-ramp filter
 - `uvicorn api.app:app --reload` — serve the /api FastAPI service (OpenAPI docs at `/docs`); SkydiveOS calls it to create jobs, upload footage, review, approve, and stream previews
 - `celery -A api.celery_app.celery_app worker -l info` — run the worker that executes the async pipeline tasks /api enqueues (set `CELERY_TASK_ALWAYS_EAGER=1` to run tasks inline without a worker, for a single-process demo). **Never leave eager on when a worker is running**: the upload endpoint then runs the whole segment→score→render inline in the API process, so for the ~15 min of an edit `GET /jobs`, `/docs`, the review UI and the discovery loop all block (verified: `GET /jobs` times out, discovery stops scanning). Eager also skips `ultimum_watchdog_job`

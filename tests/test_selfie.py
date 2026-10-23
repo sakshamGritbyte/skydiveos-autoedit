@@ -378,7 +378,10 @@ def test_build_scenes_concats_multi_chapter_and_writes_manifest(
     # Duration sums; delta spans first clip's first to last clip's last.
     assert scenes["freefall"]["duration"] == pytest.approx(20.0)
     assert scenes["freefall"]["gpmf_signals"]["altitude_delta"] == pytest.approx(-3400.0)
-    assert manifest["flagged"] == []
+    # The fake files carry no telemetry, so no exit is found — and that is now said
+    # out loud rather than left as a silent exit_offset of 0.0.
+    assert scenes["freefall"]["exit_offset"] == 0.0
+    assert manifest["flagged"] == [selfie.EXIT_NOT_DETECTED_FLAG]
 
     # Persisted to scene_manifest.json.
     saved = json.loads((tmp_path / "job1" / "scene_manifest.json").read_text())
@@ -716,6 +719,61 @@ def test_detect_exit_offset_zero_when_no_dip(monkeypatch: pytest.MonkeyPatch) ->
     data = _fake_gpmf([1.0] * 15)
     monkeypatch.setattr("metadata.gpmf.parse_gpmf", lambda p: data)
     assert selfie.detect_exit_offset("/x/freefall.mp4") == 0.0
+
+
+def test_scene_exit_is_found_in_a_later_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A freefall scene of two GoPro files: the first is the whole in-aircraft ride (steady
+    # ~1 g, no exit), the exit is 10 s into the SECOND file, which starts 60 s into the
+    # scene. Must come back scene-relative (70), not 0 — the bug-reopen symptom was the
+    # cut opening on the plane ride because only the first file was ever searched.
+    data = {
+        "/x/GX010001.MP4": _fake_gpmf([1.0] * 15),
+        "/x/GX020001.MP4": _fake_gpmf([1.0] * 10 + [0.4, 0.4, 0.5, 0.6]),
+    }
+    monkeypatch.setattr("metadata.gpmf.parse_gpmf", lambda p: data[str(p)])
+    sources = [("/x/GX010001.MP4", 0.0), ("/x/GX020001.MP4", 60.0)]
+    assert selfie.detect_scene_exit_offset(sources) == 70.0
+    # First file wins when it has the exit; a later file is never consulted.
+    assert selfie.detect_scene_exit_offset(list(reversed(sources))) == 10.0 + 60.0
+    assert selfie.detect_scene_exit_offset(
+        [("/x/GX020001.MP4", 0.0), ("/x/GX010001.MP4", 14.0)]
+    ) == 10.0
+    # No file shows an exit -> 0.0, as before.
+    assert selfie.detect_scene_exit_offset([("/x/GX010001.MP4", 0.0)]) == 0.0
+    assert selfie.detect_scene_exit_offset([]) == 0.0
+
+
+def test_build_scenes_flags_an_undetected_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        selfie, "concat_scene",
+        lambda src, out: (Path(out).parent.mkdir(parents=True, exist_ok=True),
+                          Path(out).write_bytes(b"x"), Path(out))[-1],
+    )
+    monkeypatch.setattr(selfie, "detect_deploy_offset", lambda paths, exit_offset=0.0: 75.0)
+    classified = [
+        ("freefall", _sig(filename="GX010001.MP4", chapter=1, altitude_first=3800,
+                           altitude_last=600, altitude_mean=2200, accl_z_mean=0.1)),
+        ("freefall", _sig(filename="GX020001.MP4", chapter=2, altitude_first=600,
+                           altitude_last=400, altitude_mean=500, accl_z_mean=0.1)),
+    ]
+    # Exit 7 s into the SECOND file (which the manifest places at offset 10 s).
+    monkeypatch.setattr(
+        selfie, "detect_exit_offset", lambda src: 7.0 if src.endswith("GX020001.MP4") else 0.0
+    )
+    manifest = selfie.build_scenes("j1", classified, tmp_path)
+    ff = manifest["scenes"][0]
+    assert ff["file_offsets"][1]["offset"] == pytest.approx(10.0)
+    assert ff["exit_offset"] == pytest.approx(17.0)
+    assert manifest["flagged"] == []
+
+    # No file shows the exit: the manifest says so instead of a silent 0.0.
+    monkeypatch.setattr(selfie, "detect_exit_offset", lambda src: 0.0)
+    manifest = selfie.build_scenes("j2", classified, tmp_path)
+    assert manifest["scenes"][0]["exit_offset"] == 0.0
+    assert manifest["flagged"] == [selfie.EXIT_NOT_DETECTED_FLAG]
+    assert manifest["scenes"][0]["needs_review"] is False  # a flag, not a reclassification
 
 
 def _fake_gpmf_meanmin(series: list[tuple[float, float]]) -> Any:

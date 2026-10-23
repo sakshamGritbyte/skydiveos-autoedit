@@ -186,6 +186,46 @@ def test_no_drop_means_the_cut_starts_at_the_exit(drop: float | None) -> None:
     assert plan_exit_lead(drop, available_lead=20.0, max_lead=15.0) == 0.0
 
 
+def test_default_cap_is_fifteen_seconds_of_plane() -> None:
+    # QA's expectation (bug reopen 2026-10-23): at most 15 s of plane before the exit.
+    # A later drop still lands on the exit — the render enters the track mid-way.
+    assert FREEFALL_MAX_LEAD_S == 15.0
+    assert plan_exit_lead(28.4, available_lead=60.0, max_lead=FREEFALL_MAX_LEAD_S) == 15.0
+    assert music_offset_for(28.4, 15.0) == pytest.approx(13.4)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("10", 10.0),
+        ("0", 0.0),            # 0 = never lead in: the cut starts at the exit
+        ("12.5", 12.5),
+        ("", FREEFALL_MAX_LEAD_S),
+        ("plenty", FREEFALL_MAX_LEAD_S),
+        ("-5", FREEFALL_MAX_LEAD_S),
+        ("nan", FREEFALL_MAX_LEAD_S),
+    ],
+)
+def test_lead_cap_from_env(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: float
+) -> None:
+    monkeypatch.setenv("FREEFALL_MAX_LEAD_S", raw)
+    assert beatdrop.freefall_max_lead_s() == expected
+    monkeypatch.delenv("FREEFALL_MAX_LEAD_S")
+    assert beatdrop.freefall_max_lead_s() == FREEFALL_MAX_LEAD_S
+
+
+def test_env_cap_bounds_the_composed_lead(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(selfie, "beat_drop_for", lambda p: 28.4)
+    assert selfie._freefall_lead(_scenes(exit_off=40.0), "/m.mp3") == FREEFALL_MAX_LEAD_S
+    monkeypatch.setenv("FREEFALL_MAX_LEAD_S", "30")
+    assert selfie._freefall_lead(_scenes(exit_off=40.0), "/m.mp3") == 28.4
+    monkeypatch.setenv("FREEFALL_MAX_LEAD_S", "10")
+    assert selfie._freefall_lead(_scenes(exit_off=40.0), "/m.mp3") == 10.0
+    monkeypatch.setenv("FREEFALL_MAX_LEAD_S", "0")
+    assert selfie._freefall_lead(_scenes(exit_off=40.0), "/m.mp3") == 0.0
+
+
 def test_music_offset_puts_the_drop_on_the_exit() -> None:
     assert music_offset_for(40.0, 15.0) == 25.0   # skip the track's head
     assert music_offset_for(6.0, 6.0) == 0.0      # lead == drop: play from the top
@@ -216,7 +256,7 @@ def test_freefall_lead_follows_the_track(monkeypatch: pytest.MonkeyPatch) -> Non
     assert selfie._freefall_lead(_scenes(exit_off=3.0), "/m.mp3") == 3.0   # footage-bound
     assert selfie._freefall_lead(_scenes(), None) == 0.0                   # no music
     monkeypatch.setattr(selfie, "beat_drop_for", lambda p: 60.0)
-    assert selfie._freefall_lead(_scenes(), "/m.mp3") == FREEFALL_MAX_LEAD_S
+    assert selfie._freefall_lead(_scenes(exit_off=90.0), "/m.mp3") == FREEFALL_MAX_LEAD_S
 
 
 def test_freefall_lead_needs_a_detected_window(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -471,6 +511,33 @@ def test_real_render_lands_the_drop_on_the_exit(
     # The looped track keeps playing after its end (12 s or 17 s of track, 15.5 s of edit).
     tail = beatdrop.decode_mono(out)[int(14.0 * RATE): int(15.0 * RATE)]
     assert float(np.abs(tail).max()) > 0.005
+
+
+_LIBRARY = Path(__file__).resolve().parent.parent / "templates" / "music"
+_AUDIO_SUFFIXES = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg"}
+_LIBRARY_TRACKS = sorted(
+    p for p in (_LIBRARY.glob("*") if _LIBRARY.is_dir() else ())
+    if p.suffix.lower() in _AUDIO_SUFFIXES
+)
+
+
+@_needs_ffmpeg
+@pytest.mark.skipif(not _LIBRARY_TRACKS, reason="no tracks in templates/music")
+@pytest.mark.parametrize("track", _LIBRARY_TRACKS, ids=lambda p: p.stem)
+def test_every_shipped_track_has_a_drop_to_sync_to(track: Path) -> None:
+    """Every library track must yield a drop (detected, or pinned by a sidecar) —
+    otherwise the freefall cut silently starts at the exit with the music from 0, and
+    "the music didn't hit on the exit" is the first anyone hears of it. A track that
+    truly has no drop must say so with ``{"beat_drop": null}`` so this skips on purpose.
+    Measured 2026-10-23: Fly Away 12.2 s, KsMyHt 11.6 s, Free Fallin' 10.0 s,
+    sample2 28.4 s (past the 15 s cap: its cut enters the track 13.4 s in)."""
+    found, pinned = beatdrop._read_sidecar(track)
+    if found and pinned is None:
+        pytest.skip(f"{track.name}: pinned to no drop")
+    drop = beat_drop_for(track)
+    assert drop is not None and 0.0 < drop <= beatdrop._SEARCH_MAX_S, (
+        f"{track.name}: no beat drop found — pin one in {sidecar_path(track).name}"
+    )
 
 
 # --------------------------------------------------------------------------- #

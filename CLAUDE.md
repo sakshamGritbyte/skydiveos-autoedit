@@ -450,6 +450,20 @@ Two runtime media roots, with different audiences:
   Archive Utility). The page's buttons HEAD the URL first (refusal shown inline, not a JSON
   tab), show "Preparing…", ignore a second tap, then hand the URL to the browser's download
   manager; plain anchors without JS; an iOS-only note says ZIPs go to the Files app.
+- **The gallery has ONE Share button, in the hero** (2026-10-23, `render_gallery_html(
+  share_url=…)`, passed only by `GET /j/{code}`). It shares the CLEAN link
+  `{PUBLIC_BASE_URL}/j/{code}` — never the `?s=e`/`?s=m` source tag of the original send,
+  never a `#tab` fragment. Same bearer link the customer already holds, so sharing grants
+  exactly what forwarding the email would; it renders on the LOCKED page too, where a
+  friend lands on the watermarked preview and its unlock CTA (the upsell). Markup is a
+  `<details>` menu (WhatsApp / Facebook / Email anchors + the link in a read-only box), so
+  it works with no JS; the script opens `navigator.share` from the summary's own click
+  (Safari refuses a share started outside the tap), treats `AbortError` as silent, falls
+  back to the menu on any other failure, and swaps the box for a Copy-link button when the
+  clipboard API exists. Outbound anchors keep `rel="noreferrer"` (the URL is a
+  credential). Adds `og:title/description/type/url` — no `og:image` yet (posters are
+  per-token URLs; a public preview image needs its own decision). The legacy S3 page
+  passes no `share_url` and is byte-identical. Tests: `test_gallery_share.py`.
 - **The filmed intro/outro BOOKENDS play whole, without music** (Bug 441, client rule).
   `edl.validate.bookend_ranges(manifest[, manifest_by_camera, multicam])` = the FIRST
   source file of `intro_interview` (`[0, file_offsets[1])`, whole scene when one file) and

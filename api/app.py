@@ -2608,6 +2608,14 @@ def create_app() -> FastAPI:
             # Lets an open page flip itself the moment /unlock (or an add-on
             # purchase) lands (Frame 03).
             poll_token=token,
+            # The hero's Share button: this gallery's CLEAN link — never the `?s=`
+            # source tag the email/SMS carried, never a `#tab` fragment. Absolute when
+            # the public origin is known (it always is when this route is reachable);
+            # the page's script resolves a relative one against its own location.
+            share_url=(
+                f"{settings.public_base_url}/j/{token}"
+                if settings.public_base_url else f"/j/{token}"
+            ),
         )
         return HTMLResponse(html_page)
 

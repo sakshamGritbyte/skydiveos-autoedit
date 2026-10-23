@@ -30,6 +30,7 @@ from __future__ import annotations
 import base64
 import html
 import mimetypes
+import urllib.parse
 from collections.abc import Mapping, Sequence
 from datetime import date
 from functools import lru_cache
@@ -74,6 +75,15 @@ _PLATFORM_MARK = "UltimateDZM"
 
 #: Header tagline (the redesign's top-right line).
 _TAGLINE = "Your souvenir is ready"
+
+#: The Share button's glyph — inline, because the page carries no external assets.
+_SHARE_ICON = (
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    '<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/>'
+    '<line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>'
+    "</svg>"
+)
 
 
 @lru_cache(maxsize=4)
@@ -160,6 +170,7 @@ def render_gallery_html(
     posters: Mapping[str, str] | None = None,
     logo_data_uri: str | None = None,
     download_urls: Mapping[str, str] | None = None,
+    share_url: str | None = None,
 ) -> str:
     """Render the customer gallery page as one self-contained HTML string.
 
@@ -246,6 +257,17 @@ def render_gallery_html(
       cross-origin redirect makes browsers ignore the ``download`` attribute, so the
       click would *play* the video instead of saving it. A card with no entry keeps
       using its player URL (the legacy S3 page, unchanged).
+    * ``share_url`` — the gallery's own link, CLEAN (no ``?s=`` source tag, no
+      ``#tab`` fragment), for the hero's Share button. It is the same bearer link the
+      customer was sent — sharing it grants exactly what forwarding the email would,
+      no more — and on a locked page a friend lands on the watermarked preview with
+      its unlock offer, which is the point. The control is a ``<details>`` menu
+      (WhatsApp / Facebook / Email anchors + the link in a read-only box) so it works
+      with no JavaScript; the script opens the device's native share sheet where one
+      exists and turns the box into a Copy-link button where the clipboard is
+      available. Also emits ``og:`` title/description so the pasted link previews
+      as the customer's gallery rather than a bare URL. ``None`` (the legacy S3
+      page, whose presigned URLs expire) renders none of it — byte-identical.
     """
     e = html.escape
     brand_e = e(brand)
@@ -519,6 +541,70 @@ def render_gallery_html(
         "});});})();</script>"
     ) if (dl_btn or download_everything_url) else ""
 
+    # The Share control (see ``share_url`` above). Everything the menu needs is
+    # rendered server-side; the script only upgrades it. The outbound anchors keep
+    # rel="noreferrer" for the same reason the page sets `referrer: no-referrer`:
+    # the URL is the customer's credential and travels only where they send it.
+    share_html = share_js = og_meta = ""
+    if share_url:
+        share_title = f"{customer_name} — {brand}" if customer_name else brand
+        share_text = f"Check out my skydive at {brand}!" if brand else "Check out my skydive!"
+        q = urllib.parse.quote
+        wa_href = "https://wa.me/?text=" + q(f"{share_text} {share_url}", safe="")
+        fb_href = "https://www.facebook.com/sharer/sharer.php?u=" + q(share_url, safe="")
+        mail_href = (
+            "mailto:?subject=" + q(share_title, safe="")
+            + "&body=" + q(f"{share_text} {share_url}", safe="")
+        )
+        share_html = (
+            f'<div class="share" data-share data-url="{e(share_url)}" '
+            f'data-title="{e(share_title)}" data-text="{e(share_text)}">'
+            '<details><summary class="sharebtn">'
+            f"{_SHARE_ICON}<span>Share</span></summary>"
+            '<div class="sharemenu">'
+            '<button type="button" class="shareitem" data-share-copy hidden>Copy link</button>'
+            f'<input class="shareurl" data-share-box readonly value="{e(share_url)}" '
+            'aria-label="Gallery link" onclick="this.select()">'
+            f'<a class="shareitem" data-share-to="whatsapp" rel="noreferrer noopener" '
+            f'target="_blank" href="{e(wa_href)}">WhatsApp</a>'
+            f'<a class="shareitem" data-share-to="facebook" rel="noreferrer noopener" '
+            f'target="_blank" href="{e(fb_href)}">Facebook</a>'
+            f'<a class="shareitem" data-share-to="email" rel="noreferrer" '
+            f'href="{e(mail_href)}">Email</a>'
+            "</div></details></div>"
+        )
+        og_meta = (
+            f'\n<meta property="og:title" content="{e(share_title)}">'
+            f'\n<meta property="og:description" content="{e(share_text)}">'
+            '\n<meta property="og:type" content="video.other">'
+            f'\n<meta property="og:url" content="{e(share_url)}">'
+        )
+        # The native sheet is opened from the summary's OWN click, so it runs inside
+        # the tap's user activation (Safari refuses a share started later). A
+        # dismissed sheet (AbortError) is silent; any other failure falls back to the
+        # menu. The link is re-derived from the attribute against location, so a
+        # relative share_url still yields an absolute link.
+        share_js = (
+            "<script>(function(){var w=document.querySelector('[data-share]');if(!w)return;"
+            "var d=w.querySelector('details'),sm=w.querySelector('summary');"
+            "var u=new URL(w.getAttribute('data-url'),location.href).href;"
+            "var t=w.getAttribute('data-title'),x=w.getAttribute('data-text');"
+            "var box=w.querySelector('[data-share-box]');box.value=u;"
+            "var c=w.querySelector('[data-share-copy]');"
+            "if(navigator.clipboard&&navigator.clipboard.writeText){"
+            "c.hidden=false;box.hidden=true;var lbl=c.textContent;"
+            "c.addEventListener('click',function(){navigator.clipboard.writeText(u).then(function(){"
+            "c.textContent='Link copied \u2713';setTimeout(function(){c.textContent=lbl;},2000);"
+            "},function(){c.hidden=true;box.hidden=false;box.select();});});}"
+            "if(navigator.share){sm.addEventListener('click',function(ev){"
+            "ev.preventDefault();if(d.open){d.open=false;return;}"
+            "navigator.share({title:t,text:x,url:u})['catch'](function(er){"
+            "if(er&&er.name==='AbortError')return;d.open=true;});});}"
+            "document.addEventListener('click',function(ev){if(d.open&&!w.contains(ev.target))d.open=false;});"
+            "document.addEventListener('keydown',function(ev){if(ev.key==='Escape')d.open=false;});"
+            "})();</script>"
+        )
+
     if tabbed:
         eyebrow = "We filmed it anyway" if locked else "Your jump is ready"
         eyebrow_html = f'<div class="eyebrow">{eyebrow}</div>'
@@ -626,7 +712,7 @@ def render_gallery_html(
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<title>{title} — {brand_e}</title>
+<title>{title} — {brand_e}</title>{og_meta}
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   :root {{
@@ -748,6 +834,35 @@ def render_gallery_html(
      exactly the catalogue's string. */
   .utile .uprice::before {{ content:"Add "; font-size:14px; font-weight:700; margin-right:6px; }}
 
+  .share {{ margin-top:22px; position:relative; display:inline-block; }}
+  .share details > summary {{ list-style:none; }}
+  .share details > summary::-webkit-details-marker {{ display:none; }}
+  .sharebtn {{
+    display:inline-flex; align-items:center; gap:9px; min-height:44px; cursor:pointer;
+    background:var(--surface); border:1px solid var(--line); color:var(--white);
+    padding:10px 18px; border-radius:9px; font-weight:700; font-size:14px;
+    transition:border-color .15s ease,background .15s ease;
+  }}
+  .sharebtn:hover, .share details[open] .sharebtn {{ border-color:var(--red-dim); background:var(--surface-2); }}
+  .sharebtn svg {{ width:16px; height:16px; }}
+  .sharemenu {{
+    position:absolute; left:0; top:calc(100% + 6px); z-index:20; min-width:220px;
+    display:flex; flex-direction:column; padding:6px; gap:2px;
+    background:var(--surface); border:1px solid var(--line); border-radius:10px;
+    box-shadow:0 12px 30px rgba(0,0,0,.5);
+  }}
+  .shareitem {{
+    display:block; width:100%; text-align:left; background:none; border:0; cursor:pointer;
+    color:var(--white); font:inherit; font-size:14px; font-weight:600;
+    padding:10px 12px; border-radius:7px;
+  }}
+  .shareitem:hover, .shareitem:focus-visible {{ background:var(--surface-2); outline:none; }}
+  .shareitem[hidden], .shareurl[hidden] {{ display:none; }}
+  .shareurl {{
+    width:100%; margin:2px 0 4px; padding:8px 10px; border-radius:7px;
+    background:var(--bg); border:1px solid var(--line); color:var(--gray); font-size:12.5px;
+  }}
+
   footer {{ text-align:center; padding:30px 20px 50px; color:var(--gray); font-size:12.5px; border-top:1px solid var(--line); }}
   footer .fmark {{ color:var(--red); font-weight:700; }}
 
@@ -766,11 +881,11 @@ def render_gallery_html(
 </style></head>
 <body>
   <header>{brand_mark}<div class="tagline">{_TAGLINE}</div></header>
-  <div class="hero">{eyebrow_html}<h1>{title}</h1><div class="sub">{subtitle}</div></div>
+  <div class="hero">{eyebrow_html}<h1>{title}</h1><div class="sub">{subtitle}</div>{share_html}</div>
   {cta_bar}{tab_nav}
   <main>
     {videos_section}{photos_section}
   </main>
   {upsell_section}
   <footer>Powered by <span class="fmark">{_PLATFORM_MARK}</span> · {brand_e}</footer>
-{tab_js}{flip_js}{zip_js}</body></html>"""
+{tab_js}{flip_js}{zip_js}{share_js}</body></html>"""

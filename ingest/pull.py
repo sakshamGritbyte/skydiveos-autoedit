@@ -27,6 +27,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from .camera import Camera, CameraError, GoProCamera, RemoteMedia, pair
 from .events import EventEmitter, build_event, default_emitter
@@ -62,6 +63,7 @@ async def _pull_one(
     sink: EventEmitter | None,
     repull: bool,
     now: Callable[[], float],
+    source: dict[str, Any] | None = None,
 ) -> PulledJump:
     """Stage a single recording (MP4 + LRV + thumbnail), manifest, and emit."""
     mp4_dest = destination(root, camera_id, media.created_epoch, media.filename)
@@ -111,6 +113,7 @@ async def _pull_one(
         thumbnail_path=thumb_dest,
         created_epoch=media.created_epoch,
         emitted_at=now(),
+        source=source,
     )
     # Manifest is written before emitting so a crash mid-emit still leaves the
     # jump marked complete (resumable); the event can be re-derived on replay.
@@ -188,6 +191,7 @@ async def pull_camera(
     cleanup_min_age_s: float = 0.0,
     cleanup_dry_run: bool = False,
     now: Callable[[], float] = time.time,
+    source: dict[str, Any] | None = None,
 ) -> list[PulledJump]:
     """Pull all (new) recordings off ``camera_id`` into local staging.
 
@@ -210,6 +214,10 @@ async def pull_camera(
         emit: Emit ``ready_for_processing`` events. When False, no emitter is used.
         queue: Override the Redis queue name for the default emitter.
         now: Clock for the event timestamp (injectable for deterministic tests).
+        source: Transport facts the hand-off needs beyond ``camera_id``, written onto
+            every emitted event (and its manifest) as ``event["source"]`` — the
+            SD-card pull passes ``{"transport": "sdcard", "card_serial": ...}``.
+            Omitted → the event shape is exactly as before.
 
     Returns:
         One :class:`PulledJump` per recording considered (skipped or downloaded).
@@ -256,7 +264,9 @@ async def pull_camera(
                 continue
             try:
                 results.append(
-                    await _pull_one(cam, camera_id, media, resolved_root, sink, repull, now)
+                    await _pull_one(
+                        cam, camera_id, media, resolved_root, sink, repull, now, source
+                    )
                 )
             except Exception as e:  # noqa: BLE001 - tallied and re-raised below
                 logger.error("download failed for %s: %r — skipping this clip", media.filename, e)

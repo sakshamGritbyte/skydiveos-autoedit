@@ -380,6 +380,7 @@ def s3_notify_uploader(
         camera_role: str | None = None,
         *,
         staff_id: str | None = None,
+        card_serial: str | None = None,
         marker: bool = False,
     ) -> str:
         import httpx
@@ -411,6 +412,11 @@ def s3_notify_uploader(
             # and skips its goproSerial lookup (the card may be from any camera).
             payload["staff_id"] = staff_id
             payload["staff_source"] = "qr"
+        if card_serial is not None:
+            # The CARD's serial (not the camera's): SkydiveOS resolves it against the
+            # instructor's paired cards when no QR marker named anyone. Sent even
+            # beside a staff_id so the raw row records which card the clip came off.
+            payload["sd_card_serial"] = card_serial
         captured_at = _probe_capture_time(mp4_path, clock_tz=clock_tz)
         if captured_at is not None:
             payload["captured_at"] = captured_at
@@ -846,17 +852,26 @@ class CameraDiscoveryService:
                 if staff_id is None:
                     logger.warning(
                         "clip %s has no QR session marker; falling back to the "
-                        "serial-based match", mp4,
+                        "card-serial / camera-serial match", mp4,
                     )
 
+        # The CARD's own serial, stamped on the event by the SD-card pull
+        # (ingest.sdcard.card_serial_for_mount → pull_camera(source=...)). SkydiveOS
+        # resolves it against the instructor's paired cards; this side only forwards it.
+        source = event.get("source") or {}
+        card_serial = source.get("card_serial") if isinstance(source, dict) else None
+
         logger.info(
-            "uploading %s to S3 + notifying SkydiveOS (camera %s, instructor %s, role %s) ...",
-            mp4, camera_id, instructor_id, camera_role,
+            "uploading %s to S3 + notifying SkydiveOS (camera %s, instructor %s, role %s, "
+            "card %s) ...",
+            mp4, camera_id, instructor_id, camera_role, card_serial,
         )
         # Keywords only when set, so uploaders predating the QR flow keep working.
         extra: dict[str, Any] = {}
         if staff_id is not None:
             extra["staff_id"] = staff_id
+        if card_serial:
+            extra["card_serial"] = str(card_serial)
         s3_key = self._upload(mp4, camera_id, instructor_id, camera_role, **extra)
         logger.info(
             "handed %s off to SkydiveOS (camera %s, instructor %s, role %s)",

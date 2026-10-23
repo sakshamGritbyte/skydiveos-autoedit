@@ -733,7 +733,7 @@ def _build_pull(
         async def _sdcard_pull(camera_id: str, *, emitter: EventEmitter | None = None) -> object:
             from ingest.camera import Camera
             from ingest.pull import pull_camera
-            from ingest.sdcard import SdCardCamera, mount_for
+            from ingest.sdcard import SdCardCamera, card_serial_for_mount, mount_for
 
             if card_status is not None:
                 card_status.pull_started(camera_id)
@@ -742,6 +742,13 @@ def _build_pull(
                 # (or yanked) between the scan and this pull; a gone card raises the same
                 # CameraError a camera wandering out of BLE range would.
                 mount = mount_for(camera_id, settings.sdcard_mount_roots)
+                # The CARD's own serial (not the camera's) rides every emitted event so
+                # the hand-off can tell SkydiveOS which card the clip came off — the
+                # instructor's cards are paired to them there. Best-effort: None when
+                # the host cannot read one, and the pull runs regardless.
+                card_serial = card_serial_for_mount(mount)
+                if card_status is not None:
+                    card_status.card_identity(camera_id, card_serial)
                 camera: Camera = SdCardCamera(mount)
                 if card_status is not None:
                     from ingest.cardstatus import TrackedCamera
@@ -751,6 +758,11 @@ def _build_pull(
                     camera_id,
                     camera=camera,
                     emitter=emitter,
+                    source=(
+                        {"transport": "sdcard", "card_serial": card_serial}
+                        if card_serial
+                        else {"transport": "sdcard"}
+                    ),
                     **_cleanup_kwargs(settings),
                 )
             except Exception as e:

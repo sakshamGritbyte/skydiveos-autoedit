@@ -14,7 +14,7 @@ match from footage → booking, and passes the result in when it creates the job
  GoPro card
    │  auto-discovery (this module): pulls MP4s, uploads to S3,
    │  POSTs { s3_key, camera_id, instructor_id?, camera_role?, captured_at?,
-   │          staff_id?, staff_source? } to SkydiveOS
+   │          staff_id?, staff_source?, sd_card_serial? } to SkydiveOS
    ▼
  SkydiveOS                     ← owns loads/bookings/customers/add-ons
    │  1. match footage → the manifested jump → its booking
@@ -53,6 +53,23 @@ camera, registered or not, so `camera_id` is only a storage key in this flow. Ab
 `staff_id` → the existing serial match applies unchanged. The QR marker clips
 themselves are never notified; they are parked under `raw/{camera_id}/markers/` in S3
 purely so card-retention bookkeeping holds.
+
+**`sd_card_serial` — the CARD's own serial (not the camera's).** An instructor owns
+several cards and rotates them between cameras, so in the SD-card flow the card is what
+identifies the person, not the GoPro it sat in. The ingest reads the card's identity
+(`ingest.sdcard.card_serial_for_mount`: the hardware CID serial where the reader exposes
+it — Linux SD-host readers — else the filesystem volume serial, `1A2B-3C4D`, which a
+reformat rewrites) and forwards it **verbatim, normalized** (trimmed, UPPERCASE, no
+whitespace) on every notify from that card, beside a `staff_id` when a QR marker named
+one. **This side never resolves it.** SkydiveOS pairs serials to people
+(`staffs.sdCards[].serial`, Staff → SD cards; an instructor may hold many) and resolves
+the notify in this order: `staff_id` (QR) → `sd_card_serial` → `camera_id`
+(`staffs.goproSerial`) → `instructor_id`. A card resolved by serial is matched by
+**staff + `captured_at`** like the QR flow (`staff_source: "sd-card"`), because the camera
+serial on that card may be some other instructor's camera. The serial is shown on the
+operator banner (`GET /ingest/cards` → `card_serial`, enriched by SkydiveOS with the
+paired name) and by `scripts/check_sdcard.py`, which is how an admin learns the value to
+pair; it is omitted from the payload when the host cannot read one.
 
 An **executable reference implementation** of this consumer lives at
 `scripts/skydiveos_bridge.py` (used locally until the SkydiveOS backend ships it):

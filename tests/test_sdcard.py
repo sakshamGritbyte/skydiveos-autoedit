@@ -13,11 +13,19 @@ from pathlib import Path
 
 import pytest
 
+from ingest import sdcard
 from ingest.camera import CameraError, RemoteMedia
 from ingest.pull import pull_camera
 from ingest.retention import record_uploaded
 from ingest.scanner import SdCardScanner
-from ingest.sdcard import SdCardCamera, card_id_for_mount, find_cards, mount_for
+from ingest.sdcard import (
+    SdCardCamera,
+    card_id_for_mount,
+    card_serial_for_mount,
+    find_cards,
+    mount_for,
+    normalize_card_serial,
+)
 from ingest.storage import camera_dir
 
 # --------------------------------------------------------------------------- #
@@ -76,6 +84,75 @@ def test_card_id_falls_back_to_volume_label(tmp_path: Path) -> None:
     """No readable serial → sanitized label with an sd- prefix (can't collide with serials)."""
     mount = _make_card(tmp_path, name="My Card!", serial=None)
     assert card_id_for_mount(mount) == "sd-My-Card"
+
+
+# --------------------------------------------------------------------------- #
+# Card serial — the CARD's identity, distinct from the camera's
+# --------------------------------------------------------------------------- #
+
+
+def test_normalize_card_serial_is_the_pairing_equality() -> None:
+    """Trimmed, uppercase, no whitespace — what SkydiveOS applies to a typed serial too."""
+    assert normalize_card_serial("  1a2b-3c4d ") == "1A2B-3C4D"
+    assert normalize_card_serial("mmc 0x1234abcd") == "MMC0X1234ABCD"
+    assert normalize_card_serial("   ") is None
+    assert normalize_card_serial(None) is None
+
+
+def test_card_serial_for_mount_normalizes_the_probe(monkeypatch, tmp_path: Path) -> None:
+    mount = _make_card(tmp_path)
+    monkeypatch.setattr(sdcard, "_read_card_serial", lambda _m: " 1a2b-3c4d ")
+    assert card_serial_for_mount(mount) == "1A2B-3C4D"
+
+
+def test_card_serial_for_mount_never_raises(monkeypatch, tmp_path: Path) -> None:
+    """A failing probe is a None, not an exception — the pull must run without it."""
+    mount = _make_card(tmp_path)
+
+    def _boom(_m: Path) -> str | None:
+        raise OSError("no sysfs here")
+
+    monkeypatch.setattr(sdcard, "_read_card_serial", _boom)
+    assert card_serial_for_mount(mount) is None
+
+
+def test_find_cards_carries_the_card_serial_beside_the_camera_id(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The two serials are different facts: camera_id follows the GoPro, card_serial the card."""
+    mount = _make_card(tmp_path, serial="C3504224544313")
+    monkeypatch.setattr(sdcard, "_read_card_serial", lambda m: "1A2B-3C4D" if m == mount else None)
+    [card] = find_cards([tmp_path])
+    assert card.camera_id == "4313"
+    assert card.card_serial == "1A2B-3C4D"
+
+
+def test_find_cards_tolerates_an_unreadable_card_serial(monkeypatch, tmp_path: Path) -> None:
+    mount = _make_card(tmp_path)
+    monkeypatch.setattr(sdcard, "_read_card_serial", lambda _m: None)
+    [card] = find_cards([tmp_path])
+    assert card.mount == mount and card.card_serial is None
+
+
+def test_linux_mount_device_parses_mountinfo_escapes(monkeypatch, tmp_path: Path) -> None:
+    """``/proc/self/mountinfo`` octal-escapes a label with a space; the device is still found."""
+    mount = tmp_path / "GOPRO 01"
+    mount.mkdir()
+    escaped = str(mount).replace(" ", "\\040")
+    mountinfo = (
+        "36 25 0:33 / / rw - ext4 /dev/root rw\n"
+        f"99 36 179:1 / {escaped} rw,nosuid - exfat /dev/mmcblk0p1 rw\n"
+    )
+    real_read = Path.read_text
+
+    def _fake_read(self: Path, *a: object, **k: object) -> str:
+        if str(self) == "/proc/self/mountinfo":
+            return mountinfo
+        return real_read(self, *a, **k)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", _fake_read)
+    assert sdcard._mount_device_linux(mount) == "/dev/mmcblk0p1"
+    assert sdcard._mount_device_linux(tmp_path / "other") is None
 
 
 # --------------------------------------------------------------------------- #
@@ -246,6 +323,42 @@ def test_sdcard_pull_stages_through_real_pull(tmp_path: Path) -> None:
         pull_camera("4313", camera=SdCardCamera(mount), root=root, emitter=_Capture())
     )
     assert again[0].skipped is True and len(events) == 1
+
+
+def test_sdcard_pull_stamps_the_card_serial_on_event_and_manifest(tmp_path: Path) -> None:
+    """``source.card_serial`` rides the event AND the on-disk manifest (a re-match reads it)."""
+    mount = _make_card(tmp_path / "mounts", clips=[("GX010001.MP4", 1_700_000_000.0)])
+    events: list[dict[str, object]] = []
+
+    class _Capture:
+        def emit(self, event: dict[str, object]) -> None:
+            events.append(event)
+
+    root = tmp_path / "raw"
+    jumps = asyncio.run(
+        pull_camera(
+            "4313", camera=SdCardCamera(mount), root=root, emitter=_Capture(),
+            source={"transport": "sdcard", "card_serial": "1A2B-3C4D"},
+        )
+    )
+    assert events[0]["source"] == {"transport": "sdcard", "card_serial": "1A2B-3C4D"}
+    manifest = json.loads(jumps[0].mp4_path.with_suffix(".ingest.json").read_text())
+    assert manifest["source"]["card_serial"] == "1A2B-3C4D"
+
+
+def test_pull_without_source_keeps_the_event_shape(tmp_path: Path) -> None:
+    """No ``source`` → no ``source`` key: wireless/USB events are byte-identical to before."""
+    mount = _make_card(tmp_path / "mounts", clips=[("GX010001.MP4", 1_700_000_000.0)])
+    events: list[dict[str, object]] = []
+
+    class _Capture:
+        def emit(self, event: dict[str, object]) -> None:
+            events.append(event)
+
+    asyncio.run(
+        pull_camera("4313", camera=SdCardCamera(mount), root=tmp_path / "raw", emitter=_Capture())
+    )
+    assert "source" not in events[0]
 
 
 def test_sweep_clears_confirmed_files_off_card(tmp_path: Path) -> None:

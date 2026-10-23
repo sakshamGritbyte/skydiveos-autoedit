@@ -45,6 +45,27 @@ class _Clock:
         return self.t
 
 
+def test_card_identity_survives_the_pull_counter_reset() -> None:
+    """The CARD's serial is identity, not progress: set once, served on every snapshot,
+    kept across pull_started's counter reset, and never erased by a None."""
+    reg = CardStatusRegistry(now=_Clock())
+    reg.card_identity("4313", "1A2B-3C4D")  # before any scan: creates a detected row
+    assert reg.snapshot()[0]["state"] == STATE_DETECTED
+    assert reg.snapshot()[0]["card_serial"] == "1A2B-3C4D"
+
+    reg.pull_started("4313")
+    reg.file_started("4313", "GX010001.MP4")
+    assert reg.snapshot()[0]["card_serial"] == "1A2B-3C4D"
+
+    reg.card_identity("4313", None)
+    assert reg.snapshot()[0]["card_serial"] == "1A2B-3C4D"
+
+    # A card whose serial the host cannot read serves None, not a missing key.
+    reg.detected("9999")
+    [_a, other] = reg.snapshot()
+    assert other["camera_id"] == "9999" and other["card_serial"] is None
+
+
 def test_full_lifecycle_snapshot() -> None:
     """detected → pulling (with progress) → safe_to_remove, all fields served."""
     reg = CardStatusRegistry(now=_Clock())

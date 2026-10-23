@@ -40,13 +40,20 @@ def build_event(
     thumbnail_path: Path | None,
     created_epoch: float | None,
     emitted_at: float,
+    source: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the ``ready_for_processing`` payload for one staged jump.
 
     Paths are stringified (JSON has no Path type). ``job_id`` is deterministic
     per jump so downstream stages stay idempotent (CLAUDE.md: one job per jump).
+
+    ``source`` describes the TRANSPORT the clip came off when the hand-off needs
+    more than ``camera_id`` — today the SD-card pull's ``{"transport": "sdcard",
+    "card_serial": ...}``, which the notify forwards as ``sd_card_serial``. It is
+    written only when given, so every other transport's event (and every manifest
+    already on disk) keeps its exact shape.
     """
-    return {
+    event: dict[str, Any] = {
         "event": EVENT_NAME,
         "job_id": job_id,
         "camera_id": camera_id,
@@ -59,6 +66,9 @@ def build_event(
         "created_epoch": created_epoch,
         "emitted_at": emitted_at,
     }
+    if source:
+        event["source"] = dict(source)
+    return event
 
 
 class EventEmitter(ABC):

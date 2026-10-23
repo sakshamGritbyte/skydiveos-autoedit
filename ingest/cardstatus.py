@@ -114,6 +114,11 @@ class CardStatus:
     error: str | None = None
     #: Epoch seconds of the last transition (repo convention: seconds, floats).
     updated_at: float = 0.0
+    #: The CARD's own serial (:func:`ingest.sdcard.card_serial_for_mount`) — distinct
+    #: from ``camera_id``, which is the camera's. Shown on the operator banner so an
+    #: admin can read off the value to pair to an instructor in SkydiveOS; ``None``
+    #: when the host cannot read one. SkydiveOS enriches it with the paired name.
+    card_serial: str | None = None
 
 
 class CardStatusRegistry:
@@ -141,6 +146,23 @@ class CardStatusRegistry:
                     camera_id, STATE_DETECTED, updated_at=self._now()
                 )
 
+    def card_identity(self, camera_id: str, card_serial: str | None) -> None:
+        """Attach the CARD's serial to its row (creating a ``detected`` row if needed).
+
+        Identity, not progress: it survives :meth:`pull_started`'s counter reset
+        (that method re-reads it) and is never cleared by a transition — a card
+        that fails to pull is exactly the card whose serial the operator needs.
+        ``None`` is a no-op rather than an erasure (a later probe may know better).
+        """
+        if card_serial is None:
+            return
+        with self._lock:
+            entry = self._cards.get(camera_id)
+            if entry is None:
+                entry = CardStatus(camera_id, STATE_DETECTED, updated_at=self._now())
+                self._cards[camera_id] = entry
+            entry.card_serial = card_serial
+
     def pull_started(self, camera_id: str) -> None:
         """A pull is opening the card: reset the counters for this run.
 
@@ -161,8 +183,12 @@ class CardStatusRegistry:
             )
             state = entry.state if keep and entry is not None else STATE_PULLING
             pending = entry.pending_files if keep and entry is not None else 0
+            # Identity outlives the counters: the serial is a fact about the card,
+            # not about this run (see card_identity).
+            card_serial = entry.card_serial if entry is not None else None
             self._cards[camera_id] = CardStatus(
-                camera_id, state, pending_files=pending, updated_at=self._now()
+                camera_id, state, pending_files=pending, updated_at=self._now(),
+                card_serial=card_serial,
             )
 
     def totals(self, camera_id: str, files_total: int, bytes_total: int) -> None:

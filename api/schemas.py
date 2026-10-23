@@ -464,6 +464,11 @@ class CardIngestStatus(BaseModel):
     error: str | None = None
     #: Epoch seconds of the last transition (repo convention: seconds, floats).
     updated_at: float
+    #: The CARD's own serial (hardware CID where the reader exposes it, else the
+    #: filesystem volume serial) — NOT the camera's. SkydiveOS pairs this to an
+    #: instructor (``staffs.sdCards[].serial``) and shows the paired name on the
+    #: banner; ``None`` when the host could not read one.
+    card_serial: str | None = Field(default=None, examples=["1A2B-3C4D"])
 
 
 class AssignCameraRequest(BaseModel):

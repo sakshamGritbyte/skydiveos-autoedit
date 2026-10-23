@@ -82,6 +82,15 @@ def main(argv: list[str] | None = None) -> int:
         if not serial:
             failed = True
         print(f"\ncard {card.camera_id}  @ {card.mount}   identity: {rule}")
+        # The CARD's serial is what an admin pairs to an instructor in SkydiveOS
+        # (Staff → SD cards); print it here so it can be read off the box.
+        if card.card_serial:
+            print(f"  card serial: {card.card_serial}   (pair this to the instructor in SkydiveOS)")
+        else:
+            print(
+                "  card serial: unreadable on this host — attribution needs a QR marker "
+                "or camera pairing"
+            )
 
         videos = asyncio.run(SdCardCamera(card.mount).list_videos())
         if not videos:

@@ -857,6 +857,25 @@ Two runtime media roots, with different audiences:
   frees inserted cards too). Card identity = the camera serial in `MISC/version.txt`
   (last 4 digits, same id a wireless pull would use → shared staging tree + ledger),
   else an `sd-<label>` fallback.
+  **The CARD has its own serial, and it is a different fact from the camera's.**
+  `ingest.sdcard.card_serial_for_mount` reads the card's identity — the hardware CID
+  serial where the OS exposes it (Linux SD-host readers, `/sys/class/block/mmcblk*/
+  device/serial` → `MMC-…`), else the filesystem volume serial (Windows
+  `GetVolumeInformationW` → `1A2B-3C4D`, Linux `/dev/disk/by-uuid`, macOS `diskutil`),
+  normalized by `normalize_card_serial` (trim, UPPERCASE, no whitespace — the SAME rule
+  SkydiveOS's `utils/sdCardSerial.js` applies to a typed serial; change both or neither).
+  It is best-effort (`None`, never an exception: one rung of attribution, the pull is
+  not). `_sdcard_pull` stamps it on the pull as `pull_camera(source={"transport":
+  "sdcard", "card_serial": …})` → `event["source"]` (and the on-disk manifest; omitted
+  entirely for other transports so their events are byte-identical), discovery
+  forwards it as `sd_card_serial` on the raw-upload notify (beside a QR `staff_id` too —
+  the raw row records which card), and `CardStatus.card_serial` puts it on the operator
+  banner. **This side never resolves a card serial to a person**: SkydiveOS pairs cards
+  (`staffs.sdCards[].serial`, many per instructor) and resolves `staff_id` (QR) →
+  `sd_card_serial` → `camera_id` → `instructor_id`. A volume serial changes on reformat,
+  so a reformatted card must be paired again — the banner shows the new value.
+  Tests: `tests/test_sdcard.py` §card serial, `test_discovery.py` (`card_serial`
+  keyword + `sd_card_serial` payload), `test_cardstatus.py::test_card_identity…`.
   **A card mounts differently per platform, and all three differences are load-bearing.**
   POSIX mounts it INSIDE a container (`/media/<user>/<vol>/DCIM`); Windows mounts it AS a
   drive (`E:\DCIM`), one level shallower. So `_mounts_with_dcim` searches depth 0 under a

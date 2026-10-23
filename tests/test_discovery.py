@@ -96,8 +96,11 @@ class FakeRegistry:
         self.closed = True
 
 
-def _make_pull(staged_mp4: Path, *, emit_once: bool = True):
-    """A fake pull_camera: emits one ready_for_processing event per camera (optionally once)."""
+def _make_pull(staged_mp4: Path, *, emit_once: bool = True, source: dict | None = None):
+    """A fake pull_camera: emits one ready_for_processing event per camera (optionally once).
+
+    ``source`` mirrors the SD-card pull's ``event["source"]`` (card serial) when given.
+    """
     seen: set[str] = set()
 
     async def _pull(camera_id: str, *, emitter=None) -> list[object]:
@@ -105,17 +108,18 @@ def _make_pull(staged_mp4: Path, *, emit_once: bool = True):
             return []  # already staged — real pull emits nothing for skipped jumps
         seen.add(camera_id)
         if emitter is not None:
-            emitter.emit(
-                {
-                    "event": "ready_for_processing",
-                    "job_id": f"{camera_id}-GX010001",
-                    "camera_id": camera_id,
-                    "jump_dir": str(staged_mp4.parent),
-                    "files": {"mp4": str(staged_mp4), "lrv": None, "thumbnail": None},
-                    "created_epoch": None,
-                    "emitted_at": 0.0,
-                }
-            )
+            event = {
+                "event": "ready_for_processing",
+                "job_id": f"{camera_id}-GX010001",
+                "camera_id": camera_id,
+                "jump_dir": str(staged_mp4.parent),
+                "files": {"mp4": str(staged_mp4), "lrv": None, "thumbnail": None},
+                "created_epoch": None,
+                "emitted_at": 0.0,
+            }
+            if source:
+                event["source"] = dict(source)
+            emitter.emit(event)
         return []
 
     return _pull
@@ -1020,6 +1024,57 @@ def test_identity_resolver_staff_id_reaches_uploader(tmp_path: Path) -> None:
     assert kwargs == {"staff_id": "staff-A"}
 
 
+def test_card_serial_on_the_event_reaches_uploader(tmp_path: Path) -> None:
+    """The SD-card pull's ``source.card_serial`` is forwarded as the ``card_serial`` keyword —
+    with or without a QR staff_id — and an event without one passes no such keyword."""
+    from ingest.qr import ClipIdentity
+
+    uploads = _KwargsRecordingUploader()
+    registry = FakeRegistry([CameraRecord(camera_id="4313", paired_at=1.0)])
+    staged = tmp_path / "4313" / "2026-08-04" / "GX010002.MP4"
+    service = CameraDiscoveryService(
+        scanner=StaticCameraScanner(["4313"]),
+        registry=registry,
+        upload=uploads,
+        pull=_make_pull(staged, source={"transport": "sdcard", "card_serial": "1A2B-3C4D"}),
+        interval=0.05,
+        identity_resolver=lambda _c, _m: ClipIdentity(None),  # no QR marker on this card
+        require_registered=False,
+    )
+
+    async def scenario() -> None:
+        await service.start()
+        await _wait_for(lambda: bool(uploads.calls))
+        await service.stop()
+
+    asyncio.run(scenario())
+
+    ((args, kwargs),) = uploads.calls
+    assert args == (str(staged), "4313", None, None)
+    assert kwargs == {"card_serial": "1A2B-3C4D"}
+
+    # QR marker AND card serial: both ride along — identity from the QR, the card for the record.
+    uploads2 = _KwargsRecordingUploader()
+    service2 = CameraDiscoveryService(
+        scanner=StaticCameraScanner(["4313"]),
+        registry=registry,
+        upload=uploads2,
+        pull=_make_pull(staged, source={"transport": "sdcard", "card_serial": "1A2B-3C4D"}),
+        interval=0.05,
+        identity_resolver=lambda _c, _m: ClipIdentity("staff-A"),
+        require_registered=False,
+    )
+
+    async def scenario2() -> None:
+        await service2.start()
+        await _wait_for(lambda: bool(uploads2.calls))
+        await service2.stop()
+
+    asyncio.run(scenario2())
+    ((_a, kwargs2),) = uploads2.calls
+    assert kwargs2 == {"staff_id": "staff-A", "card_serial": "1A2B-3C4D"}
+
+
 def test_qr_marker_is_uploaded_as_marker_and_never_notified(tmp_path: Path) -> None:
     """A session-marker clip: PUT under markers/ (ledger entry) but no hand-off."""
     from ingest.qr import ClipIdentity
@@ -1259,6 +1314,51 @@ def test_s3_notify_uploader_includes_staff_id(tmp_path, monkeypatch) -> None:
     posted.clear()
     upload(str(mp4), "4313", None, None)
     assert "staff_id" not in posted["json"] and "staff_source" not in posted["json"]
+
+
+def test_s3_notify_uploader_forwards_the_card_serial(tmp_path, monkeypatch) -> None:
+    """``sd_card_serial`` rides the notify when the pull knew the CARD's serial — beside a
+    QR staff_id too (the raw row records which card), and never when unknown."""
+    import httpx
+
+    from ingest.discovery import s3_notify_uploader
+
+    mp4 = _staged(tmp_path, "GX010001.MP4", body=b"video-bytes")
+
+    class _FakeS3:
+        def upload_file(self, filename: str, bucket: str, key: str) -> None:
+            pass
+
+        def head_object(self, **kwargs: object) -> dict[str, int]:
+            raise KeyError("no such key")
+
+    posted: dict[str, object] = {}
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            pass
+
+    def _fake_post(url, *, json, timeout, headers=None):  # noqa: ANN001
+        posted.update(json=json)
+        return _Resp()
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    upload = s3_notify_uploader("http://skydiveos.test/", bucket="jumps", s3_client=_FakeS3())
+
+    upload(str(mp4), "4313", None, None, card_serial="1A2B-3C4D")
+    assert posted["json"]["sd_card_serial"] == "1A2B-3C4D"
+    assert "staff_id" not in posted["json"]
+
+    posted.clear()
+    upload(
+        str(mp4), "4313", None, None, staff_id="665f1c0a2ab79c0012345678", card_serial="1A2B-3C4D"
+    )
+    assert posted["json"]["staff_id"] == "665f1c0a2ab79c0012345678"
+    assert posted["json"]["sd_card_serial"] == "1A2B-3C4D"
+
+    posted.clear()
+    upload(str(mp4), "4313", None, None)
+    assert "sd_card_serial" not in posted["json"]
 
 
 def test_s3_notify_uploader_marker_key_and_no_post(tmp_path, monkeypatch) -> None:

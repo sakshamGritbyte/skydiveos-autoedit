@@ -19,7 +19,20 @@ runs unchanged (see :class:`ingest.camera.LocalSampleCamera` for the pattern):
 
 Who the footage belongs to is NOT decided here: a card knows only the camera
 and the clock. Attribution comes from the filmed QR session marker
-(:mod:`ingest.qr`) or, failing that, the same serial-based match as wireless.
+(:mod:`ingest.qr`), else from the CARD's own serial paired to an instructor in
+SkydiveOS (``staffs.sdCards[].serial`` — an instructor may own several cards and
+rotate them between cameras, so the card is the thing that identifies them,
+not the camera it happened to sit in), else the same camera-serial match as
+wireless.
+
+Two serials, two meanings — never conflate them:
+
+* ``camera_id`` is the CAMERA's serial (``MISC/version.txt``), the staging /
+  retention / S3 identity of the footage. It follows the GoPro.
+* ``card_serial`` (:func:`card_serial_for_mount`) is the CARD's identity. It
+  follows the piece of plastic, and it is what SkydiveOS pairs to a person. It
+  travels on the pull event as ``source.card_serial`` and on the raw-upload
+  notify as ``sd_card_serial``; SkydiveOS resolves it, this side never does.
 """
 
 from __future__ import annotations
@@ -30,6 +43,8 @@ import logging
 import os
 import re
 import shutil
+import subprocess
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,10 +90,158 @@ _GOPRO_MP4 = re.compile(r"^G[HX]\d+\.MP4$", re.IGNORECASE)
 
 @dataclass(frozen=True)
 class SdCard:
-    """One mounted GoPro SD card: its derived camera id and where it's mounted."""
+    """One mounted GoPro SD card: its derived camera id and where it's mounted.
+
+    ``card_serial`` is the CARD's own identity (:func:`card_serial_for_mount`),
+    distinct from ``camera_id`` (the camera's). ``None`` when the host cannot
+    read one — the pull still runs, attribution just has one less rung.
+    """
 
     camera_id: str
     mount: Path
+    card_serial: str | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Card serial — the CARD's identity (SkydiveOS pairs it to an instructor)
+# --------------------------------------------------------------------------- #
+
+#: Cap on the serial probes that shell out (``diskutil``); a wedged tool must not
+#: stall the scan tick, which would freeze the operator's card banner.
+_SERIAL_PROBE_TIMEOUT_S = 5.0
+
+
+def normalize_card_serial(raw: str | None) -> str | None:
+    """Canonical form of a card serial: trimmed, UPPERCASE, no whitespace.
+
+    This is the equality SkydiveOS pairs on (``utils/sdCardSerial.js`` applies the
+    SAME rule to what an admin types), so a serial copied off the banner with a
+    stray space or in lowercase still matches. ``None`` for nothing usable.
+    """
+    if not isinstance(raw, str):
+        return None
+    clean = re.sub(r"\s+", "", raw).upper()
+    return clean or None
+
+
+def _mount_device_linux(mount: Path) -> str | None:
+    """The block device mounted at ``mount`` per ``/proc/self/mountinfo``."""
+    try:
+        text = Path("/proc/self/mountinfo").read_text()
+    except OSError:
+        return None
+    target = os.path.realpath(str(mount))
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 10 or fields[4] == "/":
+            continue
+        # The mount point is octal-escaped (a label with a space is "\040").
+        point = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[4])
+        if os.path.realpath(point) != target:
+            continue
+        try:
+            dash = fields.index("-")
+        except ValueError:
+            continue
+        if dash + 2 < len(fields):
+            return fields[dash + 2]
+    return None
+
+
+def _linux_card_serial(mount: Path) -> str | None:
+    """Linux: the card's hardware serial when an SD-host reader exposes it, else the
+    filesystem's volume serial.
+
+    A built-in (MMC/SDHCI) reader surfaces the card's CID register in sysfs —
+    ``/sys/class/block/mmcblk0p1/device/serial`` — which survives any reformat.
+    A USB card reader presents the card as plain mass storage and hides the CID
+    entirely, so the only per-card identity left is the FAT/exFAT volume serial
+    (``/dev/disk/by-uuid`` → ``1234-ABCD``), which a reformat rewrites.
+    """
+    device = _mount_device_linux(mount)
+    if not device or not device.startswith("/dev/"):
+        return None
+    name = Path(device).name
+    sysfs = Path("/sys/class/block") / name / "device" / "serial"
+    if name.startswith("mmcblk"):
+        try:
+            raw = sysfs.read_text().strip()
+            if raw:
+                return f"MMC-{raw.removeprefix('0x').removeprefix('0X').upper()}"
+        except OSError:
+            pass
+    by_uuid = Path("/dev/disk/by-uuid")
+    try:
+        real_device = os.path.realpath(device)
+        for link in by_uuid.iterdir():
+            if os.path.realpath(str(link)) == real_device:
+                return link.name
+    except OSError:
+        pass
+    return None
+
+
+def _windows_card_serial(mount: Path) -> str | None:
+    """Windows: the volume serial (``GetVolumeInformationW``), rendered ``XXXX-XXXX``
+    exactly as ``dir`` / ``vol`` print it, so an operator can read it off the box."""
+    import ctypes  # noqa: PLC0415 - Windows-only path
+
+    root = str(mount)
+    if not root.endswith("\\"):
+        root += "\\"
+    serial = ctypes.c_uint32(0)
+    ok = ctypes.windll.kernel32.GetVolumeInformationW(  # type: ignore[attr-defined]
+        ctypes.c_wchar_p(root), None, 0, ctypes.byref(serial), None, None, None, 0
+    )
+    if not ok or not serial.value:
+        return None
+    return f"{serial.value >> 16:04X}-{serial.value & 0xFFFF:04X}"
+
+
+def _macos_card_serial(mount: Path) -> str | None:
+    """macOS: the volume UUID from ``diskutil info -plist`` (no CID access either)."""
+    import plistlib  # noqa: PLC0415 - macOS-only path
+
+    try:
+        out = subprocess.run(
+            ["diskutil", "info", "-plist", str(mount)],
+            capture_output=True, timeout=_SERIAL_PROBE_TIMEOUT_S, check=False,
+        )
+        if out.returncode != 0 or not out.stdout:
+            return None
+        info = plistlib.loads(out.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    value = info.get("VolumeUUID") or info.get("DiskUUID")
+    return str(value) if value else None
+
+
+def _read_card_serial(mount: Path) -> str | None:
+    """Platform dispatch for the raw serial probe (module-level so tests can patch it)."""
+    if os.name == "nt":
+        return _windows_card_serial(mount)
+    if sys.platform == "darwin":
+        return _macos_card_serial(mount)
+    return _linux_card_serial(mount)
+
+
+def card_serial_for_mount(mount: Path) -> str | None:
+    """The CARD's serial for a mounted card, normalized — or ``None``.
+
+    Best effort by contract: every probe failure is a ``None`` (logged at debug),
+    never an exception, because the serial is one rung of attribution and the
+    pull must run without it. The hardware CID is preferred wherever the OS
+    exposes it; the filesystem volume serial is the fallback everywhere else,
+    and the operator-facing docs say so: a volume serial changes when the card
+    is reformatted, so a reformatted card must be paired again. The banner and
+    ``scripts/check_sdcard.py`` print whatever this returns, which is how an admin
+    learns the value to pair.
+    """
+    try:
+        return normalize_card_serial(_read_card_serial(Path(mount)))
+    except Exception as e:  # noqa: BLE001 - identity is best-effort, the pull is not
+        logger.debug("could not read a card serial for %s: %r", mount, e)
+        return None
 
 
 def _serial_from_version_txt(mount: Path) -> str | None:
@@ -191,7 +354,10 @@ def _mounts_with_dcim(roots: Sequence[str | Path]) -> list[Path]:
 
 def find_cards(roots: Sequence[str | Path] = DEFAULT_MOUNT_ROOTS) -> list[SdCard]:
     """Every GoPro-shaped card currently mounted under ``roots``."""
-    return [SdCard(camera_id=card_id_for_mount(m), mount=m) for m in _mounts_with_dcim(roots)]
+    return [
+        SdCard(camera_id=card_id_for_mount(m), mount=m, card_serial=card_serial_for_mount(m))
+        for m in _mounts_with_dcim(roots)
+    ]
 
 
 def mount_for(camera_id: str, roots: Sequence[str | Path] = DEFAULT_MOUNT_ROOTS) -> Path:

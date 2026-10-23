@@ -44,8 +44,8 @@ from analysis.proxy import analysis_source
 from edl.storage import job_dir
 from edl.validate import BOOKEND_DELIVERABLES, bookend_ranges, validate_and_repair
 from render.beatdrop import (
-    FREEFALL_MAX_LEAD_S,
     beat_drop_for,
+    freefall_max_lead_s,
     music_offset_for,
     plan_exit_lead,
 )
@@ -310,6 +310,81 @@ _EXIT_PLANE_G = 0.85  # steady ~1 g that must precede the dip (we were in the pl
 #: either so both exit styles are detected.
 _EXIT_WEIGHTLESS_G = 0.25
 
+# Tumbling-exit fallback (bug reopen 2026-10-23, job ba5fade8…, a Hero with no GPS).
+# A tandem that rolls out of the door keeps a ~1 g payload MEAN through the exit
+# (centripetal acceleration from the roll + the drogue), and its near-0 g samples look
+# exactly like a cameraman shaking at the open door, which the rule above deliberately
+# ignores. What the per-payload view hides, the sample view shows: dropping off the
+# aircraft is a QUARTER-second of sustained weightlessness (0.62 g mean, 0.07 g min on
+# that job), and it begins a stretch of turbulence that never once goes quiet until the
+# canopy opens — whereas the cabin, however busy at the door, always has quiet seconds.
+#: Window length (s) and the weightless signature inside it: mean AND a near-0 g sample.
+_WEIGHTLESS_WIN_S = 0.25
+_WEIGHTLESS_WIN_MEAN_G = 0.7
+_WEIGHTLESS_WIN_MIN_G = 0.25
+#: A calm second in the aircraft (proves the clip started on board, not in freefall).
+_CALM_MIN_G = 0.75
+_CALM_MAX_G = 1.6
+#: A quiet second: no sample below / above these. Freefall never has one (measured min
+#: >= 1.58 g peak every second for 49 s); the cabin does even at the door (0.64/1.32 g).
+_QUIET_MIN_G = 0.6
+_QUIET_MAX_G = 1.45
+#: Unbroken non-quiet seconds a real exit must start (a tandem freefall is 40-80 s).
+_FREEFALL_RUN_S = 30
+
+
+def _tumbling_exit(accl: Any) -> float:
+    """Seconds into the clip where a TUMBLING exit happens, or ``0.0`` (pure on ``accl``).
+
+    The first quarter-second window that is weightless (mean < 0.7 g with a sample under
+    0.25 g) and that
+    * comes after at least one calm second (0.75–1.6 g throughout) — the clip began in
+      the aircraft, so a clip that starts mid-freefall is never given an "exit"; and
+    * starts a run of at least :data:`_FREEFALL_RUN_S` consecutive seconds none of which
+      is quiet (all samples within 0.6–1.45 g) — freefall, not a stumble at the door.
+    """
+    per_second: dict[int, list[float]] = {}
+    per_window: dict[int, list[float]] = {}
+    times, payloads = accl.times, accl.payloads
+    for k, (t0, samples) in enumerate(zip(times, payloads, strict=False)):
+        t1 = times[k + 1] if k + 1 < len(times) else t0 + 1.0
+        n = len(samples)
+        for j, smp in enumerate(samples):
+            if len(smp) < 3:
+                continue
+            t = t0 + (t1 - t0) * j / max(n, 1)
+            g = math.sqrt(sum(c * c for c in smp[:3])) / _G
+            per_second.setdefault(int(t), []).append(g)
+            per_window.setdefault(int(t / _WEIGHTLESS_WIN_S), []).append(g)
+    if not per_second:
+        return 0.0
+
+    def calm(sec: int) -> bool:
+        v = per_second.get(sec) or []
+        return bool(v) and min(v) >= _CALM_MIN_G and max(v) <= _CALM_MAX_G
+
+    def quiet(sec: int) -> bool:
+        v = per_second.get(sec) or []
+        return bool(v) and min(v) >= _QUIET_MIN_G and max(v) <= _QUIET_MAX_G
+
+    last = max(per_second)
+    for w in sorted(per_window):
+        vals = per_window[w]
+        if statistics.fmean(vals) >= _WEIGHTLESS_WIN_MEAN_G or min(vals) >= _WEIGHTLESS_WIN_MIN_G:
+            continue
+        start = w * _WEIGHTLESS_WIN_S
+        sec = int(start)
+        if not any(calm(s) for s in range(0, sec)):
+            continue
+        run = 0
+        for s in range(sec, last + 1):
+            if s not in per_second or quiet(s):
+                break
+            run += 1
+        if run >= _FREEFALL_RUN_S:
+            return round(start, 2)
+    return 0.0
+
 
 def detect_exit_offset(mp4_path: str | Path) -> float:
     """Seconds into a freefall clip where the aircraft exit happens (seam; mocked).
@@ -355,6 +430,39 @@ def detect_exit_offset(mp4_path: str | Path) -> float:
         weightless = mins[i] < _EXIT_WEIGHTLESS_G and means[i] < _EXIT_PLANE_G
         if mean_dip or weightless:
             return round(times[i], 2)
+    # Only when the payload-level rule saw nothing: a tumbling tandem exit.
+    found = _tumbling_exit(accl)
+    if found > 0.0:
+        logger.info("exit found by the tumbling-exit rule at %.2f s in %s", found, mp4_path)
+    return found
+
+
+#: Manifest ``flagged`` reason when a freefall scene's exit could not be located.
+EXIT_NOT_DETECTED_FLAG = (
+    "freefall exit not detected (no sub-g dip after ~1 g flight in any source file); "
+    "the freefall cut starts at the scene head — check exit_offset against the footage"
+)
+
+
+def detect_scene_exit_offset(sources: Sequence[tuple[str | Path, float]]) -> float:
+    """The aircraft exit as seconds into a CONCATENATED freefall scene, or ``0.0``.
+
+    ``sources`` is the scene's files in order as ``(analysis file, offset of that file
+    within the scene)`` — the manifest's ``file_offsets``. The exit is looked for in each
+    file in turn (:func:`detect_exit_offset`) and the first file that shows it wins, with
+    its offset added so the result is scene-relative.
+
+    Before this the exit was only ever looked for in the scene's FIRST file. A scene made
+    of several GoPro files (a chaptered master, or a short in-aircraft clip the
+    classifier grouped with the jump) then got ``0.0`` whenever the exit lived in a later
+    file — indistinguishable from "starts in freefall", so the freefall cut opened on the
+    whole plane ride and the music's drop played over the aircraft (bug reopen
+    2026-10-23: 19 s of plane before the exit).
+    """
+    for src, offset in sources:
+        found = detect_exit_offset(src)
+        if found > 0.0:
+            return round(float(offset) + found, 2)
     return 0.0
 
 
@@ -1044,11 +1152,23 @@ def build_scenes(
             # Where the real exit happens within the clip (it often starts in the plane)
             # and, when the canopy ride is part of the same clip, where it opens. Read
             # from the analysis source (the LRV's telemetry is identical to the master).
-            scene["exit_offset"] = detect_exit_offset(clips[0].analysis_src)
+            scene["exit_offset"] = detect_scene_exit_offset(
+                [(c.analysis_src, fo["offset"]) for c, fo in zip(clips, file_offsets, strict=True)]
+            )
             scene["deploy_offset"] = detect_deploy_offset(
                 [c.analysis_src for c in clips],
                 exit_offset=scene["exit_offset"],
             )
+            if scene["exit_offset"] <= 0.0:
+                # A 0.0 is also what a clip that genuinely starts in freefall returns, but
+                # a handcam/cameraman file practically always starts in the aircraft — so
+                # a missed exit is the likelier reading, and it costs the customer a
+                # plane-ride opening with the music's drop in the wrong place. Surface it.
+                logger.warning(
+                    "job %s: %s — files=%s", job_id, EXIT_NOT_DETECTED_FLAG,
+                    [c.filename for c in clips],
+                )
+                flagged.append(EXIT_NOT_DETECTED_FLAG)
         scenes.append(scene)
         if needs_review:
             flagged.append(label)
@@ -2258,10 +2378,12 @@ def _audio_markers(
 def _freefall_lead(scenes: Sequence[dict[str, Any]], music_path: str | None) -> float:
     """Seconds of footage the freefall-only cut keeps before the exit.
 
-    The track's drop when the footage before the exit and :data:`FREEFALL_MAX_LEAD_S`
-    allow it (the music then plays from its first second); less when they don't (the
-    render then starts the music later). 0 with no music, no detectable drop, or no
-    detected exit — the cut starts at the exit, as it did before this rule.
+    The track's drop when the footage before the exit and the lead cap
+    (:func:`render.beatdrop.freefall_max_lead_s`, ``$FREEFALL_MAX_LEAD_S``) allow it —
+    the music then plays from its first second, untouched, and only the clip's head is
+    trimmed; less when they don't (the render then starts the music later). 0 with no
+    music, no detectable drop, or no detected exit — the cut starts at the exit, as it
+    did before this rule.
     """
     if not music_path:
         return 0.0
@@ -2270,7 +2392,7 @@ def _freefall_lead(scenes: Sequence[dict[str, Any]], music_path: str | None) -> 
         return 0.0  # no aerial window to anchor the cut to; nothing to sync
     try:
         exit_off = max(0.0, float(ff["exit_offset"]))
-        return plan_exit_lead(beat_drop_for(music_path), exit_off, FREEFALL_MAX_LEAD_S)
+        return plan_exit_lead(beat_drop_for(music_path), exit_off, freefall_max_lead_s())
     except Exception as e:  # noqa: BLE001 - music is optional; never fail a job on it
         logger.warning("freefall music sync skipped (%r); the cut starts at the exit", e)
         return 0.0

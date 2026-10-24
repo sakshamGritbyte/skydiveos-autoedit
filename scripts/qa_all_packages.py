@@ -55,6 +55,10 @@ from pathlib import Path
 from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+#: The longest a tandem freefall scene may run past its exit with NO deployment detected
+#: before the QA calls it a missed opening rather than a recording that stopped early.
+#: A tandem freefall is 40-80 s; 90 s leaves room for a high pull and the 3 s tail.
+_MAX_FREEFALL_TAIL_S = 90.0
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
@@ -293,15 +297,30 @@ def _audit_segment(run: PackageRun, jd: Path, roles: list[str]) -> None:
         else:
             exit_off = freefall.get("exit_offset")
             deploy_off = freefall.get("deploy_offset")
-            ok = (
-                isinstance(exit_off, int | float)
-                and isinstance(deploy_off, int | float)
-                and deploy_off > exit_off
+            exit_ok = isinstance(exit_off, int | float) and float(exit_off) > 0.0
+            deploy_ok = (
+                exit_ok and isinstance(deploy_off, int | float) and deploy_off > exit_off
             )
-            run.add("segment", f"exit/deploy offsets{tag}", ok,
-                    f"exit={exit_off} deploy={deploy_off} "
-                    f"(freefall {round(float(deploy_off) - float(exit_off), 1)}s)"
-                    if ok else f"exit={exit_off} deploy={deploy_off}")
+            if deploy_ok:
+                run.add("segment", f"exit/deploy offsets{tag}", True,
+                        f"exit={exit_off} deploy={deploy_off} "
+                        f"(freefall {round(float(deploy_off) - float(exit_off), 1)}s)")
+            elif exit_ok:
+                # ``deploy_offset: 0.0`` is the detector's "not found" sentinel
+                # (edl.validate._deploy_detected, 2026-10-24): the whole freefall scene
+                # then plays to its end and no deploy beat is forced. That is the
+                # designed behaviour, so it passes — unless the scene runs on far past
+                # any plausible tandem freefall, which means the opening was MISSED and
+                # the cut will bleed into the canopy ride.
+                tail = float(freefall.get("duration") or 0.0) - float(exit_off)
+                run.add("segment", f"exit/deploy offsets{tag}", tail <= _MAX_FREEFALL_TAIL_S,
+                        f"exit={exit_off} deploy NOT detected (deploy_offset={deploy_off}) — "
+                        f"the scene's whole {tail:.1f}s after the exit plays"
+                        + ("" if tail <= _MAX_FREEFALL_TAIL_S else
+                           f" (> {_MAX_FREEFALL_TAIL_S:.0f}s: the opening was likely missed)"))
+            else:
+                run.add("segment", f"exit/deploy offsets{tag}", False,
+                        f"exit={exit_off} deploy={deploy_off}")
 
         # Informational, never a failure: whether a post-freefall scene carries the
         # touchdown accl signature is a property of the FOOTAGE (a jump whose landing
@@ -405,7 +424,9 @@ def _audit_render(run: PackageRun, package: str, outputs: dict[str, str]) -> Non
             run.add("render", f"{name} has audio", False, "no audio stream (music never mixed?)")
 
 
-def _audit_photos(run: PackageRun, package: str, jd: Path, outputs: dict[str, str]) -> None:
+def _audit_photos(
+    run: PackageRun, package: str, jd: Path, outputs: dict[str, str], *, delivered: bool = True
+) -> None:
     if "photos" not in _EXPECTED_OUTPUTS[package]:
         run.add("photos", "no photos expected", "photos" not in outputs,
                 "correctly absent" if "photos" not in outputs else "photos emitted anyway")
@@ -419,6 +440,13 @@ def _audit_photos(run: PackageRun, package: str, jd: Path, outputs: dict[str, st
         empty = [p.name for p in stills if p.stat().st_size == 0]
         run.add("photos", "photos non-empty", not empty, f"{len(empty)} zero-byte" if empty else "")
     zipped = jd / "photos.zip"
+    if not delivered:
+        # The zip is built by delivery (the photo dir is zipped before the S3 upload):
+        # a job held at the review gate has none yet, and that is the expected state.
+        run.add("photos", "photos.zip", True,
+                f"{zipped.stat().st_size / 1e6:,.1f} MB" if zipped.is_file()
+                else "not yet — zipped at delivery (job not delivered)")
+        return
     run.add("photos", "photos.zip", zipped.is_file(),
             f"{zipped.stat().st_size / 1e6:,.1f} MB" if zipped.is_file() else "not zipped")
 
@@ -483,7 +511,11 @@ def _audit_archive(run: PackageRun, job: dict[str, Any], package: str) -> None:
     )
     base = root / day / instructor
     jump_dir = None
-    for candidate in sorted(p for p in base.glob(f"{customer}*") if p.is_dir()):
+    # The leaf is "<HH-MM_>?<customer>[-<job-id suffix>]": the time prefix comes from
+    # the job's capture time, which this stub does not carry, so match on what the
+    # archive records as ownership — the manifest's job_id — over every leaf here.
+    candidates = sorted(p for p in base.glob("*") if p.is_dir()) if base.is_dir() else []
+    for candidate in sorted(candidates, key=lambda p: (customer not in p.name, p.name)):
         manifest = _load_json(candidate / "manifest.json") or {}
         if manifest.get("job_id") == job["job_id"]:
             jump_dir = candidate
@@ -635,7 +667,7 @@ def _audit_all(
     _audit_compose(run, jd, package)
     _audit_validate(run, jd, package)
     _audit_render(run, package, outputs)
-    _audit_photos(run, package, jd, outputs)
+    _audit_photos(run, package, jd, outputs, delivered=job.get("status") == "delivered")
     _audit_delivery(run, client, job, want_email=want_email, review_gate=review_gate)
     _audit_archive(run, job, package)
     _audit_api(run, client, api, run.job_id, package)
@@ -678,7 +710,8 @@ def _audit_existing(client: Any, api: str, job_id: str) -> PackageRun:
         cameras.append((None, _masters(jd / "raw")))
 
     _audit_all(run, client, api, package, job, cameras,
-               want_email=bool(job.get("customer_email")))
+               want_email=bool(job.get("customer_email")),
+               review_gate=run.status in {"ready", "ready_for_review"})
     return run
 
 

@@ -1,0 +1,274 @@
+2026-10-24 14:23:07,752 INFO httpx: HTTP Request: GET http://localhost:8000/jobs "HTTP/1.1 200 OK"
+2026-10-24 14:23:07,798 INFO httpx: HTTP Request: POST http://localhost:8000/jobs "HTTP/1.1 201 Created"
+API        : http://localhost:8000
+packages   : selfie, external, video_only, photo_only, ultimum
+footage    : 7 master(s) — /home/msi/Desktop/Development/skydiving-autoedit/skydiveos-autoedit/jobs/08142ed6225841bc887c457d0059fe23/raw
+ultimum    : 3 instructor + 7 external
+email      : (none — links only)
+
+── selfie ─────────────────────────────────────
+    job 6eedd3b6b44b488eaf33818dcf64017d
+    uploading 2,104 MB …
+2026-10-24 14:47:28,458 INFO httpx: HTTP Request: POST http://localhost:8000/jobs/6eedd3b6b44b488eaf33818dcf64017d/upload "HTTP/1.1 200 OK"
+    processing2026-10-24 14:47:28,462 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/6eedd3b6b44b488eaf33818dcf64017d "HTTP/1.1 200 OK"
+2026-10-24 14:47:28,557 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/6eedd3b6b44b488eaf33818dcf64017d/deliverables "HTTP/1.1 200 OK"
+2026-10-24 14:47:28,560 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/6eedd3b6b44b488eaf33818dcf64017d/deliverables/full_video "HTTP/1.1 206 Partial Content"
+2026-10-24 14:47:28,564 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/6eedd3b6b44b488eaf33818dcf64017d/photos "HTTP/1.1 200 OK"
+2026-10-24 14:47:28,569 INFO httpx: HTTP Request: POST http://localhost:8000/jobs "HTTP/1.1 201 Created"
+ ready in 24m20s
+
+── external ─────────────────────────────────────
+    job 2608e8e65a594d9f8916d79183b5795a
+    uploading 2,104 MB …
+2026-10-24 15:08:28,361 INFO httpx: HTTP Request: POST http://localhost:8000/jobs/2608e8e65a594d9f8916d79183b5795a/upload "HTTP/1.1 200 OK"
+    processing2026-10-24 15:08:28,363 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/2608e8e65a594d9f8916d79183b5795a "HTTP/1.1 200 OK"
+2026-10-24 15:08:28,438 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/2608e8e65a594d9f8916d79183b5795a/deliverables "HTTP/1.1 200 OK"
+2026-10-24 15:08:28,440 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/2608e8e65a594d9f8916d79183b5795a/deliverables/full_video "HTTP/1.1 206 Partial Content"
+2026-10-24 15:08:28,442 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/2608e8e65a594d9f8916d79183b5795a/photos "HTTP/1.1 200 OK"
+2026-10-24 15:08:28,446 INFO httpx: HTTP Request: POST http://localhost:8000/jobs "HTTP/1.1 201 Created"
+ ready in 20m59s
+
+── video_only ─────────────────────────────────────
+    job 4705f76b84be4d5e89b70216b20fa9ff
+    uploading 2,104 MB …
+2026-10-24 15:26:33,072 INFO httpx: HTTP Request: POST http://localhost:8000/jobs/4705f76b84be4d5e89b70216b20fa9ff/upload "HTTP/1.1 200 OK"
+    processing2026-10-24 15:26:33,075 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/4705f76b84be4d5e89b70216b20fa9ff "HTTP/1.1 200 OK"
+2026-10-24 15:26:33,151 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/4705f76b84be4d5e89b70216b20fa9ff/deliverables "HTTP/1.1 200 OK"
+2026-10-24 15:26:33,153 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/4705f76b84be4d5e89b70216b20fa9ff/deliverables/full_video "HTTP/1.1 206 Partial Content"
+2026-10-24 15:26:33,158 INFO httpx: HTTP Request: POST http://localhost:8000/jobs "HTTP/1.1 201 Created"
+ ready in 18m04s
+
+── photo_only ─────────────────────────────────────
+    job 2dd6976826544463ab6525276d45083f
+    uploading 2,104 MB …
+2026-10-24 15:35:18,659 INFO httpx: HTTP Request: POST http://localhost:8000/jobs/2dd6976826544463ab6525276d45083f/upload "HTTP/1.1 200 OK"
+    processing2026-10-24 15:35:18,661 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/2dd6976826544463ab6525276d45083f "HTTP/1.1 200 OK"
+2026-10-24 15:35:18,666 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/2dd6976826544463ab6525276d45083f/deliverables "HTTP/1.1 200 OK"
+2026-10-24 15:35:18,669 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/2dd6976826544463ab6525276d45083f/photos "HTTP/1.1 200 OK"
+2026-10-24 15:35:18,673 INFO httpx: HTTP Request: POST http://localhost:8000/jobs "HTTP/1.1 201 Created"
+ ready in 8m45s
+
+── ultimum ─────────────────────────────────────
+    job 5b4912db1a894133b8be62501c7b4062
+    uploading 778 MB …
+2026-10-24 15:35:20,604 INFO httpx: HTTP Request: POST http://localhost:8000/jobs/5b4912db1a894133b8be62501c7b4062/upload "HTTP/1.1 200 OK"
+2026-10-24 15:35:20,607 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/5b4912db1a894133b8be62501c7b4062 "HTTP/1.1 200 OK"
+2026-10-24 15:47:12,734 INFO httpx: HTTP Request: POST http://localhost:8000/jobs/5b4912db1a894133b8be62501c7b4062/upload "HTTP/1.1 200 OK"
+    processing2026-10-24 15:47:12,736 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/5b4912db1a894133b8be62501c7b4062 "HTTP/1.1 200 OK"
+2026-10-24 15:47:12,797 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/5b4912db1a894133b8be62501c7b4062/deliverables "HTTP/1.1 200 OK"
+2026-10-24 15:47:12,799 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/5b4912db1a894133b8be62501c7b4062/deliverables/full_video "HTTP/1.1 206 Partial Content"
+2026-10-24 15:47:12,801 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/5b4912db1a894133b8be62501c7b4062/photos "HTTP/1.1 200 OK"
+ ready in 11m54s
+
+==============================================================================
+                                 STAGE MATRIX                                 
+==============================================================================
+package     create  ingest  pipeli  segmen  score   compos  valida  render  photos  review  delive  archiv  api     
+selfie      PASS    PASS    PASS    FAIL    PASS    PASS    PASS    PASS    FAIL    PASS    PASS    FAIL    PASS    
+external    PASS    PASS    PASS    FAIL    PASS    PASS    PASS    PASS    FAIL    PASS    PASS    FAIL    PASS    
+video_only  PASS    PASS    PASS    FAIL    PASS    PASS    PASS    PASS    PASS    PASS    PASS    FAIL    PASS    
+photo_only  PASS    PASS    PASS    FAIL    PASS    –       PASS    PASS    FAIL    PASS    PASS    FAIL    PASS    
+ultimum     PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    FAIL    PASS    PASS    FAIL    PASS    
+
+==============================================================================
+
+selfie  [6eedd3b6b44b488eaf33818dcf64017d]  ready
+-------------------------------------------------
+  ✓ create    POST /jobs                         job 6eedd3b6b44b488eaf33818dcf64017d
+  ✓ ingest    upload                             7 file(s)
+  ✓ pipeline  job succeeded                      ready in 24m20s
+  ✓ ingest    raw staged                         7 master(s) + 0 proxy(s) in jobs/6eedd3b6b44b488eaf33818dcf64017d/raw
+  ✓ ingest    LRV proxies present                none uploaded — analysis falls back to the full MP4 (slower)
+  ✓ segment   scenes found                       5: ['intro_interview', 'boarding', 'freefall', 'canopy', 'outro_interview']
+  ✓ segment   milestone scenes                   freefall present
+  ✗ segment   exit/deploy offsets                exit=74.07 deploy=0.0
+  ✓ segment   landing milestone                  no landing rename (canopy accl_z_mean=[0.448], needs >1.5) — expected unless the touchdown is in frame
+  ✓ segment   flagged for review                 none
+  ✓ segment   file_offsets recorded              every scene maps back to its source files
+  ✓ score     face scores                        284 scored second(s) across 5 scene(s)
+  ✓ compose   EDL full_video                     12 clip(s) in edl_full.json
+  ✓ compose   EDL full_video sane                every clip has src_start <= src_end
+  ✓ compose   EDL highlights                     15 clip(s) in edl_highlights.json
+  ✓ compose   EDL highlights sane                every clip has src_start <= src_end
+  ✓ compose   EDL freefall                       5 clip(s) in edl_freefall.json
+  ✓ compose   EDL freefall sane                  every clip has src_start <= src_end
+  ✓ validate  validation report                  9 repair(s) across 3 deliverable(s): {"full_video": ["deployment not detected (deploy_offset=0.00, exit_offset=74.07) \u2014 the freefall window runs to the scene end (122.71 s) and no deploy beat is forced", "dropped freefall [73.00, 74.07] \u2014 outside freefall window [74.07, 122.71]", "injected door arrival intro_interview [71.14, 77.14] \u2014 the last 6.0 s of 'GX015835.MP4' (the walk to the aircraft) before boarding"], "highl
+  ✓ render    deliverable set                    got ['freefall', 'full_video', 'highlights', 'photos']
+  ✓ render    full_video rendered                147 MB, video 185.266667s, audio 185.260998s
+  ✓ render    full_video A/V sync                video/audio differ by 0.01s
+  ✓ render    highlights rendered                38 MB, video 50.8s, audio 50.768005s
+  ✓ render    highlights A/V sync                video/audio differ by 0.03s
+  ✓ render    freefall rendered                  40 MB, video 64.133333s, audio 64.116009s
+  ✓ render    freefall A/V sync                  video/audio differ by 0.02s
+  ✓ photos    photo count                        50 stills (expected 35–60)
+  ✓ photos    photos non-empty                   
+  ✗ photos    photos.zip                         not zipped
+  ✓ review    held at review gate                status=ready
+  ✓ deliver   no links before approval           nothing delivered, as expected
+  ✗ archive   jump folder                        no folder under /home/msi/Desktop/Development/skydiving-autoedit/skydiveos-autoedit/raw-storage/2026-10-24/QA-Instructor owns this job
+  ✓ api       GET /deliverables                  HTTP 200, lists ['freefall', 'full_video', 'highlights', 'photos']
+  ✓ api       stream full_video                  HTTP 206
+  ✓ api       GET /photos                        HTTP 200, count=50
+  → 3 FAILING CHECK(S)
+
+external  [2608e8e65a594d9f8916d79183b5795a]  ready
+---------------------------------------------------
+  ✓ create    POST /jobs                         job 2608e8e65a594d9f8916d79183b5795a
+  ✓ ingest    upload                             7 file(s)
+  ✓ pipeline  job succeeded                      ready in 20m59s
+  ✓ ingest    raw staged                         7 master(s) + 0 proxy(s) in jobs/2608e8e65a594d9f8916d79183b5795a/raw
+  ✓ ingest    LRV proxies present                none uploaded — analysis falls back to the full MP4 (slower)
+  ✓ segment   scenes found                       5: ['intro_interview', 'boarding', 'freefall', 'canopy', 'outro_interview']
+  ✓ segment   milestone scenes                   freefall present
+  ✗ segment   exit/deploy offsets                exit=74.07 deploy=0.0
+  ✓ segment   landing milestone                  no landing rename (canopy accl_z_mean=[0.448], needs >1.5) — expected unless the touchdown is in frame
+  ✓ segment   flagged for review                 none
+  ✓ segment   file_offsets recorded              every scene maps back to its source files
+  ✓ score     face scores                        284 scored second(s) across 5 scene(s)
+  ✓ compose   EDL full_video                     15 clip(s) in edl_full.json
+  ✓ compose   EDL full_video sane                every clip has src_start <= src_end
+  ✓ compose   EDL highlights                     18 clip(s) in edl_highlights.json
+  ✓ compose   EDL highlights sane                every clip has src_start <= src_end
+  ✓ compose   EDL freefall                       7 clip(s) in edl_freefall.json
+  ✓ compose   EDL freefall sane                  every clip has src_start <= src_end
+  ✓ validate  validation report                  13 repair(s) across 3 deliverable(s): {"full_video": ["deployment not detected (deploy_offset=0.00, exit_offset=74.07) \u2014 the freefall window runs to the scene end (122.71 s) and no deploy beat is forced", "dropped freefall [0.00, 74.07] \u2014 outside freefall window [74.07, 122.71]", "injected door arrival intro_interview [71.14, 77.14] \u2014 the last 6.0 s of 'GX015835.MP4' (the walk to the aircraft) before boarding", "dropped
+  ✓ render    deliverable set                    got ['freefall', 'full_video', 'highlights', 'photos']
+  ✓ render    full_video rendered                152 MB, video 194.833333s, audio 194.801995s
+  ✓ render    full_video A/V sync                video/audio differ by 0.03s
+  ✓ render    highlights rendered                41 MB, video 55.433333s, audio 55.415011s
+  ✓ render    highlights A/V sync                video/audio differ by 0.02s
+  ✓ render    freefall rendered                  43 MB, video 67.2s, audio 67.196009s
+  ✓ render    freefall A/V sync                  video/audio differ by 0.00s
+  ✓ photos    photo count                        50 stills (expected 35–60)
+  ✓ photos    photos non-empty                   
+  ✗ photos    photos.zip                         not zipped
+  ✓ review    held at review gate                status=ready
+  ✓ deliver   no links before approval           nothing delivered, as expected
+  ✗ archive   jump folder                        no folder under /home/msi/Desktop/Development/skydiving-autoedit/skydiveos-autoedit/raw-storage/2026-10-24/QA-Instructor owns this job
+  ✓ api       GET /deliverables                  HTTP 200, lists ['freefall', 'full_video', 'highlights', 'photos']
+  ✓ api       stream full_video                  HTTP 206
+  ✓ api       GET /photos                        HTTP 200, count=50
+  → 3 FAILING CHECK(S)
+
+video_only  [4705f76b84be4d5e89b70216b20fa9ff]  ready
+-----------------------------------------------------
+  ✓ create    POST /jobs                         job 4705f76b84be4d5e89b70216b20fa9ff
+  ✓ ingest    upload                             7 file(s)
+  ✓ pipeline  job succeeded                      ready in 18m04s
+  ✓ ingest    raw staged                         7 master(s) + 0 proxy(s) in jobs/4705f76b84be4d5e89b70216b20fa9ff/raw
+  ✓ ingest    LRV proxies present                none uploaded — analysis falls back to the full MP4 (slower)
+  ✓ segment   scenes found                       5: ['intro_interview', 'boarding', 'freefall', 'canopy', 'outro_interview']
+  ✓ segment   milestone scenes                   freefall present
+  ✗ segment   exit/deploy offsets                exit=74.07 deploy=0.0
+  ✓ segment   landing milestone                  no landing rename (canopy accl_z_mean=[0.448], needs >1.5) — expected unless the touchdown is in frame
+  ✓ segment   flagged for review                 none
+  ✓ segment   file_offsets recorded              every scene maps back to its source files
+  ✓ score     face scores                        284 scored second(s) across 5 scene(s)
+  ✓ compose   EDL full_video                     15 clip(s) in edl_full.json
+  ✓ compose   EDL full_video sane                every clip has src_start <= src_end
+  ✓ compose   EDL highlights                     15 clip(s) in edl_highlights.json
+  ✓ compose   EDL highlights sane                every clip has src_start <= src_end
+  ✓ compose   EDL freefall                       6 clip(s) in edl_freefall.json
+  ✓ compose   EDL freefall sane                  every clip has src_start <= src_end
+  ✓ validate  validation report                  11 repair(s) across 3 deliverable(s): {"full_video": ["deployment not detected (deploy_offset=0.00, exit_offset=74.07) \u2014 the freefall window runs to the scene end (122.71 s) and no deploy beat is forced", "dropped freefall [71.07, 74.07] \u2014 outside freefall window [74.07, 122.71]", "injected boarding beat boarding [22.22, 25.22] \u2014 no clip from the boarding scene's last third", "injected door arrival intro_interview [71.1
+  ✓ render    deliverable set                    got ['freefall', 'full_video', 'highlights']
+  ✓ render    full_video rendered                151 MB, video 189.4s, audio 189.392993s
+  ✓ render    full_video A/V sync                video/audio differ by 0.01s
+  ✓ render    highlights rendered                57 MB, video 74.933333s, audio 74.911995s
+  ✓ render    highlights A/V sync                video/audio differ by 0.02s
+  ✓ render    freefall rendered                  44 MB, video 67.833333s, audio 67.840998s
+  ✓ render    freefall A/V sync                  video/audio differ by 0.01s
+  ✓ photos    no photos expected                 correctly absent
+  ✓ review    held at review gate                status=ready
+  ✓ deliver   no links before approval           nothing delivered, as expected
+  ✗ archive   jump folder                        no folder under /home/msi/Desktop/Development/skydiving-autoedit/skydiveos-autoedit/raw-storage/2026-10-24/QA-Instructor owns this job
+  ✓ api       GET /deliverables                  HTTP 200, lists ['freefall', 'full_video', 'highlights']
+  ✓ api       stream full_video                  HTTP 206
+  → 2 FAILING CHECK(S)
+
+photo_only  [2dd6976826544463ab6525276d45083f]  ready
+-----------------------------------------------------
+  ✓ create    POST /jobs                         job 2dd6976826544463ab6525276d45083f
+  ✓ ingest    upload                             7 file(s)
+  ✓ pipeline  job succeeded                      ready in 8m45s
+  ✓ ingest    raw staged                         7 master(s) + 0 proxy(s) in jobs/2dd6976826544463ab6525276d45083f/raw
+  ✓ ingest    LRV proxies present                none uploaded — analysis falls back to the full MP4 (slower)
+  ✓ segment   scenes found                       5: ['intro_interview', 'boarding', 'freefall', 'canopy', 'outro_interview']
+  ✓ segment   milestone scenes                   freefall present
+  ✗ segment   exit/deploy offsets                exit=74.07 deploy=0.0
+  ✓ segment   landing milestone                  no landing rename (canopy accl_z_mean=[0.448], needs >1.5) — expected unless the touchdown is in frame
+  ✓ segment   flagged for review                 none
+  ✓ segment   file_offsets recorded              every scene maps back to its source files
+  ✓ score     face scores                        284 scored second(s) across 5 scene(s)
+  ✓ validate  validation report                  n/a for photo_only (no video EDLs)
+  ✓ render    deliverable set                    got ['photos']
+  ✓ photos    photo count                        140 stills (expected 110–150)
+  ✓ photos    photos non-empty                   
+  ✗ photos    photos.zip                         not zipped
+  ✓ review    held at review gate                status=ready
+  ✓ deliver   no links before approval           nothing delivered, as expected
+  ✗ archive   jump folder                        no folder under /home/msi/Desktop/Development/skydiving-autoedit/skydiveos-autoedit/raw-storage/2026-10-24/QA-Instructor owns this job
+  ✓ api       GET /deliverables                  HTTP 200, lists ['photos']
+  ✓ api       GET /photos                        HTTP 200, count=140
+  → 3 FAILING CHECK(S)
+
+ultimum  [5b4912db1a894133b8be62501c7b4062]  ready
+--------------------------------------------------
+  ✓ create    POST /jobs                         job 5b4912db1a894133b8be62501c7b4062
+  ✓ ingest    upload [instructor]                3 file(s)
+  ✓ ingest    ultimum waits for 2nd camera       status after camera 1 = queued
+  ✓ ingest    upload [external]                  7 file(s)
+  ✓ pipeline  job succeeded                      ready in 11m54s
+  ✓ ingest    raw staged [instructor]            3 master(s) + 0 proxy(s) in jobs/5b4912db1a894133b8be62501c7b4062/raw/instructor
+  ✓ ingest    LRV proxies present [instructor]   none uploaded — analysis falls back to the full MP4 (slower)
+  ✓ ingest    raw staged [external]              7 master(s) + 0 proxy(s) in jobs/5b4912db1a894133b8be62501c7b4062/raw/external
+  ✓ ingest    LRV proxies present [external]     none uploaded — analysis falls back to the full MP4 (slower)
+  ✓ segment   scenes found [instructor]          2: ['freefall', 'canopy']
+  ✓ segment   milestone scenes [instructor]      freefall present
+  ✓ segment   exit/deploy offsets [instructor]   exit=15.02 deploy=60.06 (freefall 45.0s)
+  ✓ segment   landing milestone [instructor]     no landing rename (canopy accl_z_mean=[-2.656], needs >1.5) — expected unless the touchdown is in frame
+  ✓ segment   flagged for review [instructor]    none
+  ✓ segment   file_offsets recorded [instructor] every scene maps back to its source files
+  ✓ segment   scenes found [external]            5: ['intro_interview', 'boarding', 'freefall', 'canopy', 'outro_interview']
+  ✓ segment   milestone scenes [external]        freefall present
+  ✓ segment   exit/deploy offsets [external]     exit=36.04 deploy=88.09 (freefall 52.1s)
+  ✓ segment   landing milestone [external]       no landing rename (canopy accl_z_mean=[-3.958], needs >1.5) — expected unless the touchdown is in frame
+  ✓ segment   flagged for review [external]      none
+  ✓ segment   file_offsets recorded [external]   every scene maps back to its source files
+  ✓ score     face scores [instructor]           120 scored second(s) across 2 scene(s)
+  ✓ score     face scores [external]             217 scored second(s) across 5 scene(s)
+  ✓ compose   EDL full_video                     26 clip(s) in edl_full.json
+  ✓ compose   EDL full_video sane                every clip has src_start <= src_end
+  ✓ compose   EDL highlights                     25 clip(s) in edl_highlights.json
+  ✓ compose   EDL highlights sane                every clip has src_start <= src_end
+  ✓ compose   EDL external_freefall              5 clip(s) in edl_external_freefall.json
+  ✓ compose   EDL external_freefall sane         every clip has src_start <= src_end
+  ✓ compose   EDL chute_libre_selfie             17 clip(s) in edl_chute_libre.json
+  ✓ compose   EDL chute_libre_selfie sane        every clip has src_start <= src_end
+  ✓ validate  validation report                  44 repair(s) across 4 deliverable(s): {"full_video": ["dropped instructor/freefall [0.00, 15.02] \u2014 outside freefall window [15.02, 63.06]", "dropped external/freefall [0.00, 36.04] \u2014 outside freefall window [36.04, 91.09]", "clamped instructor/freefall [61.06, 76.00] -> [61.06, 63.06] \u2014 freefall window is [15.02, 63.06]", "dropped instructor/freefall [76.00, 77.00] @0.4 \u2014 outside freefall window [15.02, 63.06]", "c
+  ✓ render    deliverable set                    got ['chute_libre_selfie', 'external_freefall', 'full_video', 'highlights', 'photos']
+  ✓ render    full_video rendered                163 MB, video 218.966667s, audio 218.949002s
+  ✓ render    full_video A/V sync                video/audio differ by 0.02s
+  ✓ render    highlights rendered                61 MB, video 82.0s, audio 81.967007s
+  ✓ render    highlights A/V sync                video/audio differ by 0.03s
+  ✓ render    external_freefall rendered         51 MB, video 78.566667s, audio 78.55s
+  ✓ render    external_freefall A/V sync         video/audio differ by 0.02s
+  ✓ render    chute_libre_selfie rendered        77 MB, video 80.566667s, audio 80.54s
+  ✓ render    chute_libre_selfie A/V sync        video/audio differ by 0.03s
+  ✓ photos    photo count                        50 stills (expected 35–150)
+  ✓ photos    photos non-empty                   
+  ✗ photos    photos.zip                         not zipped
+  ✓ review    held at review gate                status=ready
+  ✓ deliver   no links before approval           nothing delivered, as expected
+  ✗ archive   jump folder                        no folder under /home/msi/Desktop/Development/skydiving-autoedit/skydiveos-autoedit/raw-storage/2026-10-24/QA-Instructor owns this job
+  ✓ api       GET /deliverables                  HTTP 200, lists ['chute_libre_selfie', 'external_freefall', 'full_video', 'highlights', 'photos']
+  ✓ api       stream full_video                  HTTP 206
+  ✓ api       GET /photos                        HTTP 200, count=50
+  → 2 FAILING CHECK(S)
+
+==============================================================================
+RESULT: FAILURES in selfie, external, video_only, photo_only, ultimum
+==============================================================================
+
+reports: /home/msi/Desktop/Development/skydiving-autoedit/skydiveos-autoedit/qa-report.json  and  /home/msi/Desktop/Development/skydiving-autoedit/skydiveos-autoedit/qa-report.md
+EXIT=1

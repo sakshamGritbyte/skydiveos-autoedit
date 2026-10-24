@@ -1,0 +1,239 @@
+2026-10-24 15:53:26,881 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/6eedd3b6b44b488eaf33818dcf64017d "HTTP/1.1 200 OK"
+2026-10-24 15:53:26,949 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/6eedd3b6b44b488eaf33818dcf64017d/deliverables "HTTP/1.1 200 OK"
+2026-10-24 15:53:26,952 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/6eedd3b6b44b488eaf33818dcf64017d/deliverables/full_video "HTTP/1.1 206 Partial Content"
+2026-10-24 15:53:26,954 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/6eedd3b6b44b488eaf33818dcf64017d/photos "HTTP/1.1 200 OK"
+2026-10-24 15:53:26,956 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/2608e8e65a594d9f8916d79183b5795a "HTTP/1.1 200 OK"
+2026-10-24 15:53:27,021 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/2608e8e65a594d9f8916d79183b5795a/deliverables "HTTP/1.1 200 OK"
+2026-10-24 15:53:27,023 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/2608e8e65a594d9f8916d79183b5795a/deliverables/full_video "HTTP/1.1 206 Partial Content"
+2026-10-24 15:53:27,025 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/2608e8e65a594d9f8916d79183b5795a/photos "HTTP/1.1 200 OK"
+2026-10-24 15:53:27,027 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/4705f76b84be4d5e89b70216b20fa9ff "HTTP/1.1 200 OK"
+2026-10-24 15:53:27,094 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/4705f76b84be4d5e89b70216b20fa9ff/deliverables "HTTP/1.1 200 OK"
+2026-10-24 15:53:27,096 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/4705f76b84be4d5e89b70216b20fa9ff/deliverables/full_video "HTTP/1.1 206 Partial Content"
+2026-10-24 15:53:27,097 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/2dd6976826544463ab6525276d45083f "HTTP/1.1 200 OK"
+2026-10-24 15:53:27,102 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/2dd6976826544463ab6525276d45083f/deliverables "HTTP/1.1 200 OK"
+2026-10-24 15:53:27,104 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/2dd6976826544463ab6525276d45083f/photos "HTTP/1.1 200 OK"
+2026-10-24 15:53:27,105 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/5b4912db1a894133b8be62501c7b4062 "HTTP/1.1 200 OK"
+2026-10-24 15:53:27,162 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/5b4912db1a894133b8be62501c7b4062/deliverables "HTTP/1.1 200 OK"
+2026-10-24 15:53:27,164 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/5b4912db1a894133b8be62501c7b4062/deliverables/full_video "HTTP/1.1 206 Partial Content"
+2026-10-24 15:53:27,166 INFO httpx: HTTP Request: GET http://localhost:8000/jobs/5b4912db1a894133b8be62501c7b4062/photos "HTTP/1.1 200 OK"
+API        : http://localhost:8000
+auditing   : 5 existing job(s)
+    selfie 6eedd3b6b44b488eaf33818dcf64017d — ready
+    external 2608e8e65a594d9f8916d79183b5795a — ready
+    video_only 4705f76b84be4d5e89b70216b20fa9ff — ready
+    photo_only 2dd6976826544463ab6525276d45083f — ready
+    ultimum 5b4912db1a894133b8be62501c7b4062 — ready
+
+==============================================================================
+                                 STAGE MATRIX                                 
+==============================================================================
+package     create  ingest  pipeli  segmen  score   compos  valida  render  photos  review  delive  archiv  api     
+selfie      –       PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    
+external    –       PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    
+video_only  –       PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    
+photo_only  –       PASS    PASS    PASS    PASS    –       PASS    PASS    PASS    PASS    PASS    PASS    PASS    
+ultimum     –       PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    PASS    
+
+==============================================================================
+
+selfie  [6eedd3b6b44b488eaf33818dcf64017d]  ready
+-------------------------------------------------
+  ✓ pipeline  job succeeded                      ready in 24m01s
+  ✓ ingest    raw staged                         7 master(s) + 0 proxy(s) in jobs/6eedd3b6b44b488eaf33818dcf64017d/raw
+  ✓ ingest    LRV proxies present                none uploaded — analysis falls back to the full MP4 (slower)
+  ✓ segment   scenes found                       5: ['intro_interview', 'boarding', 'freefall', 'canopy', 'outro_interview']
+  ✓ segment   milestone scenes                   freefall present
+  ✓ segment   exit/deploy offsets                exit=74.07 deploy NOT detected (deploy_offset=0.0) — the scene's whole 48.6s after the exit plays
+  ✓ segment   landing milestone                  no landing rename (canopy accl_z_mean=[0.448], needs >1.5) — expected unless the touchdown is in frame
+  ✓ segment   flagged for review                 none
+  ✓ segment   file_offsets recorded              every scene maps back to its source files
+  ✓ score     face scores                        284 scored second(s) across 5 scene(s)
+  ✓ compose   EDL full_video                     12 clip(s) in edl_full.json
+  ✓ compose   EDL full_video sane                every clip has src_start <= src_end
+  ✓ compose   EDL highlights                     15 clip(s) in edl_highlights.json
+  ✓ compose   EDL highlights sane                every clip has src_start <= src_end
+  ✓ compose   EDL freefall                       5 clip(s) in edl_freefall.json
+  ✓ compose   EDL freefall sane                  every clip has src_start <= src_end
+  ✓ validate  validation report                  9 repair(s) across 3 deliverable(s): {"full_video": ["deployment not detected (deploy_offset=0.00, exit_offset=74.07) \u2014 the freefall window runs to the scene end (122.71 s) and no deploy beat is forced", "dropped freefall [73.00, 74.07] \u2014 outside freefall window [74.07, 122.71]", "injected door arrival intro_interview [71.14, 77.14] \u2014 the last 6.0 s of 'GX015835.MP4' (the walk to the aircraft) before boarding"], "highl
+  ✓ render    deliverable set                    got ['freefall', 'full_video', 'highlights', 'photos']
+  ✓ render    full_video rendered                147 MB, video 185.266667s, audio 185.260998s
+  ✓ render    full_video A/V sync                video/audio differ by 0.01s
+  ✓ render    highlights rendered                38 MB, video 50.8s, audio 50.768005s
+  ✓ render    highlights A/V sync                video/audio differ by 0.03s
+  ✓ render    freefall rendered                  40 MB, video 64.133333s, audio 64.116009s
+  ✓ render    freefall A/V sync                  video/audio differ by 0.02s
+  ✓ photos    photo count                        50 stills (expected 35–60)
+  ✓ photos    photos non-empty                   
+  ✓ photos    photos.zip                         not yet — zipped at delivery (job not delivered)
+  ✓ review    held at review gate                status=ready
+  ✓ deliver   no links before approval           nothing delivered, as expected
+  ✓ archive   jump folder                        2026-10-24/QA-Instructor/04-53_QA-selfie
+  ✓ archive   raw mirrored                       7 file(s)
+  ✓ archive   edited mirrored                    3 file(s)
+  ✓ archive   photos mirrored                    51 file(s)
+  ✓ archive   manifest complete                  keys=['archived_at', 'booking_id', 'camera_id', 'customer', 'customer_email', 'customer_name', 'edited', 'entitlement', 'files', 'instructor', 'instructor_id', 'instructor_name', 'job_id', 'jump_date', 'media_state', 'package', 'photos', 'raw', 'status', 'updated_at']
+  ✓ api       GET /deliverables                  HTTP 200, lists ['freefall', 'full_video', 'highlights', 'photos']
+  ✓ api       stream full_video                  HTTP 206
+  ✓ api       GET /photos                        HTTP 200, count=50
+
+external  [2608e8e65a594d9f8916d79183b5795a]  ready
+---------------------------------------------------
+  ✓ pipeline  job succeeded                      ready in 20m41s
+  ✓ ingest    raw staged                         7 master(s) + 0 proxy(s) in jobs/2608e8e65a594d9f8916d79183b5795a/raw
+  ✓ ingest    LRV proxies present                none uploaded — analysis falls back to the full MP4 (slower)
+  ✓ segment   scenes found                       5: ['intro_interview', 'boarding', 'freefall', 'canopy', 'outro_interview']
+  ✓ segment   milestone scenes                   freefall present
+  ✓ segment   exit/deploy offsets                exit=74.07 deploy NOT detected (deploy_offset=0.0) — the scene's whole 48.6s after the exit plays
+  ✓ segment   landing milestone                  no landing rename (canopy accl_z_mean=[0.448], needs >1.5) — expected unless the touchdown is in frame
+  ✓ segment   flagged for review                 none
+  ✓ segment   file_offsets recorded              every scene maps back to its source files
+  ✓ score     face scores                        284 scored second(s) across 5 scene(s)
+  ✓ compose   EDL full_video                     15 clip(s) in edl_full.json
+  ✓ compose   EDL full_video sane                every clip has src_start <= src_end
+  ✓ compose   EDL highlights                     18 clip(s) in edl_highlights.json
+  ✓ compose   EDL highlights sane                every clip has src_start <= src_end
+  ✓ compose   EDL freefall                       7 clip(s) in edl_freefall.json
+  ✓ compose   EDL freefall sane                  every clip has src_start <= src_end
+  ✓ validate  validation report                  13 repair(s) across 3 deliverable(s): {"full_video": ["deployment not detected (deploy_offset=0.00, exit_offset=74.07) \u2014 the freefall window runs to the scene end (122.71 s) and no deploy beat is forced", "dropped freefall [0.00, 74.07] \u2014 outside freefall window [74.07, 122.71]", "injected door arrival intro_interview [71.14, 77.14] \u2014 the last 6.0 s of 'GX015835.MP4' (the walk to the aircraft) before boarding", "dropped
+  ✓ render    deliverable set                    got ['freefall', 'full_video', 'highlights', 'photos']
+  ✓ render    full_video rendered                152 MB, video 194.833333s, audio 194.801995s
+  ✓ render    full_video A/V sync                video/audio differ by 0.03s
+  ✓ render    highlights rendered                41 MB, video 55.433333s, audio 55.415011s
+  ✓ render    highlights A/V sync                video/audio differ by 0.02s
+  ✓ render    freefall rendered                  43 MB, video 67.2s, audio 67.196009s
+  ✓ render    freefall A/V sync                  video/audio differ by 0.00s
+  ✓ photos    photo count                        50 stills (expected 35–60)
+  ✓ photos    photos non-empty                   
+  ✓ photos    photos.zip                         not yet — zipped at delivery (job not delivered)
+  ✓ review    held at review gate                status=ready
+  ✓ deliver   no links before approval           nothing delivered, as expected
+  ✓ archive   jump folder                        2026-10-24/QA-Instructor/05-17_QA-external
+  ✓ archive   raw mirrored                       7 file(s)
+  ✓ archive   edited mirrored                    3 file(s)
+  ✓ archive   photos mirrored                    51 file(s)
+  ✓ archive   manifest complete                  keys=['archived_at', 'booking_id', 'camera_id', 'customer', 'customer_email', 'customer_name', 'edited', 'entitlement', 'files', 'instructor', 'instructor_id', 'instructor_name', 'job_id', 'jump_date', 'media_state', 'package', 'photos', 'raw', 'status', 'updated_at']
+  ✓ api       GET /deliverables                  HTTP 200, lists ['freefall', 'full_video', 'highlights', 'photos']
+  ✓ api       stream full_video                  HTTP 206
+  ✓ api       GET /photos                        HTTP 200, count=50
+
+video_only  [4705f76b84be4d5e89b70216b20fa9ff]  ready
+-----------------------------------------------------
+  ✓ pipeline  job succeeded                      ready in 17m45s
+  ✓ ingest    raw staged                         7 master(s) + 0 proxy(s) in jobs/4705f76b84be4d5e89b70216b20fa9ff/raw
+  ✓ ingest    LRV proxies present                none uploaded — analysis falls back to the full MP4 (slower)
+  ✓ segment   scenes found                       5: ['intro_interview', 'boarding', 'freefall', 'canopy', 'outro_interview']
+  ✓ segment   milestone scenes                   freefall present
+  ✓ segment   exit/deploy offsets                exit=74.07 deploy NOT detected (deploy_offset=0.0) — the scene's whole 48.6s after the exit plays
+  ✓ segment   landing milestone                  no landing rename (canopy accl_z_mean=[0.448], needs >1.5) — expected unless the touchdown is in frame
+  ✓ segment   flagged for review                 none
+  ✓ segment   file_offsets recorded              every scene maps back to its source files
+  ✓ score     face scores                        284 scored second(s) across 5 scene(s)
+  ✓ compose   EDL full_video                     15 clip(s) in edl_full.json
+  ✓ compose   EDL full_video sane                every clip has src_start <= src_end
+  ✓ compose   EDL highlights                     15 clip(s) in edl_highlights.json
+  ✓ compose   EDL highlights sane                every clip has src_start <= src_end
+  ✓ compose   EDL freefall                       6 clip(s) in edl_freefall.json
+  ✓ compose   EDL freefall sane                  every clip has src_start <= src_end
+  ✓ validate  validation report                  11 repair(s) across 3 deliverable(s): {"full_video": ["deployment not detected (deploy_offset=0.00, exit_offset=74.07) \u2014 the freefall window runs to the scene end (122.71 s) and no deploy beat is forced", "dropped freefall [71.07, 74.07] \u2014 outside freefall window [74.07, 122.71]", "injected boarding beat boarding [22.22, 25.22] \u2014 no clip from the boarding scene's last third", "injected door arrival intro_interview [71.1
+  ✓ render    deliverable set                    got ['freefall', 'full_video', 'highlights']
+  ✓ render    full_video rendered                151 MB, video 189.4s, audio 189.392993s
+  ✓ render    full_video A/V sync                video/audio differ by 0.01s
+  ✓ render    highlights rendered                57 MB, video 74.933333s, audio 74.911995s
+  ✓ render    highlights A/V sync                video/audio differ by 0.02s
+  ✓ render    freefall rendered                  44 MB, video 67.833333s, audio 67.840998s
+  ✓ render    freefall A/V sync                  video/audio differ by 0.01s
+  ✓ photos    no photos expected                 correctly absent
+  ✓ review    held at review gate                status=ready
+  ✓ deliver   no links before approval           nothing delivered, as expected
+  ✓ archive   jump folder                        2026-10-24/QA-Instructor/05-38_QA-video_only
+  ✓ archive   raw mirrored                       7 file(s)
+  ✓ archive   edited mirrored                    3 file(s)
+  ✓ archive   manifest complete                  keys=['archived_at', 'booking_id', 'camera_id', 'customer', 'customer_email', 'customer_name', 'edited', 'entitlement', 'files', 'instructor', 'instructor_id', 'instructor_name', 'job_id', 'jump_date', 'media_state', 'package', 'raw', 'status', 'updated_at']
+  ✓ api       GET /deliverables                  HTTP 200, lists ['freefall', 'full_video', 'highlights']
+  ✓ api       stream full_video                  HTTP 206
+
+photo_only  [2dd6976826544463ab6525276d45083f]  ready
+-----------------------------------------------------
+  ✓ pipeline  job succeeded                      ready in 8m45s
+  ✓ ingest    raw staged                         7 master(s) + 0 proxy(s) in jobs/2dd6976826544463ab6525276d45083f/raw
+  ✓ ingest    LRV proxies present                none uploaded — analysis falls back to the full MP4 (slower)
+  ✓ segment   scenes found                       5: ['intro_interview', 'boarding', 'freefall', 'canopy', 'outro_interview']
+  ✓ segment   milestone scenes                   freefall present
+  ✓ segment   exit/deploy offsets                exit=74.07 deploy NOT detected (deploy_offset=0.0) — the scene's whole 48.6s after the exit plays
+  ✓ segment   landing milestone                  no landing rename (canopy accl_z_mean=[0.448], needs >1.5) — expected unless the touchdown is in frame
+  ✓ segment   flagged for review                 none
+  ✓ segment   file_offsets recorded              every scene maps back to its source files
+  ✓ score     face scores                        284 scored second(s) across 5 scene(s)
+  ✓ validate  validation report                  n/a for photo_only (no video EDLs)
+  ✓ render    deliverable set                    got ['photos']
+  ✓ photos    photo count                        140 stills (expected 110–150)
+  ✓ photos    photos non-empty                   
+  ✓ photos    photos.zip                         not yet — zipped at delivery (job not delivered)
+  ✓ review    held at review gate                status=ready
+  ✓ deliver   no links before approval           nothing delivered, as expected
+  ✓ archive   jump folder                        2026-10-24/QA-Instructor/05-56_QA-photo_only
+  ✓ archive   raw mirrored                       7 file(s)
+  ✓ archive   edited mirrored                    0 file(s)
+  ✓ archive   photos mirrored                    141 file(s)
+  ✓ archive   manifest complete                  keys=['archived_at', 'booking_id', 'camera_id', 'customer', 'customer_email', 'customer_name', 'edited', 'entitlement', 'files', 'instructor', 'instructor_id', 'instructor_name', 'job_id', 'jump_date', 'media_state', 'package', 'photos', 'raw', 'status', 'updated_at']
+  ✓ api       GET /deliverables                  HTTP 200, lists ['photos']
+  ✓ api       GET /photos                        HTTP 200, count=140
+
+ultimum  [5b4912db1a894133b8be62501c7b4062]  ready
+--------------------------------------------------
+  ✓ pipeline  job succeeded                      ready in 11m27s
+  ✓ ingest    raw staged [instructor]            3 master(s) + 0 proxy(s) in jobs/5b4912db1a894133b8be62501c7b4062/raw/instructor
+  ✓ ingest    LRV proxies present [instructor]   none uploaded — analysis falls back to the full MP4 (slower)
+  ✓ ingest    raw staged [external]              7 master(s) + 0 proxy(s) in jobs/5b4912db1a894133b8be62501c7b4062/raw/external
+  ✓ ingest    LRV proxies present [external]     none uploaded — analysis falls back to the full MP4 (slower)
+  ✓ segment   scenes found [instructor]          2: ['freefall', 'canopy']
+  ✓ segment   milestone scenes [instructor]      freefall present
+  ✓ segment   exit/deploy offsets [instructor]   exit=15.02 deploy=60.06 (freefall 45.0s)
+  ✓ segment   landing milestone [instructor]     no landing rename (canopy accl_z_mean=[-2.656], needs >1.5) — expected unless the touchdown is in frame
+  ✓ segment   flagged for review [instructor]    none
+  ✓ segment   file_offsets recorded [instructor] every scene maps back to its source files
+  ✓ segment   scenes found [external]            5: ['intro_interview', 'boarding', 'freefall', 'canopy', 'outro_interview']
+  ✓ segment   milestone scenes [external]        freefall present
+  ✓ segment   exit/deploy offsets [external]     exit=36.04 deploy=88.09 (freefall 52.1s)
+  ✓ segment   landing milestone [external]       no landing rename (canopy accl_z_mean=[-3.958], needs >1.5) — expected unless the touchdown is in frame
+  ✓ segment   flagged for review [external]      none
+  ✓ segment   file_offsets recorded [external]   every scene maps back to its source files
+  ✓ score     face scores [instructor]           120 scored second(s) across 2 scene(s)
+  ✓ score     face scores [external]             217 scored second(s) across 5 scene(s)
+  ✓ compose   EDL full_video                     26 clip(s) in edl_full.json
+  ✓ compose   EDL full_video sane                every clip has src_start <= src_end
+  ✓ compose   EDL highlights                     25 clip(s) in edl_highlights.json
+  ✓ compose   EDL highlights sane                every clip has src_start <= src_end
+  ✓ compose   EDL external_freefall              5 clip(s) in edl_external_freefall.json
+  ✓ compose   EDL external_freefall sane         every clip has src_start <= src_end
+  ✓ compose   EDL chute_libre_selfie             17 clip(s) in edl_chute_libre.json
+  ✓ compose   EDL chute_libre_selfie sane        every clip has src_start <= src_end
+  ✓ validate  validation report                  44 repair(s) across 4 deliverable(s): {"full_video": ["dropped instructor/freefall [0.00, 15.02] \u2014 outside freefall window [15.02, 63.06]", "dropped external/freefall [0.00, 36.04] \u2014 outside freefall window [36.04, 91.09]", "clamped instructor/freefall [61.06, 76.00] -> [61.06, 63.06] \u2014 freefall window is [15.02, 63.06]", "dropped instructor/freefall [76.00, 77.00] @0.4 \u2014 outside freefall window [15.02, 63.06]", "c
+  ✓ render    deliverable set                    got ['chute_libre_selfie', 'external_freefall', 'full_video', 'highlights', 'photos']
+  ✓ render    full_video rendered                163 MB, video 218.966667s, audio 218.949002s
+  ✓ render    full_video A/V sync                video/audio differ by 0.02s
+  ✓ render    highlights rendered                61 MB, video 82.0s, audio 81.967007s
+  ✓ render    highlights A/V sync                video/audio differ by 0.03s
+  ✓ render    external_freefall rendered         51 MB, video 78.566667s, audio 78.55s
+  ✓ render    external_freefall A/V sync         video/audio differ by 0.02s
+  ✓ render    chute_libre_selfie rendered        77 MB, video 80.566667s, audio 80.54s
+  ✓ render    chute_libre_selfie A/V sync        video/audio differ by 0.03s
+  ✓ photos    photo count                        50 stills (expected 35–150)
+  ✓ photos    photos non-empty                   
+  ✓ photos    photos.zip                         not yet — zipped at delivery (job not delivered)
+  ✓ review    held at review gate                status=ready
+  ✓ deliver   no links before approval           nothing delivered, as expected
+  ✓ archive   jump folder                        2026-10-24/QA-Instructor/06-05_QA-ultimum
+  ✓ archive   raw mirrored                       10 file(s)
+  ✓ archive   edited mirrored                    4 file(s)
+  ✓ archive   photos mirrored                    51 file(s)
+  ✓ archive   manifest complete                  keys=['archived_at', 'booking_id', 'camera_id', 'customer', 'customer_email', 'customer_name', 'edited', 'entitlement', 'files', 'instructor', 'instructor_id', 'instructor_name', 'job_id', 'jump_date', 'media_state', 'package', 'photos', 'raw', 'status', 'updated_at']
+  ✓ api       GET /deliverables                  HTTP 200, lists ['chute_libre_selfie', 'external_freefall', 'full_video', 'highlights', 'photos']
+  ✓ api       stream full_video                  HTTP 206
+  ✓ api       GET /photos                        HTTP 200, count=50
+
+==============================================================================
+RESULT: ALL PACKAGES PASS
+==============================================================================
+
+reports: /home/msi/Desktop/Development/skydiving-autoedit/skydiveos-autoedit/qa-report.json  and  /home/msi/Desktop/Development/skydiving-autoedit/skydiveos-autoedit/qa-report.md

@@ -333,9 +333,35 @@ converted), operator-authored SMS-mirror/broadcast bodies and subjects.
 |---|---|---|
 | SD-card live QA | real API in `sdcard` mode on a scratch root + fake cards + a stub SkydiveOS receiver + the real S3 bucket (QA keys deleted afterwards); harness in `evidence/sdcard-live-qa/` | **18 / 18** — normal card → `safe_to_remove`; second card, same camera, same day, reused `GX010001.MP4` → staged in the collision sibling, uploaded under its own fingerprint key, one ledger record per recording, nothing dropped; refused clip → `needs_attention` naming the file, rejection recorded durably, the other clip confirmed; restart with a ledger record removed → exactly the two unconfirmed clips re-handed off (the stranded one and the previously refused one, whose rejection is then cleared) |
 | Auto-deliver + paywall demo | `scripts/demo_auto_deliver.py --preview-only` on a real master, local SMTP sink, real S3 (upload deleted afterwards) | **PASS** — delivered; caught email subject `Votre vidéo de saut est prête, QA Paywall ! / Your skydive video is ready, QA Paywall!` with the FRANÇAIS section before ENGLISH; locked `/j/{code}` serves the watermarked preview and the unlock CTA; `POST /unlock` flips the same URL to the clean master with no re-render (`evidence/demo_auto_deliver_preview_only.log`) |
-| Five-package no-GoPro QA | `scripts/qa_all_packages.py --review-gate --no-email` on the real masters in `jobs/*/raw` (eager worker, discovery off, no callbacks) | in progress at commit time — reported separately when it completes |
+| Five-package no-GoPro QA | `scripts/qa_all_packages.py --review-gate --no-email` on the real masters in `jobs/*/raw` (eager worker, discovery off, no callbacks); then `--audit-job` on the same five jobs after the QA-tool fixes below | **ALL FIVE PASS** (selfie, external, video_only, photo_only, ultimum — jobs `6eedd3b6`, `2608e8e6`, `4705f76b`, `2dd69768`, `5b4912db`): every stage produced what it should — scenes with `file_offsets`, scores, one EDL per deliverable, `validation_report.json`, every render with video/audio durations within 0.03 s, 50 stills each, held at the review gate, nothing delivered before approval, archived under `raw-storage/2026-10-24/QA-Instructor/<HH-MM>_QA-<package>/`, `/deliverables` + `/photos` 200 (`evidence/pkgqa/`) |
 | SkydiveOS static checks | `npm run i18n:check` (catalog drift), `eslint` on every changed file | pass (0 errors; warnings pre-existing) |
 
 One QA-tool defect found and fixed on the way: `scripts/qa_all_packages.py`'s health probe sent no
 service token, so against a gated deployment it reported the API "not reachable" (401) before any
 test ran.
+
+The first five-package run reported 2–3 failing checks per package; all were **stale checks in the
+QA tool, not pipeline failures**, and are fixed in `scripts/qa_all_packages.py`
+(`evidence/pkgqa/qa_run_review_gate.log` is that run, `reaudit_after_check_fixes.log` the re-grade):
+
+* `segment / exit/deploy offsets` failed on `deploy_offset: 0.0`. Since 449ee49 that value is the
+  detector's "not found" sentinel and the validator plays the whole freefall scene to its end — the
+  designed behaviour, so the check now passes it (naming the undetected deploy and the seconds that
+  play), and fails only when the scene runs more than 90 s past the exit, which would mean a missed
+  opening bleeding into the canopy ride.
+* `photos / photos.zip` failed under `--review-gate`. The zip is built by delivery, so a job held
+  at the gate has none; the check now expects it only once the job is `delivered`.
+* `archive / jump folder` found nothing: the archive leaf carries REV03's `HH-MM_` time prefix
+  (791055e) and the tool's `<customer>*` glob never matched. It now matches on the manifest's
+  `job_id` over every leaf under the day/instructor folder.
+* `--audit-job` graded a job still at the review gate as if delivery were expected; it now infers
+  the gate from the job's status.
+
+**Observation for the detector (not changed here, pre-dates this work):** on the single-camera QA
+footage (`GX015838.MP4`, 122.7 s freefall scene, exit at 74.07 s) the opening shock sits in the
+file's LAST 1.7 s — accelerometer peaks of 5.3 / 5.6 g at 121–122 s with a 349 °/s gyro spike —
+but the per-payload *mean* there is 1.29 / 1.47 g, under `_DEPLOY_G`, and nothing follows it for
+`_confirms_canopy`, so `detect_deploy_offset` returns `0.0`. The customer still gets the whole
+freefall including the opening (the sentinel rule), only the forced slow-motion deploy beat is
+absent. The ultimum pair detected both openings (instructor 60.06 s, external 88.09 s). Worth a
+detector-tuning ticket: an onset in the final seconds of a file, judged on peak rather than mean.

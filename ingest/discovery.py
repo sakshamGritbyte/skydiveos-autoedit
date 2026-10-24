@@ -514,7 +514,15 @@ def s3_notify_uploader(
             mp4_path, camera_id, key_prefix=key_prefix,
             exists=lambda k: _object_size(_client(), bucket, k),
         )
-        _client().upload_file(mp4_path, bucket, key)
+        # A retried hand-off (a notify that was refused, a restart's reconciliation)
+        # maps to the SAME key by construction; when S3 already holds that object at
+        # the local file's size, the bytes are there and only the notify is owed.
+        # Re-sending a multi-GB master over the dropzone uplink on every restart
+        # would be pure cost.
+        if _object_size(_client(), bucket, key) == _file_size(mp4_path):
+            logger.info("%s already in S3 as %s (same size); notifying only", mp4_path, key)
+        else:
+            _client().upload_file(mp4_path, bucket, key)
 
         payload: dict[str, Any] = {"s3_key": key, "camera_id": camera_id}
         if instructor_id is not None:

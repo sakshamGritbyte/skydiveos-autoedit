@@ -290,6 +290,20 @@ def test_registry_tracks_verdicts_and_never_greens_over_a_refused_clip() -> None
     assert row["state"] == STATE_SAFE_TO_REMOVE and row["pending_files"] == 0
 
 
+def test_a_verdict_for_a_card_not_in_the_reader_creates_no_row() -> None:
+    """Regression (South Shore, 2026-10-24): the start-up reconciliation re-queued 36
+    clips from six-day-old staging days; their verdicts must not put phantom 'pulling'
+    rows for cameras 4368/4812 on the operator banner while the reader is empty."""
+    reg = CardStatusRegistry(now=lambda: 100.0)
+    reg.handoff_result("4812", "GX010989.MP4", "rejected", "HTTP 404")
+    reg.handoff_result("4368", "GX013279.MP4", "confirmed", "raw/k")
+    assert reg.snapshot() == []
+    # A card that IS tracked still gets its verdicts.
+    reg.pull_started("9999")
+    reg.handoff_result("9999", "GX010001.MP4", "rejected", "HTTP 404")
+    assert reg.snapshot()[0]["rejected_files"] == ["GX010001.MP4"]
+
+
 def test_verifying_is_a_transient_state_that_never_hides_an_error() -> None:
     reg = CardStatusRegistry(now=lambda: 100.0)
     reg.pull_started("4812")

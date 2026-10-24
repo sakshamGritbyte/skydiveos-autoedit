@@ -288,7 +288,14 @@ class CardStatusRegistry:
         are confirmed, so the banner can name them and never reads "done" over them.
         """
         with self._lock:
-            entry = self._ensure(camera_id)
+            # Only a card that is (or was just) in the reader has a row. A verdict for a
+            # clip the start-up reconciliation re-queued from an OLD staging day must
+            # not conjure a "pulling" row for a card nobody inserted — that row would
+            # never be pruned (mid-pull rows are protected) and the operator screen
+            # would read "DO NOT REMOVE THE CARD" over an empty reader.
+            entry = self._cards.get(camera_id)
+            if entry is None:
+                return
             if outcome == HANDOFF_CONFIRMED:
                 entry.uploaded_files += 1
                 entry.rejected_files = [f for f in entry.rejected_files if f != filename]

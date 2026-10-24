@@ -1705,3 +1705,53 @@ def test_card_is_swept_right_after_the_last_upload(tmp_path: Path) -> None:
         return cleared
 
     assert asyncio.run(scenario()) is True
+
+
+def test_s3_notify_uploader_skips_the_upload_when_s3_already_holds_the_bytes(
+    tmp_path, monkeypatch,
+) -> None:
+    """A retried hand-off (refused notify, restart reconciliation) must not re-send a
+    master S3 already holds at the same key and size — only the notify is owed."""
+    import httpx
+
+    from ingest.discovery import s3_notify_uploader
+
+    mp4 = _staged(tmp_path, "GX010001.MP4", body=b"video-bytes")
+    key = f"raw/1234/{STAGING_DAY}/GX010001.MP4"
+
+    class _FakeS3:
+        def __init__(self) -> None:
+            self.uploads: list[str] = []
+            self.objects: dict[str, int] = {}
+
+        def upload_file(self, filename: str, bucket: str, k: str) -> None:
+            self.uploads.append(k)
+            self.objects[k] = Path(filename).stat().st_size
+
+        def head_object(self, **kwargs: object) -> dict[str, int]:
+            k = str(kwargs["Key"])
+            if k not in self.objects:
+                raise KeyError(k)
+            return {"ContentLength": self.objects[k]}
+
+    s3 = _FakeS3()
+    posts: list[dict] = []
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            pass
+
+    def _fake_post(url, *, json, timeout, headers=None):  # noqa: ANN001
+        posts.append(json)
+        return _Resp()
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    upload = s3_notify_uploader("http://skydiveos.test/", bucket="jumps", s3_client=s3)
+    assert upload(str(mp4), "1234", None) == key
+    assert upload(str(mp4), "1234", None) == key  # the retry
+    assert s3.uploads == [key], "uploaded once, notified twice"
+    assert [p["s3_key"] for p in posts] == [key, key]
+    # A DIFFERENT recording under the same name still uploads, under its own key.
+    mp4.write_bytes(b"other-recording-bytes-longer")
+    other = upload(str(mp4), "1234", None)
+    assert other != key and s3.uploads == [key, other]

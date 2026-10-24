@@ -124,10 +124,14 @@ Two attribution routes, and at least one must work:
   `SDCARD_QR_MAX_CLIP_SECONDS`, 60 s, is never probed) with the code visible
   **immediately** (only the first `SDCARD_QR_SCAN_SECONDS`, 8 s, is sampled). Start of
   day, end of day, or mid-card — position is not a protocol.
-* **Serial fallback.** SkydiveOS matches `Staff.findOne({ goproSerial })` **exactly**,
-  while this box sends only the serial's **last 4 digits** as `camera_id`. So the field
-  must hold e.g. `8228`, not `C3504224544313`. A mismatch is a 404, which is a permanent
-  hand-off error and is never retried.
+* **Serial fallback.** This box sends only the serial's **last 4 digits** as
+  `camera_id`. SkydiveOS matches `Staff.goproSerial` exactly first and, since
+  2026-10-24, also accepts a stored full serial that **ends** in those digits
+  (`C3504224544313` matches `4313`) as long as only ONE staff member's serial does;
+  two staff whose serials share a tail are refused by name. An older SkydiveOS build
+  matches exactly only, so there the field must hold e.g. `8228`. A mismatch is a 404
+  (`No instructor is paired to GoPro serial "…"`), recorded as refused and re-sent on
+  the next service restart once the pairing is fixed.
 
 Either way the clip still needs a **load** whose `businessDate`/`departureTime` window
 contains its `captured_at`. QR yields the staff; it cannot conjure a load.
@@ -169,14 +173,33 @@ stops recording mid-day.
 | Card sits in `uploading` forever | Ledger records with no `size` can never be confirmed, and `ingest/pull.py` skips an already-staged clip before the emit, so no new sized record is ever written. Clear that card's staging day folder and re-pull |
 | Service runs by hand but not as a task | The task must run as a **user**, not SYSTEM — `uv` installs into `%USERPROFILE%\.local\bin`. `install-service.ps1` uses `-LogonType S4U` for exactly this |
 | Footage lands somewhere unexpected | `RAW_STORAGE_ROOT` defaults to the **relative** `./raw-storage`; a task that starts in `C:\Windows\System32` stages there. `run.ps1` sets the working directory |
-| Clips staged, nothing after a restart | Hand-offs are in-process. A restart strands already-staged clips; clear the staging day folder to retrigger |
+| Clips staged, nothing after a restart | Since 2026-10-24 a restart recovers them by itself: at start the service re-queues every staged clip the ledger does not confirm (`start-up reconciliation:` in the log). Do NOT clear the staging day folder — that re-copies from the card. A clip SkydiveOS refused (`REJECTED … — <reason>`) stays refused until the cause named in the log is fixed; then restart the task again |
 
 ## 7. Updating this box
+
+No admin needed for a code update — the task definition is unchanged, so restart the
+task rather than re-registering it:
 
 ```powershell
 cd C:\skydiveos-autoedit
 git pull origin main
 uv sync
+schtasks /End /TN "SkydiveOS-Ingest"
+schtasks /Run /TN "SkydiveOS-Ingest"
+Get-Content logs\ingest.out.log -Tail 5      # "=== ingest start <now> ===" (+ any "reclaiming port" line)
+Get-Content logs\ingest.err.log -Tail 5      # "Application startup complete."
+```
+
+`schtasks /End` kills the wrapper but not always the uvicorn it started; `run.ps1`
+reclaims port 8000 from that stale chain itself (and notes it in `ingest.out.log`), so
+the new code — not the old process — is what serves. Proof, if in doubt: the running
+API's route list must contain the newest routes, e.g.
+`(Invoke-RestMethod http://127.0.0.1:8000/openapi.json -Headers @{Authorization="Bearer <AUTO_EDIT_API_KEY>"}).paths.PSObject.Properties.Name`.
+
+Only when `install-service.ps1` itself changed (trigger, principal, settings) does the
+task need re-registering, from an **elevated** PowerShell:
+
+```powershell
 powershell -ExecutionPolicy Bypass -File deploy\windows\install-service.ps1 -Action remove
 powershell -ExecutionPolicy Bypass -File deploy\windows\install-service.ps1
 ```

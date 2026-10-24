@@ -44,13 +44,55 @@ $errLog = Join-Path $logDir 'ingest.err.log'
 # the service ran perfectly (observed on the North Shore box). Start-Process hands the
 # child real file handles, so lines land as they are written.
 #
+# Task Scheduler's Stop (and `schtasks /End`) kills the wrapper, but not always the
+# uvicorn process the wrapper started - so a restart can find the port still held by
+# the PREVIOUS run. The new instance then completes lifespan startup and dies on bind
+# (WinError 10048), the task reports exit 0, and the OLD code keeps serving. That is
+# the worst shape of failure available here: nothing looks wrong. So reclaim the port
+# first, and only from a process that is plausibly ours: the listener and the chain of
+# parents it was started through (`uv run` -> uvicorn.exe -> python -> python), never
+# anything above that chain.
+#
+# This runs BEFORE the log rotation on purpose. The stale run still holds
+# ingest.err.log open, Move-Item on an open file fails on Windows, and under
+# $ErrorActionPreference = 'Stop' that failure ended the wrapper with exit 1 before it
+# reached this block (North Shore, 2026-10-24: task result 1, old code still on :8000).
+$ours = @('python', 'pythonw', 'uv', 'uvicorn')
+$notes = @()
+$stale = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+foreach ($conn in $stale) {
+  $owner = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
+  if (-not ($owner -and $ours -contains $owner.ProcessName)) {
+    $notes += "WARNING: port $Port held by PID $($conn.OwningProcess) ($(if ($owner) { $owner.ProcessName } else { 'unknown' })) - not ours, leaving it alone"
+    continue
+  }
+  # The listener first, then its orphaned parents while they are still ours.
+  $pid_ = [int]$owner.Id
+  for ($hop = 0; $hop -lt 6 -and $pid_ -gt 4; $hop++) {
+    $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $pid_" -ErrorAction SilentlyContinue
+    if (-not $cim) { break }
+    $name = [System.IO.Path]::GetFileNameWithoutExtension($cim.Name)
+    if ($ours -notcontains $name) { break }
+    $notes += "reclaiming port $Port from stale $name PID $pid_"
+    Stop-Process -Id $pid_ -Force -ErrorAction SilentlyContinue
+    $pid_ = [int]$cim.ParentProcessId
+  }
+}
+if ($stale.Count -gt 0) { Start-Sleep -Seconds 2 }
+
 # Start-Process truncates its redirect targets, so rotate first rather than appending.
+# A log the stale run still holds open cannot be moved: note it and carry on - the
+# restart matters more than keeping the previous run's tail.
 foreach ($f in @($outLog, $errLog)) {
-  if ((Test-Path $f) -and ((Get-Item $f).Length -gt 0)) { Move-Item $f "$f.1" -Force }
+  if ((Test-Path $f) -and ((Get-Item $f).Length -gt 0)) {
+    try { Move-Item $f "$f.1" -Force -ErrorAction Stop }
+    catch { $notes += "WARNING: could not rotate $f ($($_.Exception.Message)); it will be truncated" }
+  }
 }
 
 "=== ingest start $(Get-Date -Format o) host=$BindHost port=$Port ===" |
   Out-File $outLog -Encoding UTF8
+foreach ($n in $notes) { $n | Out-File $outLog -Append -Encoding UTF8 }
 
 # Fail loudly on the one misconfiguration that looks exactly like "no cards today":
 # a scanner set to something other than sdcard, or discovery switched off entirely.
@@ -61,26 +103,6 @@ if ($scanner -and $scanner -ne 'sdcard') {
   "WARNING: CAMERA_SCANNER=$scanner on a card-reader box - sdcard was expected" |
     Out-File $outLog -Append -Encoding UTF8
 }
-
-# Task Scheduler's Stop kills the wrapper, but not always the uvicorn process the
-# wrapper started - so a restart can find the port still held by the PREVIOUS run. The
-# new instance then completes lifespan startup and dies on bind (WinError 10048), the
-# task reports exit 0, and the OLD code keeps serving. That is the worst shape of
-# failure available here: nothing looks wrong. So reclaim the port first, and only from
-# a process that is plausibly ours.
-$stale = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
-foreach ($conn in $stale) {
-  $owner = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
-  if ($owner -and @('python', 'pythonw', 'uv') -contains $owner.ProcessName) {
-    "reclaiming port $Port from stale $($owner.ProcessName) PID $($owner.Id)" |
-      Out-File $outLog -Append -Encoding UTF8
-    Stop-Process -Id $owner.Id -Force -ErrorAction SilentlyContinue
-  } else {
-    "WARNING: port $Port held by PID $($conn.OwningProcess) ($(if ($owner) { $owner.ProcessName } else { 'unknown' })) - not ours, leaving it alone" |
-      Out-File $errLog -Append -Encoding UTF8
-  }
-}
-if ($stale.Count -gt 0) { Start-Sleep -Seconds 2 }
 
 # Resolve uv by full path. A Scheduled Task's PATH is not the shell the operator
 # installed it from, and uv arrives by two different routes: the astral installer

@@ -38,6 +38,112 @@ def _covers(clips: list[dict[str, Any]], scene: str, lo: float, hi: float) -> bo
 
 
 # --------------------------------------------------------------------------- #
+# full_video: the arrival at the aircraft door (end of the last pre-boarding file)
+# --------------------------------------------------------------------------- #
+
+
+def _door_manifest(
+    intro_offsets: list[dict[str, Any]] | None = None, **intro: Any
+) -> dict[str, Any]:
+    # Real External job, 2026-10-24: a 55 s interview file, then a 22.14 s walk to the
+    # aircraft (apron -> hug by the door -> the livery at 20 s) classified into the same
+    # intro_interview scene; the full video kept 2.6 s of it and never reached the door.
+    scenes: list[dict[str, Any]] = [
+        {"name": "intro_interview", "duration": 77.14,
+         "file_offsets": intro_offsets if intro_offsets is not None else [
+             {"file": "GX015834.MP4", "offset": 0.0}, {"file": "GX015835.MP4", "offset": 55.0}],
+         **intro},
+        {"name": "boarding", "duration": 26.22,
+         "file_offsets": [{"file": "GX015836.MP4", "offset": 0.0},
+                          {"file": "GX015837.MP4", "offset": 9.13}]},
+        {"name": "freefall", "duration": 122.71, "exit_offset": 74.07, "deploy_offset": 110.0},
+        {"name": "outro_interview", "duration": 46.78,
+         "file_offsets": [{"file": "GX015840.MP4", "offset": 0.0}]},
+    ]
+    return {"scenes": scenes}
+
+
+def _door_edl(intro_end: float = 57.62) -> list[dict[str, Any]]:
+    return [
+        {"scene": "intro_interview", "src_start": 0.0, "src_end": intro_end,
+         "speed_multiplier": 1.0},
+        {"scene": "boarding", "src_start": 0.0, "src_end": 9.13, "speed_multiplier": 1.0},
+        {"scene": "boarding", "src_start": 9.13, "src_end": 19.6, "speed_multiplier": 1.0},
+        {"scene": "freefall", "src_start": 74.07, "src_end": 113.0, "speed_multiplier": 1.0},
+        {"scene": "outro_interview", "src_start": 0.0, "src_end": 46.78, "speed_multiplier": 1.0},
+    ]
+
+
+def _scene_seq(clips: list[dict[str, Any]]) -> list[str]:
+    return [c["scene"] for c in clips]
+
+
+def test_door_arrival_added_to_full_video_in_sequence() -> None:
+    manifest, edl = _door_manifest(), _door_edl()
+    out, log = validate_and_repair(edl, "full_video", manifest)
+    intro = [c for c in out if c["scene"] == "intro_interview"]
+    # The bookend rule splits the kept intro at the first file's end (0-55 | 55-57.62);
+    # the last 6 s of GX015835 (71.14 -> 77.14) are added after it, at 1x. Nothing else.
+    assert [(c["src_start"], c["src_end"]) for c in intro] == [
+        (0.0, 55.0), (55.0, 57.62), (71.14, 77.14),
+    ]
+    assert all(c["speed_multiplier"] == 1.0 for c in intro)
+    # Sequence: every intro clip before every boarding clip, nothing reordered.
+    seq = _scene_seq(out)
+    order = ["intro_interview", "boarding", "freefall", "canopy", "outro_interview"]
+    assert seq.index("boarding") > max(i for i, s in enumerate(seq) if s == "intro_interview")
+    assert seq == sorted(seq, key=order.index)
+    assert any("injected door arrival" in line and "GX015835.MP4" in line for line in log)
+    # Everything the composer chose is still there (the rule only adds).
+    for c in edl:
+        if c["scene"] != "intro_interview":
+            assert any(o["scene"] == c["scene"] and o["src_start"] == c["src_start"] for o in out)
+
+
+def test_door_arrival_starts_past_what_is_already_shown() -> None:
+    # The composer already kept the walk-out up to 73.0 s: only 73.0 -> 77.14 is added,
+    # no second plays twice.
+    out, log = validate_and_repair(_door_edl(intro_end=73.0), "full_video", _door_manifest())
+    tails = [c for c in out if c["scene"] == "intro_interview" and c["src_start"] >= 70.0]
+    assert [(c["src_start"], c["src_end"]) for c in tails] == [(73.0, 77.14)]
+    assert any("injected door arrival" in line for line in log)
+
+
+@pytest.mark.parametrize(
+    ("case", "manifest", "edl", "deliverable"),
+    [
+        ("single-file intro: the interview is whole already",
+         _door_manifest(intro_offsets=[{"file": "GX015834.MP4", "offset": 0.0}]),
+         _door_edl(), "full_video"),
+        ("tail already in the cut",
+         _door_manifest(), _door_edl(intro_end=77.14), "full_video"),
+        ("trailing fragment shorter than 8 s is not the walk-out",
+         _door_manifest(intro_offsets=[{"file": "GX015834.MP4", "offset": 0.0},
+                                       {"file": "GX015835.MP4", "offset": 72.0}]),
+         _door_edl(), "full_video"),
+        ("highlights keep their own 3 s entry beat rule",
+         _door_manifest(), _door_edl(), "highlights"),
+    ],
+)
+def test_door_arrival_not_added(case: str, manifest: dict[str, Any], edl: list[dict[str, Any]],
+                                deliverable: str) -> None:
+    out, log = validate_and_repair(edl, deliverable, manifest)
+    assert not any("injected door arrival" in line for line in log), case
+    assert not any(c["scene"] == "intro_interview" and c["src_start"] >= 71.0
+                   and c["src_end"] == 77.14 and c["src_start"] != 0.0
+                   for c in out if c not in edl), case
+
+
+def test_door_arrival_multicam_uses_the_instructor_camera() -> None:
+    mbc = {"instructor": _door_manifest(), "external": _door_manifest()}
+    edl = [{**c, "camera": "instructor"} for c in _door_edl()]
+    out, log = validate_and_repair(edl, "full_video", mbc["instructor"], manifest_by_camera=mbc)
+    beat = next(c for c in out if c["scene"] == "intro_interview" and c["src_start"] == 71.14)
+    assert beat["camera"] == "instructor"
+    assert any("injected door arrival instructor/intro_interview" in line for line in log)
+
+
+# --------------------------------------------------------------------------- #
 # Freefall-type deliverables: deploy beat + no trailing scenes + window clamp
 # --------------------------------------------------------------------------- #
 

@@ -79,6 +79,11 @@ _BOARD_MIN_COVERAGE_S = 6.0
 _BOARD_BEAT_S = 3.0
 #: highlights: the intro clip must run at least this long.
 _INTRO_MIN_S = 3.0
+#: ``full_video``: the last seconds of the last pre-boarding ground file — the walk up to
+#: the aircraft door — are kept as a beat (:func:`_require_door_arrival`). A trailing file
+#: shorter than ``_DOOR_ARRIVAL_MIN_FILE_S`` is a fragment, not the walk-out, and is skipped.
+_DOOR_ARRIVAL_S = 6.0
+_DOOR_ARRIVAL_MIN_FILE_S = 8.0
 #: Bug 441 — the filmed intro/outro "bookends": the FIRST source file of the
 #: intro interview and the LAST source file of the outro interview play in full,
 #: untrimmed, in these deliverables (the client's edit rule). Highlights keep
@@ -115,21 +120,70 @@ def _manifest_for(
     return manifest
 
 
+def _deploy_detected(manifest: dict[str, Any]) -> bool:
+    """Did the segmenter find the opening shock inside the freefall scene?
+
+    ``detect_deploy_offset`` returns ``0.0`` when no opening shock is found — a
+    sentinel, not an instant (a deployment at the first sample of a clip that opens in
+    the aircraft is impossible). A deploy at or before the exit is the same "not found"
+    reading. Real job, 2026-10-24 (external cut, ``GX015838``): the camera-flyer stopped
+    recording as he opened, the shock peaked at 1.54 g — under the detector's 1.6 g —
+    and the ``0.0`` was consumed as a real anchor: the aerial window became
+    ``[exit, 0 + 3 s]``, every freefall clip was clamped away, and the customer's
+    freefall video was the forced 2 s "deploy beat" at offset 0 (a 5 s file).
+    """
+    ff = _scene_by_name(manifest, _FREEFALL_SCENE)
+    if ff is None or ff.get("deploy_offset") is None:
+        return False
+    deploy_off = float(ff["deploy_offset"])
+    exit_off = float(ff.get("exit_offset") or 0.0)
+    return deploy_off > 0.0 and deploy_off > exit_off
+
+
 def _ff_anchors(manifest: dict[str, Any]) -> tuple[float, float, float] | None:
     """The freefall scene's ``(exit_offset, deploy_offset, duration)``, or ``None``.
 
-    ``None`` (no freefall scene, or offsets undetected) disables the freefall-window
+    ``None`` (no freefall scene, or offsets absent) disables the freefall-window
     rules entirely: without anchors there is no window to clamp to, and stripping
     the anchor-less fallback cuts would empty them.
+
+    An UNDETECTED deployment (``deploy_offset`` is the detector's ``0.0`` sentinel, or
+    not after the exit — see :func:`_deploy_detected`) is not an anchor at ``0.0``: the
+    footage simply runs out before, or at, the opening (the cameraman stops recording as
+    he opens; a chaptered master ends mid-air). The aerial window then runs to the END
+    of the scene — the same fallback compose applies (``deploy_offset or duration``) —
+    so the whole freefall that WAS filmed plays, instead of the window collapsing onto
+    the first 3 seconds of the aircraft.
     """
     ff = _scene_by_name(manifest, _FREEFALL_SCENE)
     if ff is None or ff.get("exit_offset") is None or ff.get("deploy_offset") is None:
         return None
-    return (
-        float(ff["exit_offset"]),
-        float(ff["deploy_offset"]),
-        max(float(ff.get("duration", 0.0)), 0.1),
+    dur = max(float(ff.get("duration", 0.0)), 0.1)
+    deploy_off = float(ff["deploy_offset"]) if _deploy_detected(manifest) else dur
+    return (float(ff["exit_offset"]), deploy_off, dur)
+
+
+def _undetected_deploy_notes(
+    manifest: dict[str, Any],
+    manifest_by_camera: dict[str, dict[str, Any]] | None,
+) -> list[str]:
+    """One repair-log line per camera whose freefall scene has no detected opening."""
+    sources: list[tuple[str | None, dict[str, Any]]] = (
+        sorted(manifest_by_camera.items()) if manifest_by_camera else [(None, manifest)]
     )
+    notes: list[str] = []
+    for cam, m in sources:
+        ff = _scene_by_name(m, _FREEFALL_SCENE)
+        if ff is None or ff.get("deploy_offset") is None or _deploy_detected(m):
+            continue
+        who = f"{cam} " if cam else ""
+        notes.append(
+            f"{who}deployment not detected (deploy_offset={float(ff['deploy_offset']):.2f}"
+            f", exit_offset={float(ff.get('exit_offset') or 0.0):.2f}) — the freefall"
+            f" window runs to the scene end ({max(float(ff.get('duration', 0.0)), 0.1):.2f} s)"
+            " and no deploy beat is forced"
+        )
+    return notes
 
 
 def _rank_map(
@@ -382,7 +436,10 @@ def _require_deploy_beat(
     for cam in cameras:
         m = manifest_by_camera[cam] if cam and manifest_by_camera else manifest
         anchors = _ff_anchors(m)
-        if anchors is None:
+        if anchors is None or not _deploy_detected(m):
+            # No opening was found in this camera's footage: there is no deployment
+            # to feature, and a slow-mo beat forced at the scene's end (the fallback
+            # anchor) would only slow the last second of the clip.
             continue
         _, deploy_off, dur = anchors
         lo, hi = deploy_off - _DEPLOY_BEAT_PRE_S, deploy_off + _DEPLOY_BEAT_POST_S
@@ -390,7 +447,7 @@ def _require_deploy_beat(
             return list(clips), []
         candidates.append((cam, lo, hi, dur))
 
-    if not candidates:  # no camera has anchors -> nothing to guarantee
+    if not candidates:  # no camera has a detected opening -> nothing to guarantee
         return list(clips), []
     cam, lo, hi, dur = candidates[0]
     beat: ClipDict = {
@@ -499,6 +556,89 @@ def _require_boarding(
                 " (no file_offsets; degraded check)",
             )
     return out, log
+
+
+def _intro_camera(
+    manifest: dict[str, Any],
+    manifest_by_camera: dict[str, dict[str, Any]] | None,
+    multicam: bool,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """The (camera, intro scene) pair the door-arrival rule applies to (instructor first)."""
+    if multicam and manifest_by_camera:
+        for cam in sorted(manifest_by_camera, key=lambda c: (c != "instructor", c)):
+            scene = _scene_by_name(manifest_by_camera[cam], _INTRO_SCENE)
+            if scene is not None:
+                return cam, scene
+        return None, None
+    return None, _scene_by_name(manifest, _INTRO_SCENE)
+
+
+def _require_door_arrival(
+    clips: list[ClipDict],
+    manifest: dict[str, Any],
+    manifest_by_camera: dict[str, dict[str, Any]] | None,
+    ranks: dict[str, int],
+    multicam: bool,
+) -> tuple[list[ClipDict], list[str]]:
+    """``full_video``: keep the arrival at the aircraft door — the END of the last
+    pre-boarding ground file.
+
+    The interview is the FIRST file of ``intro_interview`` (the bookend rule plays it
+    whole); any later file in that scene is what was filmed between the interview and
+    boarding — gearing up, the walk across the apron — and its last seconds are the
+    customer reaching the plane. The full video trims every scene to its HEAD
+    (proportional budget), so on a real External job (2026-10-24, ``GX015835``: apron →
+    hug by the door → the livery at 20 s) the walk-out survived as 2.6 s and the door
+    never appeared. This rule only ADDS: the last :data:`_DOOR_ARRIVAL_S` of that file at
+    1x, inserted chronologically (after whatever of the scene is kept, before boarding),
+    starting past anything already shown so no second is replayed. It does nothing for a
+    single-file intro (the interview is whole already), for a trailing fragment shorter
+    than :data:`_DOOR_ARRIVAL_MIN_FILE_S`, when the tail is already shown, or when nothing
+    follows the intro in the jump (no boarding/freefall — there is no door to arrive at).
+    """
+    cam, intro = _intro_camera(manifest, manifest_by_camera, multicam)
+    if intro is None:
+        return list(clips), []
+    m = manifest_by_camera[cam] if cam and manifest_by_camera else manifest
+    if _scene_by_name(m, _BOARDING_SCENE) is None and _scene_by_name(m, _FREEFALL_SCENE) is None:
+        return list(clips), []
+    offsets = intro.get("file_offsets") or []
+    if len(offsets) < 2:
+        return list(clips), []
+    dur = max(float(intro.get("duration", 0.0)), 0.1)
+    last = offsets[-1]
+    file_lo = float(last["offset"])
+    if dur - file_lo < _DOOR_ARRIVAL_MIN_FILE_S:
+        return list(clips), []
+    lo = max(file_lo, dur - _DOOR_ARRIVAL_S)
+    own = [
+        c
+        for c in clips
+        if c["scene"] == _INTRO_SCENE and (not multicam or c.get("camera") == cam)
+    ]
+    if any(float(c["src_end"]) >= dur - 0.05 for c in own):
+        return list(clips), []  # the arrival is already in the cut
+    # Start past whatever of the tail is already shown — never replay a second.
+    shown_until = max(
+        (float(c["src_end"]) for c in own if float(c["src_end"]) > lo), default=lo
+    )
+    start = max(lo, shown_until)
+    if dur - start < 1.0:
+        return list(clips), []
+    beat: ClipDict = {
+        "scene": _INTRO_SCENE,
+        "src_start": round(start, 3),
+        "src_end": round(dur, 3),
+        "speed_multiplier": 1.0,
+        "camera": cam,
+    }
+    return (
+        _insert_chronological(list(clips), beat, ranks),
+        [
+            f"injected door arrival {_fmt(beat)} — the last {dur - start:.1f} s of"
+            f" '{last.get('file')}' (the walk to the aircraft) before boarding"
+        ],
+    )
 
 
 def _require_intro(
@@ -1163,6 +1303,10 @@ def validate_and_repair(
     log: list[str] = []
     ranks = _rank_map(manifest, manifest_by_camera)
     multicam = any(c.get("camera") for c in clips)
+    if deliverable in FREEFALL_DELIVERABLES or deliverable in _STORY_DELIVERABLES:
+        # Say so when the opening was not found: every freefall-window rule below then
+        # runs to the scene end instead of a deployment, and the report must explain why.
+        log.extend(_undetected_deploy_notes(manifest, manifest_by_camera))
 
     def _apply(result: tuple[list[ClipDict], list[str]]) -> list[ClipDict]:
         fixed, lines = result
@@ -1188,6 +1332,12 @@ def validate_and_repair(
     if deliverable in _STORY_DELIVERABLES:
         clips = _apply(
             _require_boarding(clips, manifest, manifest_by_camera, ranks, multicam)
+        )
+    if deliverable in BOOKEND_DELIVERABLES:
+        # The full video alone has room for the arrival at the door (highlights keep
+        # their 3 s aircraft-entry beat from _require_intro).
+        clips = _apply(
+            _require_door_arrival(clips, manifest, manifest_by_camera, ranks, multicam)
         )
     if deliverable == "highlights":
         clips = _apply(

@@ -229,6 +229,55 @@ def test_no_anchors_means_no_window_and_no_change() -> None:
     assert out == edl and log == []
 
 
+@pytest.mark.parametrize("deliverable", ["freefall", "external_freefall", "full_video"])
+def test_undetected_deploy_runs_the_freefall_to_the_scene_end(deliverable: str) -> None:
+    # Real job, 2026-10-24 (external package, GX015838): exit found at 74.07 s, but the
+    # camera-flyer stopped recording as he opened and the shock stayed under the
+    # detector's threshold, so deploy_offset came back as the 0.0 "not found" sentinel.
+    # The composer's cut was the collapsed one the customer received: a 2 s slow-mo
+    # "deploy beat" at offset 0 and nothing of the jump.
+    manifest = {
+        "scenes": [
+            {"name": "boarding", "duration": 17.09},
+            {"name": "freefall", "duration": 122.71, "exit_offset": 74.07,
+             "deploy_offset": 0.0},
+            {"name": "outro_interview", "duration": 46.78},
+        ]
+    }
+    edl = [
+        {"scene": "boarding", "src_start": 0.0, "src_end": 10.45, "speed_multiplier": 1.0},
+        {"scene": "freefall", "src_start": 0.0, "src_end": 2.0, "speed_multiplier": 0.4},
+        {"scene": "freefall", "src_start": 90.0, "src_end": 95.0, "speed_multiplier": 1.0},
+        {"scene": "outro_interview", "src_start": 0.0, "src_end": 46.78,
+         "speed_multiplier": 1.0},
+    ]
+    if deliverable != "full_video":
+        edl = [c for c in edl if c["scene"] == "freefall"]
+    out, log = validate_and_repair(edl, deliverable, manifest)
+    # The window is [exit, scene end], not [exit, 0 + 3]: the whole filmed freefall plays.
+    run = _freefall_run(out)
+    _assert_uncut(run, 74.07, 122.71)
+    assert not any(c["scene"] == "freefall" and c["src_end"] <= 3.0 for c in out), (
+        "the in-aircraft head must not survive as a 'deploy beat' at offset 0"
+    )
+    # No opening was found, so none is forced — and the report says why.
+    assert not any("injected deployment beat" in line for line in log)
+    assert any("deployment not detected" in line for line in log)
+
+
+def test_deploy_at_or_before_the_exit_is_not_an_anchor() -> None:
+    # A deploy that is not after the exit is the same "not found" reading as 0.0.
+    manifest = {
+        "scenes": [
+            {"name": "freefall", "duration": 100.0, "exit_offset": 40.0, "deploy_offset": 12.0}
+        ]
+    }
+    edl = [{"scene": "freefall", "src_start": 50.0, "src_end": 55.0, "speed_multiplier": 1.0}]
+    out, log = validate_and_repair(edl, "freefall", manifest)
+    _assert_uncut(_freefall_run(out), 40.0, 100.0)
+    assert any("deployment not detected" in line for line in log)
+
+
 def test_house_cut_through_compose_persists_an_uncut_freefall(tmp_path: Path) -> None:
     # End to end through the offline house cut, as the external package composes:
     # the persisted EDLs are what the renderer (and every replay) reads.

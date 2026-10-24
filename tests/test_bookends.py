@@ -212,8 +212,13 @@ def test_the_bookend_is_never_duplicated_and_neighbours_outside_it_survive() -> 
         },
     ]
     clips, _ = validate_and_repair(edl, "full_video", manifest)
-    # First FILE [0, 25) whole at 1x, then only the part of [20,30] past the file boundary.
-    assert _scene(clips, "intro_interview") == [(0.0, 25.0, 1.0), (25.0, 30.0, 1.0)]
+    # First FILE [0, 25) whole at 1x, then only the part of [20,30] past the file boundary,
+    # then the door-arrival beat (_require_door_arrival): B.MP4 is a second, 15 s intro
+    # file followed by the jump, so its last 6 s are kept — added after the neighbours,
+    # never inside the bookend, never replaying the [25, 30] already shown.
+    assert _scene(clips, "intro_interview") == [
+        (0.0, 25.0, 1.0), (25.0, 30.0, 1.0), (34.0, 40.0, 1.0),
+    ]
     # No slow-mo fragment inside the bookend survives (it would replay the same seconds).
     assert all(
         not (c["scene"] == "intro_interview" and c["speed_multiplier"] != 1.0) for c in clips

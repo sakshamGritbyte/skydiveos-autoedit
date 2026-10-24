@@ -1699,3 +1699,133 @@ def test_delegated_sender_delivery_still_uploads_and_returns_links(store: JobSto
     )
     assert set(own) == set(delegated)
     assert len(smtp_pipeline.sent) == 1  # the legacy behaviour, unchanged
+
+
+# --------------------------------------------------------------------------- #
+# The pipeline's own gallery email is ONE bilingual message, French FIRST
+# (client decision 2026-10 — the same rule as SkydiveOS's bilingualEmail.js:
+# French leads, never the customer's preference).
+# --------------------------------------------------------------------------- #
+
+
+def _send_one_gallery_email(store: JobStore, **fields: Any) -> tuple[EmailMessage, str]:
+    from api.delivery import send_gallery_email_once
+
+    fields.setdefault("customer_email", "elodie@example.com")
+    fields.setdefault("customer_name", "Élodie Tremblay")
+    job = _job(store, **fields)
+    smtp = FakeSMTP()
+    url = "https://freefall.ing/j/AbC123xyz90?s=e#tab-video"
+    assert send_gallery_email_once(
+        job, store, url, _settings(customer_email_sender="pipeline"),
+        smtp_factory=lambda: smtp,  # type: ignore[arg-type,return-value]
+        link_expires=False,
+    ) is True
+    assert len(smtp.sent) == 1  # ONE message, never one per language
+    return smtp.sent[0], url
+
+
+def test_gallery_email_subject_is_french_first_and_carries_both(store: JobStore) -> None:
+    msg, _ = _send_one_gallery_email(store)
+    subject = str(msg["Subject"])
+    assert subject == (
+        "Votre vidéo de saut est prête, Élodie Tremblay ! / "
+        "Your skydive video is ready, Élodie Tremblay!"
+    )
+    assert subject.startswith("Votre vidéo de saut est prête")
+    assert subject.index("Votre vidéo") < subject.index("Your skydive video")
+
+
+def test_gallery_email_body_has_the_french_section_before_the_english(
+    store: JobStore,
+) -> None:
+    msg, url = _send_one_gallery_email(store)
+    body = msg.get_content()
+    fr_at = body.index("════════════ FRANÇAIS ════════════")
+    en_at = body.index("════════════ ENGLISH ════════════")
+    assert fr_at == 0 and fr_at < en_at
+    fr, en = body[:en_at], body[en_at:]
+    assert "Bonjour Élodie Tremblay," in fr
+    assert "Votre vidéo de saut est prête ! 🪂" in fr
+    assert "Hi Élodie Tremblay," in en
+    assert "Your skydive video is ready! 🪂" in en
+    assert "Your skydive video" not in fr and "Votre vidéo" not in en
+    # The gallery URL is in BOTH sections.
+    assert url in fr and url in en
+    # A served link never expires — in neither language.
+    assert "valid for" not in body and "expire" not in fr
+
+
+def test_gallery_email_legacy_expiring_link_says_so_in_both_languages() -> None:
+    from api.delivery import gallery_email_content
+
+    _, body = gallery_email_content(
+        "Sam", "https://s3.test/gallery.html?expires=1", link_expires=True, expiry_days=7
+    )
+    fr, en = body.split("════════════ ENGLISH ════════════")
+    assert "Ce lien expire dans 7 jours." in fr
+    assert "The link is valid for 7 days" in en
+
+
+def test_gallery_email_without_a_real_name_greets_plainly_in_french() -> None:
+    from api.delivery import gallery_email_content
+
+    subject, body = gallery_email_content(
+        "Valued Skydiver", "https://x.test/j/a", link_expires=False, expiry_days=7
+    )
+    assert subject == (
+        "Votre vidéo de saut est prête ! / Your skydive video is ready, Valued Skydiver!"
+    )
+    assert body.split("\n")[2] == "Bonjour,"
+
+
+def test_gallery_email_accents_survive_the_wire_round_trip(store: JobStore) -> None:
+    from email import message_from_bytes, message_from_string
+    from email import policy as email_policy
+
+    msg, url = _send_one_gallery_email(store)
+    raw_bytes = msg.as_bytes()
+    raw_str = msg.as_string()
+    # On the wire the subject is RFC 2047-encoded ASCII and the body is UTF-8.
+    header_block = raw_bytes.split(b"\n\n", 1)[0]
+    header_block.decode("ascii")  # no raw 8-bit bytes in the headers
+    assert b"=?utf-8?" in header_block.lower()
+    assert msg.get_content_charset() == "utf-8"
+    for parsed in (
+        message_from_bytes(raw_bytes, policy=email_policy.default),
+        message_from_string(raw_str, policy=email_policy.default),
+    ):
+        assert str(parsed["Subject"]) == str(msg["Subject"])
+        body = parsed.get_content()  # type: ignore[attr-defined]
+        for needle in ("Français".upper(), "Élodie", "vidéo", "prête", "téléchargez", "🪂", url):
+            assert needle in body
+
+
+def test_gallery_email_gate_still_skips_when_skydiveos_sends(store: JobStore) -> None:
+    from api.delivery import send_gallery_email_once
+
+    job = _job(store, customer_email="elodie@example.com", customer_name="Élodie")
+    smtp = FakeSMTP()
+    assert send_gallery_email_once(
+        job, store, "https://freefall.ing/j/abc",
+        _settings(customer_email_sender="skydiveos"),
+        smtp_factory=lambda: smtp,  # type: ignore[arg-type,return-value]
+    ) is True
+    assert smtp.sent == []
+    assert store.load(job.job_id).email_sent_at is None
+
+
+def test_gallery_email_once_claim_is_unchanged_by_the_bilingual_body(store: JobStore) -> None:
+    from api.delivery import send_gallery_email_once
+
+    job = _job(store, customer_email="elodie@example.com", customer_name="Élodie")
+    smtp = FakeSMTP()
+    for _ in range(3):
+        send_gallery_email_once(
+            store.load(job.job_id), store, "https://freefall.ing/j/abc",
+            _settings(customer_email_sender="pipeline"),
+            smtp_factory=lambda: smtp,  # type: ignore[arg-type,return-value]
+        )
+    assert len(smtp.sent) == 1
+    assert store.load(job.job_id).email_sent_at is not None
+    assert store.claim_email_send(job.job_id) is False  # the O_EXCL claim is held

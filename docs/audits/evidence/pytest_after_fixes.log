@@ -1,0 +1,190 @@
+.............................sss........................................ [  4%]
+........................................................................ [  9%]
+........................................................................ [ 14%]
+........................................................................ [ 19%]
+........................................................................ [ 23%]
+........................................................................ [ 28%]
+.....................................................................F.. [ 33%]
+........................................................................ [ 38%]
+........................................................................ [ 43%]
+........................................................................ [ 47%]
+........................................................................ [ 52%]
+........................................................................ [ 57%]
+........................................................................ [ 62%]
+.................................Fsss.ss................................ [ 67%]
+........................................................................ [ 71%]
+........................................................................ [ 76%]
+........................................................................ [ 81%]
+...........................s............................................ [ 86%]
+........................................................................ [ 91%]
+........................................................................ [ 95%]
+...............................................................          [100%]
+=================================== FAILURES ===================================
+____________________________ test_build_pull_modes _____________________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fde53607b60>
+
+    def test_build_pull_modes(monkeypatch) -> None:
+        import sys
+    
+        import pytest
+    
+        appmod = sys.modules["api.app"]
+    
+        assert _build_pull(_settings(camera_scanner="ble")) is None
+        # sdcard mode wires a pull against the mounted card.
+        assert _build_pull(_settings(camera_scanner="sdcard")) is not None
+        # An explicit sample → a simulated pull callable.
+        assert _build_pull(
+            _settings(camera_scanner="static", discovery_sample_mp4="x.mp4")
+        ) is not None
+        # No explicit sample → falls back to the bundled default (which exists in-repo).
+>       assert _build_pull(
+            _settings(camera_scanner="static", discovery_sample_mp4=None)
+        ) is not None
+
+tests/test_discovery.py:724: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+settings = Settings(redis_url='redis://localhost:6379/0', jobs_root=None, skydiveos_api_base=None, task_always_eager=False, enabl...e, cdn_key_pair_id=None, cdn_private_key_path=None, cdn_url_ttl_s=43200, raw_web_proxies=True, raw_web_max_height=1080)
+card_status = None
+
+    def _build_pull(
+        settings: Settings, card_status: CardStatusRegistry | None = None
+    ) -> Callable[..., Awaitable[Any]] | None:
+        """The pull coroutine for the configured mode.
+    
+        ``None`` means "use the service default" (the real wireless BLE+WiFi
+        :func:`ingest.pull.pull_camera`). ``usb`` returns a pull that runs the real pull
+        path against a :class:`~ingest.camera.WiredGoProCamera` (the kiosk path). ``static``
+        returns a no-hardware simulation that stages the configured sample MP4
+        (``DISCOVERY_SAMPLE_MP4``, or the bundled ``sample-data/discovery_sample.mp4``) and
+        emits the same ``ready_for_processing`` event a real download would. In ``sdcard``
+        mode, ``card_status`` (when given) tracks the pull's progress so the API can tell
+        the operator when the card is safe to remove (``GET /ingest/cards``).
+        """
+        if settings.camera_scanner == "usb":
+            async def _usb_pull(camera_id: str, *, emitter: EventEmitter | None = None) -> object:
+                from ingest.camera import WiredGoProCamera
+                from ingest.pull import pull_camera
+    
+                return await pull_camera(
+                    camera_id,
+                    camera=WiredGoProCamera(camera_id),
+                    emitter=emitter,
+                    **_cleanup_kwargs(settings),
+                )
+    
+            return _usb_pull
+    
+        if settings.camera_scanner == "sdcard":
+            async def _sdcard_pull(camera_id: str, *, emitter: EventEmitter | None = None) -> object:
+                from ingest.camera import Camera
+                from ingest.pull import pull_camera
+                from ingest.sdcard import SdCardCamera, card_serial_for_mount, mount_for
+    
+                if card_status is not None:
+                    card_status.pull_started(camera_id)
+                try:
+                    # Re-resolve the mount at pull time — the card may have been re-inserted
+                    # (or yanked) between the scan and this pull; a gone card raises the same
+                    # CameraError a camera wandering out of BLE range would.
+                    mount = mount_for(camera_id, settings.sdcard_mount_roots)
+                    # The CARD's own serial (not the camera's) rides every emitted event so
+                    # the hand-off can tell SkydiveOS which card the clip came off — the
+                    # instructor's cards are paired to them there. Best-effort: None when
+                    # the host cannot read one, and the pull runs regardless.
+                    card_serial = card_serial_for_mount(mount)
+                    if card_status is not None:
+                        card_status.card_identity(camera_id, card_serial)
+                    camera: Camera = SdCardCamera(mount)
+                    if card_status is not None:
+                        from ingest.cardstatus import TrackedCamera
+    
+                        camera = TrackedCamera(camera, card_status, camera_id)
+                    result = await pull_camera(
+                        camera_id,
+                        camera=camera,
+                        emitter=emitter,
+                        source=(
+                            {"transport": "sdcard", "card_serial": card_serial}
+                            if card_serial
+                            else {"transport": "sdcard"}
+                        ),
+                        **_cleanup_kwargs(settings),
+                    )
+                except Exception as e:
+                    # The operator is standing at the reader: a failed pull must show as
+                    # a red card state, not only as a server log line.
+                    if card_status is not None:
+                        card_status.error(camera_id, str(e))
+                    raise
+                # The pull loop is done and the camera closed — but "copied" is not
+                # "safe to remove": S3 must hold every clip, and with cleanup on the
+                # sweep that frees the card has yet to run. Ask, rather than assume.
+                if card_status is not None:
+                    await _report_card_state(camera_id, settings, card_status)
+                return result
+    
+            return _sdcard_pull
+    
+        if settings.camera_scanner != "static":
+            return None
+    
+        sample = settings.discovery_sample_mp4
+        if not sample and Path(_DEFAULT_SAMPLE_MP4).is_file():
+            sample = _DEFAULT_SAMPLE_MP4
+        if not sample:
+>           raise RuntimeError(
+                "CAMERA_SCANNER=static (simulation) needs a sample MP4 to stage: set "
+                "DISCOVERY_SAMPLE_MP4, or add the bundled sample-data/discovery_sample.mp4."
+            )
+E           RuntimeError: CAMERA_SCANNER=static (simulation) needs a sample MP4 to stage: set DISCOVERY_SAMPLE_MP4, or add the bundled sample-data/discovery_sample.mp4.
+
+api/app.py:838: RuntimeError
+_____________________________ test_labels_present ______________________________
+
+    def test_labels_present() -> None:
+        """Sanity: the ground-truth file exists and has the expected schema."""
+>       assert LABELS, "sample-data/labels.json is missing or empty"
+E       AssertionError: sample-data/labels.json is missing or empty
+E       assert {}
+
+tests/test_metadata.py:52: AssertionError
+=============================== warnings summary ===============================
+.venv/lib/python3.12/site-packages/fastapi/testclient.py:1
+  /home/msi/Desktop/Development/skydiving-autoedit/skydiveos-autoedit/.venv/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+tests/test_bridge.py::test_notify_body_reaches_the_bridge_as_the_posted_json
+tests/test_bridge.py::test_an_empty_notify_is_answered_not_rejected_as_a_missing_query_param
+tests/test_bridge.py::test_healthz_reports_the_bridge_counters
+tests/test_bridge.py::test_notify_requires_the_service_token_when_one_is_configured
+tests/test_bridge.py::test_the_gate_is_off_until_a_key_is_configured
+  /home/msi/Desktop/Development/skydiving-autoedit/skydiveos-autoedit/scripts/skydiveos_bridge.py:784: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    @app.on_event("startup")
+
+tests/test_bridge.py::test_notify_body_reaches_the_bridge_as_the_posted_json
+tests/test_bridge.py::test_an_empty_notify_is_answered_not_rejected_as_a_missing_query_param
+tests/test_bridge.py::test_healthz_reports_the_bridge_counters
+tests/test_bridge.py::test_notify_requires_the_service_token_when_one_is_configured
+tests/test_bridge.py::test_the_gate_is_off_until_a_key_is_configured
+  /home/msi/Desktop/Development/skydiving-autoedit/skydiveos-autoedit/.venv/lib/python3.12/site-packages/fastapi/applications.py:4598: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    return self.router.on_event(event_type)  # ty: ignore[deprecated]
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_discovery.py::test_build_pull_modes - RuntimeError: CAMERA_...
+FAILED tests/test_metadata.py::test_labels_present - AssertionError: sample-d...
+2 failed, 1492 passed, 9 skipped, 11 warnings in 66.47s (0:01:06)
+EXIT=1

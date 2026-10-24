@@ -57,6 +57,11 @@ def pinned_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Itera
     # request; the tests that assert the gate itself set a token explicitly.
     for var in ("AUTO_EDIT_API_KEY", "AI_BACKEND_API_KEY", "AUTO_EDIT_SERVICE_TOKEN"):
         monkeypatch.delenv(var, raising=False)
+    # The dropzone's camera clock zone (``CAMERA_CLOCK_TZ=America/Toronto`` in a dev
+    # ``.env``) shifts every naive capture time the matcher tests hand in by 4-5 h, so
+    # the flight-window tests saw their 13:10 clip at 09:10 and matched no load. The
+    # matcher tests that need a zone pass ``clock_tz`` explicitly.
+    monkeypatch.delenv("CAMERA_CLOCK_TZ", raising=False)
     # Path B's go-live prerequisite: a locked (preview_only) job can only be delivered
     # as the served /j/{code} gallery, so ``POST /jobs`` refuses to create one without
     # an origin to serve it from. Pin it here so the suite exercises the *deliverable*

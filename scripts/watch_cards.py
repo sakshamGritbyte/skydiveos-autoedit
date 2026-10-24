@@ -45,6 +45,8 @@ _ACTION = {
     "sweeping": ("⏳", "CLEARING SPACE — DO NOT REMOVE"),
     "pulling": ("⏳", "COPYING — DO NOT REMOVE"),
     "uploading": ("☁️ ", "TRANSFERRING TO CLOUD — DO NOT REMOVE"),
+    "verifying": ("🔎", "VERIFYING THE CARD — DO NOT REMOVE"),
+    "needs_attention": ("⚠️ ", "NEEDS ATTENTION — clip(s) refused, footage kept on the card"),
     "safe_to_remove": ("✅", "SAFE TO REMOVE"),
     "error": ("⚠️ ", "FAILED — leave the card in and check the log"),
 }
@@ -83,9 +85,13 @@ def _render(cards: list[dict[str, Any]]) -> str:
         bytes_total = int(c.get("bytes_total") or 0)
         bytes_done = int(c.get("bytes_done") or 0)
         lines.append(f"  {icon} Card {c.get('camera_id')}   {action}")
-        if state == "uploading":
+        if state in ("uploading", "needs_attention"):
             pending = int(c.get("pending_files") or 0)
             lines.append(f"       {pending} clip(s) still on the card")
+            for name, why in (c.get("issues") or {}).items():
+                lines.append(f"       !! {name}: {why}")
+            if state == "needs_attention" and c.get("error"):
+                lines.append(f"       {c.get('error')}")
         if state in ("pulling", "sweeping") and files_total:
             lines.append(
                 f"       {_bar(bytes_done, bytes_total)}  "

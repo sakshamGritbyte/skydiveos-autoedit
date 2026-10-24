@@ -1,0 +1,217 @@
+........................................................................ [ 20%]
+........................................................................ [ 41%]
+........................................................................ [ 62%]
+F.....................................FF.................Fsss.ss........ [ 83%]
+.....s...................................................                [100%]
+=================================== FAILURES ===================================
+____________________________ test_build_pull_modes _____________________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f0e06ec06b0>
+
+    def test_build_pull_modes(monkeypatch) -> None:
+        import sys
+    
+        import pytest
+    
+        appmod = sys.modules["api.app"]
+    
+        assert _build_pull(_settings(camera_scanner="ble")) is None
+        # sdcard mode wires a pull against the mounted card.
+        assert _build_pull(_settings(camera_scanner="sdcard")) is not None
+        # An explicit sample → a simulated pull callable.
+        assert _build_pull(
+            _settings(camera_scanner="static", discovery_sample_mp4="x.mp4")
+        ) is not None
+        # No explicit sample → falls back to the bundled default (which exists in-repo).
+>       assert _build_pull(
+            _settings(camera_scanner="static", discovery_sample_mp4=None)
+        ) is not None
+
+tests/test_discovery.py:724: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+settings = Settings(redis_url='redis://localhost:6379/0', jobs_root=None, skydiveos_api_base=None, task_always_eager=False, enabl...e, cdn_key_pair_id=None, cdn_private_key_path=None, cdn_url_ttl_s=43200, raw_web_proxies=True, raw_web_max_height=1080)
+card_status = None
+
+    def _build_pull(
+        settings: Settings, card_status: CardStatusRegistry | None = None
+    ) -> Callable[..., Awaitable[Any]] | None:
+        """The pull coroutine for the configured mode.
+    
+        ``None`` means "use the service default" (the real wireless BLE+WiFi
+        :func:`ingest.pull.pull_camera`). ``usb`` returns a pull that runs the real pull
+        path against a :class:`~ingest.camera.WiredGoProCamera` (the kiosk path). ``static``
+        returns a no-hardware simulation that stages the configured sample MP4
+        (``DISCOVERY_SAMPLE_MP4``, or the bundled ``sample-data/discovery_sample.mp4``) and
+        emits the same ``ready_for_processing`` event a real download would. In ``sdcard``
+        mode, ``card_status`` (when given) tracks the pull's progress so the API can tell
+        the operator when the card is safe to remove (``GET /ingest/cards``).
+        """
+        if settings.camera_scanner == "usb":
+            async def _usb_pull(camera_id: str, *, emitter: EventEmitter | None = None) -> object:
+                from ingest.camera import WiredGoProCamera
+                from ingest.pull import pull_camera
+    
+                return await pull_camera(
+                    camera_id,
+                    camera=WiredGoProCamera(camera_id),
+                    emitter=emitter,
+                    **_cleanup_kwargs(settings),
+                )
+    
+            return _usb_pull
+    
+        if settings.camera_scanner == "sdcard":
+            async def _sdcard_pull(camera_id: str, *, emitter: EventEmitter | None = None) -> object:
+                from ingest.camera import Camera
+                from ingest.pull import pull_camera
+                from ingest.sdcard import SdCardCamera, card_serial_for_mount, mount_for
+    
+                if card_status is not None:
+                    card_status.pull_started(camera_id)
+                try:
+                    # Re-resolve the mount at pull time — the card may have been re-inserted
+                    # (or yanked) between the scan and this pull; a gone card raises the same
+                    # CameraError a camera wandering out of BLE range would.
+                    mount = mount_for(camera_id, settings.sdcard_mount_roots)
+                    # The CARD's own serial (not the camera's) rides every emitted event so
+                    # the hand-off can tell SkydiveOS which card the clip came off — the
+                    # instructor's cards are paired to them there. Best-effort: None when
+                    # the host cannot read one, and the pull runs regardless.
+                    card_serial = card_serial_for_mount(mount)
+                    if card_status is not None:
+                        card_status.card_identity(camera_id, card_serial)
+                    camera: Camera = SdCardCamera(mount)
+                    if card_status is not None:
+                        from ingest.cardstatus import TrackedCamera
+    
+                        camera = TrackedCamera(camera, card_status, camera_id)
+                    result = await pull_camera(
+                        camera_id,
+                        camera=camera,
+                        emitter=emitter,
+                        source=(
+                            {"transport": "sdcard", "card_serial": card_serial}
+                            if card_serial
+                            else {"transport": "sdcard"}
+                        ),
+                        **_cleanup_kwargs(settings),
+                    )
+                except Exception as e:
+                    # The operator is standing at the reader: a failed pull must show as
+                    # a red card state, not only as a server log line.
+                    if card_status is not None:
+                        card_status.error(camera_id, str(e))
+                    raise
+                # The pull loop is done and the camera closed — but "copied" is not
+                # "safe to remove": S3 must hold every clip, and with cleanup on the
+                # sweep that frees the card has yet to run. Ask, rather than assume.
+                if card_status is not None:
+                    await _report_card_state(camera_id, settings, card_status)
+                return result
+    
+            return _sdcard_pull
+    
+        if settings.camera_scanner != "static":
+            return None
+    
+        sample = settings.discovery_sample_mp4
+        if not sample and Path(_DEFAULT_SAMPLE_MP4).is_file():
+            sample = _DEFAULT_SAMPLE_MP4
+        if not sample:
+>           raise RuntimeError(
+                "CAMERA_SCANNER=static (simulation) needs a sample MP4 to stage: set "
+                "DISCOVERY_SAMPLE_MP4, or add the bundled sample-data/discovery_sample.mp4."
+            )
+E           RuntimeError: CAMERA_SCANNER=static (simulation) needs a sample MP4 to stage: set DISCOVERY_SAMPLE_MP4, or add the bundled sample-data/discovery_sample.mp4.
+
+api/app.py:790: RuntimeError
+_______ TestMatcherReadsTheWindow.test_the_spec_flight_path_reads_it_too _______
+
+self = <tests.test_flight_window_callbacks.TestMatcherReadsTheWindow object at 0x7f0e088a7f80>
+
+    def test_the_spec_flight_path_reads_it_too(self) -> None:
+        load = _in_air_load({"closedAt": datetime(2026, 7, 21, 13, 5)})
+        load["jumpers"] = [{"customer": "c1", "booking": "b1"}]  # flyer holds no slot
+>       r = _matcher([load]).resolve_load_for_staff("s1", "2026-07-21T13:10:00")
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_flight_window_callbacks.py:133: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+ingest/match.py:1387: in resolve_load_for_staff
+    chosen = select_load(candidates, captured_local, captured_day=captured_day)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+candidates = [LoadCandidate(load_id='L7', load_number=7, departure_local=datetime.datetime(2026, 7, 21, 13, 0), business_day='2026-07-21')]
+captured_local = datetime.datetime(2026, 7, 21, 9, 10)
+
+    def select_load(
+        candidates: list[LoadCandidate],
+        captured_local: datetime,
+        *,
+        captured_day: str,
+    ) -> LoadCandidate:
+        """Pick the single load a clip belongs to with no jumper to key on, or raise.
+    
+        The spec-flight counterpart of :func:`select_match`, and pure for the same reason.
+        A camera flyer sent up on spec holds no slot on the load, so the jumper predicate
+        yields nothing and the *timestamp is the only evidence available*. That makes the
+        flight window **mandatory** here (unlike :func:`select_match`, where a lone
+        jumper-keyed candidate is accepted on the strength of the jumper predicate alone):
+        footage shot between loads must resolve to no load rather than to the nearest one.
+    
+        Ambiguity between overlapping windows is resolved causally, exactly as for jumpers.
+        Only two loads sharing one departure instant is real ambiguity, and that raises.
+        """
+        if not candidates:
+            raise NoLoadMatch("no matchable load on this capture day")
+    
+        survivors, pool = _narrow_by_time(
+            candidates, captured_local, captured_day=captured_day
+        )
+        if len(survivors) == 1:
+            return survivors[0]
+        if not survivors:
+>           raise NoLoadMatch(
+                f"{len(pool)} load(s) that day, none whose flight window contains the clip "
+                f"({captured_local:%Y-%m-%d %H:%M}); refusing to attach it to the nearest one"
+            )
+E           ingest.match.NoLoadMatch: 1 load(s) that day, none whose flight window contains the clip (2026-07-21 09:10); refusing to attach it to the nearest one
+
+ingest/match.py:1065: NoLoadMatch
+____ TestMatcherReadsTheWindow.test_open_window_hold_names_the_in_air_load _____
+
+self = <tests.test_flight_window_callbacks.TestMatcherReadsTheWindow object at 0x7f0e088cc350>
+
+    def test_open_window_hold_names_the_in_air_load(self) -> None:
+        closes = datetime(2999, 1, 1)
+        hold = _matcher([_in_air_load({"closesAt": closes})]).open_window_hold(
+            "2026-07-21T13:05:00", staff_id="s1"
+        )
+>       assert hold == {"load_id": "L7", "load_number": 7, "closes_at": closes}
+E       AssertionError: assert None == {'closes_at': datetime.datetime(2999, 1, 1, 0, 0), 'load_id': 'L7', 'load_number': 7}
+
+tests/test_flight_window_callbacks.py:144: AssertionError
+_____________________________ test_labels_present ______________________________
+
+    def test_labels_present() -> None:
+        """Sanity: the ground-truth file exists and has the expected schema."""
+>       assert LABELS, "sample-data/labels.json is missing or empty"
+E       AssertionError: sample-data/labels.json is missing or empty
+E       assert {}
+
+tests/test_metadata.py:52: AssertionError
+=============================== warnings summary ===============================
+.venv/lib/python3.12/site-packages/fastapi/testclient.py:1
+  /home/msi/Desktop/Development/skydiving-autoedit/skydiveos-autoedit/.venv/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_discovery.py::test_build_pull_modes - RuntimeError: CAMERA_...
+FAILED tests/test_flight_window_callbacks.py::TestMatcherReadsTheWindow::test_the_spec_flight_path_reads_it_too
+FAILED tests/test_flight_window_callbacks.py::TestMatcherReadsTheWindow::test_open_window_hold_names_the_in_air_load
+FAILED tests/test_metadata.py::test_labels_present - AssertionError: sample-d...
+4 failed, 335 passed, 6 skipped, 1 warning in 27.03s
+EXIT=1

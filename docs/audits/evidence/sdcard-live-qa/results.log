@@ -1,0 +1,21 @@
+PASS card A reaches safe_to_remove
+PASS card A: 2 notifies with day-scoped keys — ['raw/9999/2026-10-24/GX010001.MP4', 'raw/9999/2026-10-24/GX010002.MP4']
+PASS card A: ledger confirms both (size recorded) — {"GX010001.MP4": {"at": 1792832056.567832, "filename": "GX010001.MP4", "s3_key": "raw/9999/2026-10-24/GX010001.MP4", "size": 39996}, "GX010002.MP4": {"at": 1792832057.4254496, "filename": "GX010002.MP4", "s3_key": "raw/9999/2026-10-24/GX010002.MP4", "size": 39790}}
+PASS card A: uploaded_files counted on the row — 2
+PASS card A removed → row gone
+PASS card B reaches safe_to_remove
+PASS card B: GX010001 staged BESIDE card A's (collision sibling) — ['_camera-staging/9999/2026-10-24/GX010001.MP4', '_camera-staging/9999/2026-10-24/alt-41230-1792832061/GX010001.MP4']
+PASS card B: GX010001 handed off under its OWN key (no overwrite) — ['raw/9999/2026-10-24/GX010001.MP4', 'raw/9999/2026-10-24/fb9ee30da0ff/GX010001.MP4']
+PASS card B: ledger holds one record per recording for GX010001 — ['GX010001.MP4', 'GX010001.MP4#41230']
+PASS card B: 4 notifies in total (nothing dropped) — 4
+PASS card C: refused clip → needs_attention (never safe_to_remove)
+PASS card C: row names the refused file — {"rejected_files": ["GX010001.MP4"], "pending_files": 1, "error": "1 clip(s) could not be handed off and stay on the card: GX010001.MP4", "issues": {"GX010001.MP4": "refused by SkydiveOS: HTTPStatusError(\"Client error '404 Not Found' for url 'http://127.0.0.1:4100/api/media/raw-upload'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404\")"}}
+PASS card C: rejection recorded durably
+PASS card C: the other clip WAS confirmed — {"GX010002.MP4": {"at": 1792832074.6742804, "filename": "GX010002.MP4", "s3_key": "raw/8888/2026-10-24/GX010002.MP4", "size": 39790}}
+PASS restart: exactly the TWO unconfirmed clips re-handed off — 5 -> 7: ['raw/8888/2026-10-24/GX010001.MP4', 'raw/9999/2026-10-24/fb9ee30da0ff/GX010001.MP4']
+PASS restart: card B's GX010001 (same fingerprint key) + card C's refused clip — ['raw/8888/2026-10-24/GX010001.MP4', 'raw/9999/2026-10-24/fb9ee30da0ff/GX010001.MP4'] vs ['raw/8888/2026-10-24/GX010001.MP4', 'raw/9999/2026-10-24/fb9ee30da0ff/GX010001.MP4']
+PASS restart: ledger record restored
+PASS restart: the refused clip's rejection is cleared once it is accepted — {}
+S3 cleanup: deleted 6 QA object(s) from skydiveos-media-878013573203: ['raw/8888/2026-10-24/GX010001.MP4', 'raw/8888/2026-10-24/GX010002.MP4', 'raw/9999/2026-10-24/GX010001.MP4', 'raw/9999/2026-10-24/GX010002.MP4', 'raw/9999/2026-10-24/GX010003.MP4', 'raw/9999/2026-10-24/fb9ee30da0ff/GX010001.MP4']
+SUMMARY: 18 passed / 0 failed
+EXIT=0

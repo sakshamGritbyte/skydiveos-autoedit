@@ -1,0 +1,74 @@
+2026-10-24 14:21:42,289 INFO render.render: rendering job demo-autodeliver -> /tmp/autodeliver-demo-cpzhf9ii/demo-autodeliver/final.mp4
+2026-10-24 14:23:27,387 INFO render.render: rendered job demo-autodeliver (19661845 bytes)
+2026-10-24 14:23:35,981 INFO api.preview: preview rendered for job demo-autodeliver: preview_final.mp4
+2026-10-24 14:23:36,066 INFO api.archive: archive: job demo-autodeliver deliverables → /home/msi/Desktop/Development/skydiving-autoedit/skydiveos-autoedit/raw-storage/2026-07-27/_no-instructor/QA-Paywall (1 video(s), 1 preview(s), 0 photo(s))
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+W0000 00:00:1792832017.533410  203779 face_landmarker_graph.cc:174] Sets FaceBlendshapesGraph acceleration to xnnpack by default.
+I0000 00:00:1792832017.560216  203779 gl_context_egl.cc:85] Successfully initialized EGL. Major : 1 Minor: 5
+I0000 00:00:1792832017.565086  203807 gl_context.cc:385] GL version: 3.2 (OpenGL ES 3.2 Mesa 21.2.6), renderer: Mesa Intel(R) UHD Graphics (CML GT2)
+INFO: Created TensorFlow Lite XNNPACK delegate for CPU.
+W0000 00:00:1792832017.586416  203782 inference_feedback_manager.cc:114] Feedback manager requires a model with a single signature inference. Disabling support for feedback tensors.
+W0000 00:00:1792832017.604530  203785 inference_feedback_manager.cc:114] Feedback manager requires a model with a single signature inference. Disabling support for feedback tensors.
+2026-10-24 14:23:38,630 INFO api.thumbnail: poster for preview_final.mp4 from t=14.44s (24 candidates, faces=yes)
+2026-10-24 14:23:38,635 INFO api.tasks: AUTO_DELIVER: job demo-autodeliver auto-approved, delivery enqueued
+2026-10-24 14:23:57,071 INFO api.delivery: job demo-autodeliver: uploaded final → s3://skydiveos-media-878013573203/deliveries/demo-autodeliver/final.mp4
+2026-10-24 14:23:57,081 INFO api.delivery: job demo-autodeliver: gallery email sent to qa-paywall@example.com
+2026-10-24 14:23:57,098 INFO celery.app.trace: Task api.deliver_job[129b1b70-7185-4828-8626-aeaf0d050877] succeeded in 18.34690202300044s: 'demo-autodeliver'
+  from starlette.testclient import TestClient as TestClient  # noqa
+2026-10-24 14:23:57,325 INFO api.app: camera auto-discovery disabled (ENABLE_AUTO_DISCOVERY unset)
+2026-10-24 14:23:57,325 INFO api.app: customer galleries served at http://127.0.0.1:8000/j/{code}; the paywall (Path B) is available
+2026-10-24 14:23:57,340 INFO api.upsell: upsell: dropping tile 'raw' — this job cannot fulfil it
+2026-10-24 14:23:57,340 INFO api.upsell: upsell: dropping tile 'photos' — this job cannot fulfil it
+2026-10-24 14:23:57,429 INFO api.app: job demo-autodeliver unlocked (preview_only -> edited_download) payment=demo-auto-deliver by=service
+2026-10-24 14:23:57,440 INFO api.upsell: upsell: dropping tile 'raw' — this job cannot fulfil it
+2026-10-24 14:23:57,440 INFO api.upsell: upsell: dropping tile 'photos' — this job cannot fulfil it
+→ job demo-autodeliver created (status=queued, entitlement=preview_only); editing GX015838.MP4 ...
+
+✓ FINAL STATUS: delivered
+
+Download links (what the customer receives):
+  • gallery: http://127.0.0.1:8000/j/MSAXhmjl3HA...
+
+── Caught delivery email ─────────────────────────────
+  Subject: Votre vidéo de saut est prête, QA Paywall ! / Your skydive video is ready, QA Paywall!
+  From:    videos@dropzone.local
+  To:      qa-paywall@example.com
+  ---
+  ════════════ FRANÇAIS ════════════
+  
+  Bonjour QA Paywall,
+  
+  Votre vidéo de saut est prête ! 🪂
+  
+  Visionnez, téléchargez et partagez votre saut :
+  
+    http://127.0.0.1:8000/j/MSAXhmjl3HA?s=e#tab-video
+  
+  Blue skies !
+  
+  
+  ════════════ ENGLISH ════════════
+  
+  Hi QA Paywall,
+  
+  Your skydive video is ready! 🪂
+  
+  View and download all your videos and photos on one page here:
+  
+    http://127.0.0.1:8000/j/MSAXhmjl3HA?s=e#tab-video
+  
+  Blue skies!
+
+── Path B: the paywall ───────────────────────────────
+  watermarked previews rendered: ['preview_final.mp4']
+  GET /j/MSAXhmjl3HA?s=e → 200, shows the unlock CTA: True
+  GET /j/MSAXhmjl3HA/media/final → HTTP 200, 10374628 bytes (the preview, 10374628 bytes on disk)
+  POST /jobs/demo-autodeliver/unlock → HTTP 200 (entitlement=edited_download)
+  after unlock: page is clean and serves the final.mp4 master: True
+  ✓ locked → paid → unlocked, no re-render
+
+Cleaning up demo uploads ...
+  cleaned up s3://skydiveos-media-878013573203/deliveries/demo-autodeliver/final.mp4
+
+Done. Job artifacts under /tmp/autodeliver-demo-cpzhf9ii
+EXIT=0

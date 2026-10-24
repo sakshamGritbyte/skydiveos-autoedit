@@ -309,35 +309,49 @@ def gallery_link(job: Job, store: JobStore, settings: Settings) -> str | None:
     return f"{settings.public_base_url}/j/{token}"
 
 
-def send_gallery_email(
-    job: Job,
+#: Section labels + rule, byte-identical to SkydiveOS's bilingual composer
+#: (``backend/src/utils/bilingualEmail.js`` ``LANGUAGE_SECTION_LABELS`` / ``textRule``).
+_SECTION_RULE = "════════════ {label} ════════════"
+_SUBJECT_SEPARATOR = " / "
+#: ``Job.customer_name``'s placeholder default — an English phrase, so the French
+#: section greets without it (SkydiveOS's no-name ``Bonjour,``).
+_PLACEHOLDER_NAME = "Valued Skydiver"
+
+
+def gallery_email_content(
+    customer_name: str | None,
     gallery_url: str,
-    settings: Settings,
     *,
-    smtp_factory: Callable[[], smtplib.SMTP] | None = None,
-    link_expires: bool = True,
-) -> bool:
-    """Email the customer ONE gallery link (all videos + photos on one page).
+    link_expires: bool,
+    expiry_days: int,
+) -> tuple[str, str]:
+    """The pipeline's "your gallery is ready" email: ``(subject, plain-text body)``.
 
-    Same skip-not-fail contract as :func:`send_delivery_email`: returns False (with a
-    warning) when there's no ``customer_email`` / SMTP, so the caller can fall back to
-    the SkydiveOS hand-off. ``link_expires=False`` drops the "valid for N days" line —
-    the served ``/j/{code}`` link never expires.
+    ONE message, BOTH languages, **French first** then English — never the customer's
+    preference (the same rule as SkydiveOS's ``bilingualEmail.js``): subject
+    ``<FR> / <EN>``, body a ``FRANÇAIS`` section then an ``ENGLISH`` section. The
+    French reuses SkydiveOS's approved copy for the equivalent email
+    (``sendMediaGalleryDeliveryEmail`` / ``sendMediaDeliveryNotification`` /
+    ``sendCustomerInvitation``); the English is the pipeline's original text, unchanged.
     """
-    if not job.customer_email:
-        logger.warning("job %s has no customer_email — not emailing", job.job_id)
-        return False
-    if not settings.smtp_host:
-        logger.warning("SMTP_HOST not set — not emailing job %s", job.job_id)
-        return False
-    sender = settings.delivery_from_email or settings.smtp_user
-    if not sender:
-        logger.warning("no DELIVERY_FROM_EMAIL / SMTP_USER — not emailing job %s", job.job_id)
-        return False
+    name = (customer_name or "").strip()
+    has_name = bool(name) and name != _PLACEHOLDER_NAME
+    en_name = name or "there"
 
-    expiry_days = int(settings.delivery_link_ttl_days)
-    lines = [
-        f"Hi {job.customer_name},",
+    fr_lines = [
+        f"Bonjour {name}," if has_name else "Bonjour,",
+        "",
+        "Votre vidéo de saut est prête ! 🪂",
+        "",
+        "Visionnez, téléchargez et partagez votre saut :",
+        "",
+        f"  {gallery_url}",
+        "",
+        *([f"Ce lien expire dans {expiry_days} jours.", ""] if link_expires else []),
+        "Blue skies !",
+    ]
+    en_lines = [
+        f"Hi {en_name},",
         "",
         "Your skydive video is ready! 🪂",
         "",
@@ -352,11 +366,58 @@ def send_gallery_email(
         ),
         "Blue skies!",
     ]
+    fr_subject = (
+        f"Votre vidéo de saut est prête, {name} !" if has_name
+        else "Votre vidéo de saut est prête !"
+    )
+    en_subject = f"Your skydive video is ready, {en_name}!"
+    body = "\n\n\n".join(
+        f"{_SECTION_RULE.format(label=label)}\n\n" + "\n".join(lines)
+        for label, lines in (("FRANÇAIS", fr_lines), ("ENGLISH", en_lines))
+    )
+    return f"{fr_subject}{_SUBJECT_SEPARATOR}{en_subject}", body
+
+
+def send_gallery_email(
+    job: Job,
+    gallery_url: str,
+    settings: Settings,
+    *,
+    smtp_factory: Callable[[], smtplib.SMTP] | None = None,
+    link_expires: bool = True,
+) -> bool:
+    """Email the customer ONE gallery link (all videos + photos on one page).
+
+    Same skip-not-fail contract as :func:`send_delivery_email`: returns False (with a
+    warning) when there's no ``customer_email`` / SMTP, so the caller can fall back to
+    the SkydiveOS hand-off. ``link_expires=False`` drops the "valid for N days" line —
+    the served ``/j/{code}`` link never expires. Bilingual, French first
+    (:func:`gallery_email_content`).
+    """
+    if not job.customer_email:
+        logger.warning("job %s has no customer_email — not emailing", job.job_id)
+        return False
+    if not settings.smtp_host:
+        logger.warning("SMTP_HOST not set — not emailing job %s", job.job_id)
+        return False
+    sender = settings.delivery_from_email or settings.smtp_user
+    if not sender:
+        logger.warning("no DELIVERY_FROM_EMAIL / SMTP_USER — not emailing job %s", job.job_id)
+        return False
+
+    subject, body = gallery_email_content(
+        job.customer_name,
+        gallery_url,
+        link_expires=link_expires,
+        expiry_days=int(settings.delivery_link_ttl_days),
+    )
     msg = EmailMessage()
-    msg["Subject"] = f"Your skydive video is ready, {job.customer_name}!"
+    # Non-ASCII (é, à, 🪂): the default email policy RFC 2047-encodes the subject
+    # and sends the body as charset=utf-8.
+    msg["Subject"] = subject
     msg["From"] = sender
     msg["To"] = job.customer_email
-    msg.set_content("\n".join(lines))
+    msg.set_content(body, charset="utf-8")
 
     factory = smtp_factory or (
         lambda: smtplib.SMTP(settings.smtp_host or "", settings.smtp_port, timeout=30)
@@ -578,6 +639,14 @@ def deliver_to_customer(
     from . import gallery
     from .upsell import link_tiles
 
+    if job.gallery_revoked_at is not None:
+        # Staff withdrew this customer's /j/{code} link (POST /jobs/{id}/gallery/revoke):
+        # emailing it — or forwarding it for SkydiveOS to email/SMS — would hand out a
+        # page that answers 410. Refuse before any upload/send, with the way out.
+        raise RuntimeError(
+            f"job {job.job_id}: the customer gallery link is revoked — not sending it. "
+            "POST /jobs/{id}/gallery/restore and re-queue delivery to send it."
+        )
     if job.job_kind is JobKind.load_child:
         return _deliver_load_child(job, store, settings, smtp_factory=smtp_factory)
 

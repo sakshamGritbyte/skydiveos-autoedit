@@ -42,9 +42,11 @@ service install its own SIGTERM/SIGINT handlers.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import signal
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -52,8 +54,15 @@ from typing import Any
 from .events import EventEmitter
 from .qr import ClipIdentity  # light import — cv2 stays lazy inside the decode path
 from .registry import CameraRegistry
-from .retention import record_uploaded
+from .retention import (
+    clear_rejected,
+    confirmed,
+    confirmed_for,
+    record_rejected,
+    record_uploaded,
+)
 from .scanner import CameraScanner
+from .storage import camera_dir_of, camera_staging_root, day_dir_of
 
 logger = logging.getLogger(__name__)
 
@@ -225,8 +234,9 @@ def _capture_day(mp4_path: str | Path) -> str:
     collision this function exists to prevent.
     """
     path = Path(mp4_path)
-    if _STAGING_DAY_RE.match(path.parent.name):
-        return path.parent.name
+    day_dir = day_dir_of(path)  # the day folder, or its collision sibling's parent
+    if day_dir is not None and _STAGING_DAY_RE.match(day_dir.name):
+        return day_dir.name
     try:
         from datetime import datetime
 
@@ -335,6 +345,110 @@ def raw_object_key(
         key, existing, scoped,
     )
     return scoped
+
+
+#: ``(camera_id, filename, outcome, detail)`` — outcome is one of ``confirmed``,
+#: ``rejected`` (SkydiveOS 4xx, permanent), ``failed`` (gave up after every retry),
+#: ``retrying`` (transient).
+HandoffObserver = Callable[[str, str, str, str | None], None]
+
+
+def _ledger_dir(event: dict[str, Any]) -> Path:
+    """The camera staging dir a hand-off's ledger lives in.
+
+    Derived from the clip's path (``ingest.storage.camera_dir_of``), which is right for
+    both the plain ``{date}/CLIP`` layout and a collision sibling ``{date}/alt-…/CLIP``;
+    falls back to the pre-collision rule (one above ``jump_dir``) for an event that
+    does not sit in the staging tree (tests, a custom root).
+    """
+    mp4 = str((event.get("files") or {}).get("mp4") or "")
+    found = camera_dir_of(Path(mp4)) if mp4 else None
+    return found if found is not None else Path(event["jump_dir"]).parent
+
+
+def stranded_handoffs(
+    root: Path,
+    *,
+    max_age_days: float | None = 7.0,
+    now: Callable[[], float] = time.time,
+) -> list[dict[str, Any]]:
+    """Every staged clip under ``root`` whose hand-off never completed, as events.
+
+    The hand-off queue is in memory. Before this, a restart between a clip's staging
+    and its ledger record — mid-upload, mid-retry, or in the window between S3
+    accepting the file and the ledger write — lost the event for good: the next pull
+    saw the clip ``is_complete`` and emitted nothing, no job was ever created, and
+    the card could not clear (its ledger never confirmed the clip). Pulls are
+    idempotent, so the manifest written beside each staged clip is enough to rebuild
+    the event exactly; this walks every camera's staging tree and returns one event
+    per complete staging (file + manifest) that the camera's ledger does not confirm
+    for THAT recording (name + size). A previously rejected clip is included too — a
+    restart is an operator action, and SkydiveOS dedupes a re-notified key — and its
+    rejection stays on record until it is confirmed. Re-uploading is safe: the same
+    recording maps to the same S3 key, and the notify consumer dedupes on it.
+
+    Bounded on purpose: only staging days within ``max_age_days`` are considered
+    (``None`` = every day), so a box upgraded with months of staging on disk does not
+    re-upload history on its first restart; and a ledger record written before the
+    size field existed (``size: None``) counts as confirmed HERE — it is proof enough
+    that the clip was handed off once, even though it can never authorise a deletion.
+
+    Pure apart from reading the tree; never raises on a bad manifest (it is skipped
+    and logged).
+    """
+    from datetime import date as _date  # noqa: PLC0415 - keeps module imports light
+
+    staging = camera_staging_root(root)
+    if not staging.is_dir():
+        return []
+    cutoff: _date | None = None
+    if max_age_days is not None:
+        cutoff = _date.fromtimestamp(now() - max_age_days * 86400.0)
+    events: list[dict[str, Any]] = []
+    for camera_dir in sorted(p for p in staging.iterdir() if p.is_dir()):
+        try:
+            records = confirmed(camera_dir)
+        except Exception as e:  # noqa: BLE001 - a bad ledger must not hide the clips
+            logger.warning("could not read the ledger in %s: %r", camera_dir, e)
+            records = {}
+        for manifest_path in sorted(camera_dir.rglob("*.ingest.json")):
+            if cutoff is not None:
+                day_dir = day_dir_of(manifest_path)
+                try:
+                    too_old = day_dir is not None and _date.fromisoformat(day_dir.name) < cutoff
+                except ValueError:
+                    too_old = False
+                if too_old:
+                    continue
+            try:
+                manifest = json.loads(manifest_path.read_text())
+            except (OSError, ValueError) as e:
+                logger.warning("skipping unreadable manifest %s: %r", manifest_path, e)
+                continue
+            if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), dict):
+                continue
+            name = Path(str(manifest["files"].get("mp4") or "")).name
+            if not name:
+                continue
+            clip = manifest_path.with_name(name)  # the manifest's sibling, wherever staged
+            if not clip.is_file():
+                continue
+            size = _file_size(clip)
+            if confirmed_for(records, name, size) is not None:
+                continue
+            if any(r.filename == name and r.size is None for r in records.values()):
+                continue  # a pre-size-field record: handed off once, just unverifiable
+            event = {
+                k: v for k, v in manifest.items() if k not in (_HANDOFF_ATTEMPTS_KEY, "staged")
+            }
+            files = dict(event["files"])
+            files["mp4"] = str(clip)
+            event["files"] = files
+            event.setdefault("camera_id", camera_dir.name)
+            event.setdefault("jump_dir", str(clip.parent))
+            event["_reconciled"] = True
+            events.append(event)
+    return events
 
 
 def s3_notify_uploader(
@@ -578,12 +692,23 @@ class CameraDiscoveryService:
         identity_resolver: IdentityResolver | None = None,
         require_registered: bool = True,
         rescan_after_handoff: bool = False,
+        staging_root: Path | None = None,
+        handoff_observer: HandoffObserver | None = None,
+        reconcile_max_age_days: float | None = 7.0,
     ) -> None:
         self._scanner = scanner
         self._registry = registry
         self._upload = upload
         self._role_resolver = role_resolver
         self._identity_resolver = identity_resolver
+        #: The staging root to reconcile at start-up (``stranded_handoffs``): staged
+        #: clips the ledger does not confirm are re-queued, so a restart mid-upload
+        #: never strands footage. ``None`` (the default, and every test that predates
+        #: it) skips the reconciliation.
+        self._staging_root = staging_root
+        self._reconcile_max_age_days = reconcile_max_age_days
+        #: Per-clip hand-off verdicts for the operator banner (``ingest.cardstatus``).
+        self._handoff_observer = handoff_observer
         #: SD-card mode sets this False: a physically inserted card is an operator
         #: action (not a BLE stranger in range), and the QR + load match is the real
         #: gate — unmatchable footage is flagged downstream, never delivered.
@@ -629,7 +754,39 @@ class CameraDiscoveryService:
             asyncio.create_task(self._scan_loop(), name="discovery-scan"),
             asyncio.create_task(self._materialize_loop(), name="discovery-materialize"),
         ]
+        if self._staging_root is not None:
+            self._tasks.append(
+                asyncio.create_task(self._reconcile_on_start(), name="discovery-reconcile")
+            )
         logger.info("camera auto-discovery started (interval=%.0fs)", self._interval)
+
+    async def _reconcile_on_start(self) -> None:
+        """Re-queue every staged clip the ledger does not confirm (see
+        :func:`stranded_handoffs`). Never raises: a failed reconciliation costs a
+        recovery, not the service."""
+        try:
+            root = self._staging_root
+            assert root is not None
+            events = await asyncio.to_thread(
+                stranded_handoffs, root, max_age_days=self._reconcile_max_age_days
+            )
+        except Exception as e:  # noqa: BLE001 - start-up must not die on bookkeeping
+            logger.exception("start-up reconciliation of staged clips failed: %r", e)
+            return
+        if not events:
+            logger.info("start-up reconciliation: every staged clip is confirmed in S3")
+            return
+        logger.warning(
+            "start-up reconciliation: %d staged clip(s) are not confirmed in S3 — "
+            "re-queuing their hand-off (%s)",
+            len(events),
+            ", ".join(Path(e["files"]["mp4"]).name for e in events[:5])
+            + (" …" if len(events) > 5 else ""),
+        )
+        for event in events:
+            if self._stopping.is_set():
+                return
+            self._events.put_nowait(event)
 
     async def stop(self) -> None:
         """Stop both loops and any in-flight pull, then release the registry. Idempotent."""
@@ -747,7 +904,15 @@ class CameraDiscoveryService:
         """
         attempt = int(event.get(_HANDOFF_ATTEMPTS_KEY, 0)) + 1
         mp4 = event.get("files", {}).get("mp4", "<unknown>")
+        camera_id = str(event.get("camera_id") or "")
         if _is_permanent_handoff_error(error):
+            # Durable + visible: the rejection is written beside the camera's ledger
+            # (so a restart reports it instead of silently re-trying forever) and told
+            # to the operator banner, which must never read "done" over it.
+            record_rejected(
+                _ledger_dir(event), Path(mp4).name, size=_file_size(mp4), reason=repr(error)
+            )
+            self._observe_handoff(camera_id, mp4, "rejected", repr(error))
             # A 4xx is SkydiveOS rejecting the notification itself, not the network
             # being down: retrying re-sends the identical payload to the identical
             # endpoint and gets the identical answer. (Their consumer answers 404 for a
@@ -766,11 +931,13 @@ class CameraDiscoveryService:
         if attempt >= self._handoff_max_attempts:
             logger.exception(
                 "hand-off to SkydiveOS failed %d times, giving up on %s: %r. The file "
-                "is still staged locally; delete its jump folder under raw-storage and "
-                "bring the camera back in range to re-pull and retry.",
+                "is still staged locally and will be retried at the next service "
+                "restart (start-up reconciliation), or sooner by re-inserting the card.",
                 attempt, mp4, error,
             )
+            self._observe_handoff(camera_id, mp4, "failed", repr(error))
             return
+        self._observe_handoff(camera_id, mp4, "retrying", repr(error))
         event[_HANDOFF_ATTEMPTS_KEY] = attempt
         delay = min(self._handoff_retry_delay * 2 ** (attempt - 1), _HANDOFF_MAX_DELAY)
         logger.warning(
@@ -835,7 +1002,7 @@ class CameraDiscoveryService:
                     marker_key = self._upload(mp4, camera_id, None, None, marker=True)
                     if marker_key:
                         record_uploaded(
-                            Path(event["jump_dir"]).parent,
+                            _ledger_dir(event),
                             Path(mp4).name,
                             marker_key,
                             size=_file_size(mp4),
@@ -881,16 +1048,27 @@ class CameraDiscoveryService:
         # Recording that fact is what authorises the NEXT pull to free the card
         # (ingest.retention); until then the file stays on the card.
         if s3_key:
-            # jump_dir is <root>/_camera-staging/<camera_id>/<date>; the ledger belongs
-            # one level up, per camera, so it outlives any single day's folder. The SIZE
-            # is what makes the record an identity: without it a reused GoPro filename
-            # could authorise deleting a different clip off the card (ingest.retention).
-            record_uploaded(
-                Path(event["jump_dir"]).parent,
-                Path(mp4).name,
-                s3_key,
-                size=_file_size(mp4),
-            )
+            # The ledger lives in the camera's staging dir (one level above the day
+            # folder — or two above a collision sibling), so it outlives any single
+            # day's folder. The SIZE is what makes the record an identity: without it a
+            # reused GoPro filename could authorise deleting a different clip off the
+            # card (ingest.retention).
+            size = _file_size(mp4)
+            ledger_dir = _ledger_dir(event)
+            record_uploaded(ledger_dir, Path(mp4).name, s3_key, size=size)
+            clear_rejected(ledger_dir, Path(mp4).name, size=size)
+            self._observe_handoff(camera_id, mp4, "confirmed", s3_key)
+
+    def _observe_handoff(
+        self, camera_id: str, mp4: str, outcome: str, detail: str | None
+    ) -> None:
+        """Tell the banner (if any) what became of a clip's hand-off. Never raises."""
+        if self._handoff_observer is None:
+            return
+        try:
+            self._handoff_observer(camera_id, Path(mp4).name, outcome, detail)
+        except Exception as e:  # noqa: BLE001 - the banner is cosmetic, the hand-off is not
+            logger.warning("hand-off observer failed (ignored): %r", e)
 
     # --- helpers ----------------------------------------------------------- #
 

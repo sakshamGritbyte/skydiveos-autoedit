@@ -464,6 +464,17 @@ Two runtime media roots, with different audiences:
   credential). Adds `og:title/description/type/url` — no `og:image` yet (posters are
   per-token URLs; a public preview image needs its own decision). The legacy S3 page
   passes no `share_url` and is byte-identical. Tests: `test_gallery_share.py`.
+- **A gallery link can be REVOKED** (`Job.gallery_revoked_at`, default `None` so every
+  older `job.json` loads unchanged). `POST /jobs/{id}/gallery/revoke` / `…/restore` —
+  service token + admin, like `/unlock`; idempotent; never rotates the code and never
+  touches `status`/`entitlement`/purchases. While set, EVERY `/j/{code}…` route answers a
+  plain `410 Gone` (`Cache-Control: no-store`) from the one resolver they all share
+  (`_job_by_token`) — no bytes, no poster, no ZIP, no S3/CDN redirect; restore revives the
+  same URL. `JobResponse.gallery_revoked` exposes it read-only; `deliver_to_customer`
+  refuses (job `failed`, actionable error) rather than email a revoked link, and the status
+  callback withholds `gallery_url` so SkydiveOS cannot email/SMS it. Already-issued CDN
+  signed URLs / presigned delivery links and a viewer's browser cache are NOT recalled —
+  they lapse on their own TTL. Tests: `test_gallery_revoke.py`.
 - **The filmed intro/outro BOOKENDS play whole, without music** (Bug 441, client rule).
   `edl.validate.bookend_ranges(manifest[, manifest_by_camera, multicam])` = the FIRST
   source file of `intro_interview` (`[0, file_offsets[1])`, whole scene when one file) and
@@ -499,6 +510,43 @@ Two runtime media roots, with different audiences:
   purpose (< 1 min cannot hold a 40–80 s freefall). No exit/deploy anchors → untouched.
   Like bookends, an already-composed EDL keeps its old cut until RE-PROCESSED (replay does
   not re-validate). Tests: `tests/test_freefall_uncut.py`.
+  **`deploy_offset: 0.0` is the detector's "not found" sentinel, never an anchor**
+  (`edl.validate._deploy_detected`, 2026-10-24). `detect_deploy_offset` returns `0.0`
+  when no opening shock qualifies — on a real External job the camera-flyer stopped
+  recording as he opened, the shock peaked at 1.54 g under the 1.6 g threshold, and the
+  validator read the `0.0` as a real deployment: the aerial window became `[exit, 0 + 3]`,
+  every freefall clip was clamped away, and the customer's freefall video was the forced
+  2 s deploy beat at offset 0 (a 5 s file; `full_video` showed 2 s of the jump). So a deploy
+  that is `0.0` or not after the exit is **undetected**: the window runs to the END of the
+  freefall scene (the whole freefall that was filmed plays — compose already did
+  `deploy_offset or duration`), no deploy beat is forced (there is no opening to feature),
+  and the repair log says `deployment not detected`. The manifest keeps the honest `0.0`.
+- **The full video keeps the arrival at the aircraft door** (`edl.validate._require_door_arrival`,
+  2026-10-24, `full_video` only). The interview is the FIRST `intro_interview` file (the
+  bookend); any later file in that scene is what was filmed between the interview and
+  boarding — the walk across the apron — and its last seconds are the customer reaching
+  the plane. The house cut trims every scene to its HEAD (proportional 210 s budget), so a
+  real External job kept 2.6 s of a 22 s walk-out and never showed the door. The rule only
+  ADDS: the last `_DOOR_ARRIVAL_S` (6 s) of that file at 1x, inserted chronologically
+  (after the kept intro, before boarding), starting past anything already shown so no second
+  replays. No-op for a single-file intro, a trailing fragment < 8 s, a tail already in the
+  cut, a card with no boarding/freefall after the intro, and for `highlights` (which keep
+  their 3 s aircraft-entry beat from `_require_intro`). Multicam: instructor camera first.
+- **A staff re-edit gets these rules as seconds** (`edl/protected.py`, pure; served by
+  `GET /jobs/{id}/deliverables/{name}/protected-ranges` via `api/protected_ranges.py`).
+  SkydiveOS edits the RENDERED file, so the bookend and uncut-freefall rules are handed
+  over in its output time (clip `src_len/speed` summed, per-clip frame rounding, after
+  `exclude.json` + the playable clamp): `{"deliverable", "duration", "ranges": [{"kind":
+  "intro_bookend"|"outro_bookend", "start", "end", "music": false, "music_until"} |
+  {"kind": "freefall", "start", "end", "head_trimmable_until"?}], "reason"?}`. Bookends
+  for `full_video` only; freefall for `CONTINUOUS_FREEFALL_DELIVERABLES` (the Ultimate
+  combo's alternating run is ONE span); `head_trimmable_until` = the exit's output time,
+  freefall-only cuts; `highlights` → `[]`. Not derivable (no EDL, a bookend not held
+  whole, no anchors) → no range + `reason`, and SkydiveOS enforces nothing. SkydiveOS
+  enforces at export and before `/deliverables/{name}/replace`, which still receives
+  bytes and checks none of this (its body stays `extra="forbid"`). `POST /jobs/{id}/tweak`
+  answers 409 for a scene-pipeline job (it would persist an unvalidated EDL and fail the
+  job); the legacy single-master job keeps it.
 - **The freefall cut's exit lands on the music's beat drop** (client rule, 2026-10-22:
   "never cut up in the middle; it may only be shortened at the beginning, so that the
   moment of exit lines up with the beat drop"). Applies to the freefall-ONLY cuts
@@ -705,7 +753,7 @@ Two runtime media roots, with different audiences:
 - `pytest tests/ -v` — run all pipeline tests
 - `python scripts/process_jump.py <path/to/raw.mp4>` — end-to-end on a sample file (timeline → house-cut EDL → render `jobs/{id}/final.mp4`)
 - `python -m render <source.mp4> --job-id <id> --customer "<name>"` — render an EDL (the job's saved `edl.json`, or `--edl <path>`) to `jobs/{id}/final.mp4` at 1080p/h264/30fps; intro/outro from `/templates`, music via `--music <name>`, caption font override with `$RENDER_FONT`
-- `python scripts/replay_edl.py <job_id>` — re-render from a saved EDL
+- `python scripts/replay_selfie.py <job_id>` — re-render a scene-pipeline job from its saved (possibly hand-edited) `edl_*.json` files
 - `python scripts/archive_job.py --all [--dry-run]` / `<job_id>...` — (re)file jobs into the
   browsable jump archive `raw-storage/{date}/{instructor}/{customer}/`. The pipeline does this
   automatically; this is the catch-up tool for jobs that predate the archive, jobs whose archive
@@ -881,6 +929,40 @@ Two runtime media roots, with different audiences:
   — and is cleared only when footage is re-attached to a `failed`/`rejected` job, which
   is a genuine retry. `POST /jobs/{id}/upload` also accepts **repeated `s3_key` fields**
   so a caller that already knows the whole clip set attaches it in one call.
+- **A filename is not a clip's identity in STAGING either** (2026-10-24, the audit's P0).
+  GoPro numbering restarts at `GX010001.MP4` on a formatted card, so two cards cycled through
+  ONE camera on ONE day offer two different recordings for the same
+  `_camera-staging/<camera_id>/<date>/GX010001.MP4`; the pull used to skip the second as
+  "already staged" and it was never uploaded, matched or delivered. `ingest.storage.is_complete`
+  now checks the staged file IS the listed clip (size + creation time) and
+  `resolve_destination` files a different recording into the collision sibling
+  `<date>/alt-<size>-<epoch>/GX010001.MP4` (GoPro filename kept; `day_dir_of` /
+  `camera_dir_of` walk back up). The retention ledger holds ONE RECORD PER RECORDING
+  (`NAME#SIZE` keys for a second recording of a name; readers match name + size via
+  `confirmed_for`), so neither card's confirmation can erase the other's, and the
+  `safe to remove` answer sees the second card as owed until ITS upload is confirmed. The
+  manifest records `staged.size` / `camera_path` / `collision` and the pull's `source`
+  (card serial) for provenance. Tests: `tests/test_staging_collision.py`.
+- **Hand-offs survive a restart** (`ingest.discovery.stranded_handoffs`, 2026-10-24). The
+  upload/notify queue is in memory; a restart between staging and the ledger write used to
+  strand the clip for good (the next pull saw it complete and emitted nothing). At start the
+  service walks `_camera-staging/*/<day>/**/*.ingest.json` and re-queues every staged clip
+  the ledger does not confirm for THAT recording — bounded to the last
+  `HANDOFF_RECONCILE_MAX_AGE_DAYS` (7) and treating a pre-size-field ledger row as "handed
+  off once"; `HANDOFF_RECONCILE_ON_START=0` is the rollback switch. Safe to re-run: the same
+  recording maps to the same S3 key and SkydiveOS dedupes the notify on it. A permanent
+  (4xx) rejection is recorded in `<camera dir>/.rejected.json` (informational — nothing
+  deletes on it) and cleared on a later success. Tests: `tests/test_handoff_recovery.py`.
+- **The card banner never reads "done" over a refused or unverified clip.** Discovery reports
+  each clip's verdict to the registry (`handoff_observer` → `CardStatusRegistry.handoff_result`:
+  confirmed / rejected / failed / retrying), and the end-of-pull check
+  (`api.app._report_card_state`) now passes through `verifying` and ends in
+  `needs_attention` — not green — when what the card still holds is exactly the refused/failed
+  clips, or when its contents could not be read (a card that is simply gone is still
+  released). `uploading` carries the breakdown (`unconfirmed_files`, `awaiting_sweep_files`,
+  `uploaded_files`, `rejected_files`, `failed_files`, `issues`). SkydiveOS's banner maps the
+  two new states; an older consumer falls back to its "Card detected — preparing…" line,
+  never to green. `CARD_SAFE_REQUIRES_UPLOAD=0` still restores the old unconditional banner.
 - **Card retention** (`ingest/retention.py`): a dropzone card holds ~30 Ultimate jumps, so
   at 4–5 jumps/day it fills within a week — and a full card *silently stops recording*
   mid-day. So a pull can clear the card, under one rule: **a file is deletable only once
@@ -1177,6 +1259,11 @@ Two runtime media roots, with different audiences:
   `job.json` is read-modify-write and cannot) plus `Job.email_sent_at` written after a
   successful send. A failed or unconfigured send **releases** the claim so a retry can
   still deliver
+- Don't send the pipeline's gallery email in one language: `send_gallery_email`
+  (`api.delivery.gallery_email_content`) is ONE message, **French first** then English
+  (`FRANÇAIS` / `ENGLISH` sections, subject `<FR> / <EN>`), never reordered by the
+  customer's preference — the SkydiveOS bilingual rule. Reuse SkydiveOS's approved
+  French (`sendMediaGalleryDeliveryEmail`); never invent new French copy here
 - Don't file a camera pull directly into the archive — a pull knows only the camera and
   the timestamp, not the booking, so it stages into `raw-storage/_camera-staging/` and is
   mirrored into the jump folder once a job identifies whose jump it is. The dropzone Mac
@@ -1184,6 +1271,10 @@ Two runtime media roots, with different audiences:
   **syncing it down from wherever the pipeline ran** (`deploy/mac/sync-archive.sh`,
   rsync pull, `raw/` excluded because the Mac already holds those masters)
 - Don't mine a "deployment" beat from the `canopy`/`landing` scene — it's positionally unreliable; the deploy beat comes from the freefall scene at `deploy_offset`
+- Don't treat a manifest `deploy_offset` of `0.0` (or one at/before the exit) as a time — it
+  is `detect_deploy_offset`'s "no opening found". Go through `edl.validate._ff_anchors` /
+  `_deploy_detected`, which substitute the scene end; reading it raw is what collapsed a
+  customer's freefall to the first 3 s of the aircraft
 - Don't let a locked (`preview_only`) job's clean master become reachable: the
   entitlement picks the file, never the request. No "preview" URL parameter, no
   client-side gating, no `?s=` value that unlocks, and the clean bytes are never put

@@ -33,6 +33,19 @@ never uploaded (``AUDIT_MEDIA_MATCH_ISOLATION.md`` §3-F). So every record also 
 match it. Records written before that field existed carry ``size: None`` and are treated as
 **unverifiable — never deletable**: this module's whole premise is that deletion needs
 positive proof, and "some file with this name was uploaded once" is not it.
+
+Because of that, the ledger can hold **several records for one filename** — one per
+distinct recording. The first confirmation of a name is written under the bare name (the
+layout every existing ledger already has); a confirmation of a *different* recording with
+the same name is written under ``NAME#SIZE`` instead of overwriting the first, so clearing
+card 2's ``GX010001.MP4`` can never erase the proof that card 1's was uploaded (and vice
+versa). Readers (:func:`confirmed`, :func:`deletable`, :func:`card_transfer`) match a
+card file against *every* record of its name and accept the one whose size agrees.
+
+The same folder also holds a **rejection ledger** (``.rejected.json``): clips SkydiveOS
+refused with a permanent (4xx) answer. Nothing deletes on it — it exists so the operator
+banner can say *why* a card still owes something, and so a restart knows which staged
+clips were refused rather than merely not yet uploaded.
 """
 
 from __future__ import annotations
@@ -49,6 +62,10 @@ logger = logging.getLogger(__name__)
 
 #: Ledger filename inside the camera's staging directory.
 LEDGER_NAME = ".transferred.json"
+#: Permanent hand-off rejections (SkydiveOS 4xx), beside the ledger. Informational only.
+REJECTED_NAME = ".rejected.json"
+#: Key separator for a second recording of an already-recorded filename.
+_KEY_SEP = "#"
 
 
 @dataclass(frozen=True)
@@ -82,6 +99,22 @@ def ledger_path(staging_dir: Path) -> Path:
     return staging_dir / LEDGER_NAME
 
 
+def rejected_path(staging_dir: Path) -> Path:
+    """Where the camera's hand-off rejection ledger lives."""
+    return staging_dir / REJECTED_NAME
+
+
+def _record_key(filename: str, size: int | None) -> str:
+    return f"{filename}{_KEY_SEP}{size}" if size is not None else filename
+
+
+def _filename_of(key: str, row: Mapping[str, Any]) -> str:
+    name = row.get("filename")
+    if isinstance(name, str) and name:
+        return name
+    return key.split(_KEY_SEP, 1)[0]
+
+
 def _read(path: Path) -> dict[str, dict[str, Any]]:
     try:
         data = json.loads(path.read_text())
@@ -113,7 +146,23 @@ def record_uploaded(
         staging_dir.mkdir(parents=True, exist_ok=True)
         path = ledger_path(staging_dir)
         entries = _read(path)
-        entries[filename] = {
+        # One record per RECORDING, not per name: the first confirmation of a name
+        # keeps the bare key (the layout every existing ledger has); a confirmation of
+        # the same name but a different size — a second card's reused GoPro filename —
+        # gets its own `NAME#SIZE` key instead of overwriting the first. A re-upload of
+        # the same recording (same size) updates its own record in place.
+        key = filename
+        for existing_key, row in entries.items():
+            if not isinstance(row, dict) or _filename_of(existing_key, row) != filename:
+                continue
+            existing_size = row.get("size")
+            if existing_size == size:
+                key = existing_key
+                break
+            if existing_key == filename:
+                key = _record_key(filename, size)
+        entries[key] = {
+            "filename": filename,
             "s3_key": s3_key,
             "at": now if now is not None else time.time(),
             "size": size,
@@ -123,23 +172,121 @@ def record_uploaded(
         logger.warning("could not record %s as uploaded: %r", filename, e)
 
 
+def record_rejected(
+    staging_dir: Path,
+    filename: str,
+    *,
+    size: int | None,
+    reason: str,
+    now: float | None = None,
+) -> None:
+    """Note that SkydiveOS permanently refused ``filename``'s hand-off (a 4xx).
+
+    Informational: nothing is ever deleted on this record. It lets the operator banner
+    distinguish "still uploading" from "refused — fix the cause", and survives a restart
+    so the startup reconciliation can report the clip rather than silently retry it
+    forever. Never raises.
+    """
+    try:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        path = rejected_path(staging_dir)
+        entries = _read(path)
+        entries[_record_key(filename, size)] = {
+            "filename": filename,
+            "size": size,
+            "reason": reason[:500],
+            "at": now if now is not None else time.time(),
+        }
+        path.write_text(json.dumps(entries, indent=2, sort_keys=True) + "\n")
+    except OSError as e:  # noqa: BLE001 - never break a hand-off over bookkeeping
+        logger.warning("could not record %s as rejected: %r", filename, e)
+
+
+def clear_rejected(staging_dir: Path, filename: str, *, size: int | None) -> None:
+    """Forget a rejection (the clip was later handed off successfully). Never raises."""
+    try:
+        path = rejected_path(staging_dir)
+        entries = _read(path)
+        key = _record_key(filename, size)
+        if key in entries:
+            del entries[key]
+            path.write_text(json.dumps(entries, indent=2, sort_keys=True) + "\n")
+    except OSError as e:  # noqa: BLE001
+        logger.warning("could not clear rejection of %s: %r", filename, e)
+
+
+@dataclass(frozen=True)
+class RejectedRecord:
+    """One clip SkydiveOS refused permanently."""
+
+    filename: str
+    size: int | None
+    reason: str
+    at: float
+
+
+def rejected(staging_dir: Path) -> list[RejectedRecord]:
+    """Every permanently refused hand-off recorded for this camera."""
+    out: list[RejectedRecord] = []
+    for key, row in _read(rejected_path(staging_dir)).items():
+        if not isinstance(row, dict):
+            continue
+        raw_size = row.get("size")
+        at = row.get("at")
+        out.append(
+            RejectedRecord(
+                filename=_filename_of(key, row),
+                size=int(raw_size) if isinstance(raw_size, int | float) else None,
+                reason=str(row.get("reason") or ""),
+                at=float(at) if isinstance(at, int | float) else 0.0,
+            )
+        )
+    return out
+
+
+def is_rejected(records: Iterable[RejectedRecord], filename: str, size: int | None) -> bool:
+    """Whether a card file (name + size) has a matching rejection record."""
+    return any(r.filename == filename and (r.size is None or r.size == size) for r in records)
+
+
 def confirmed(staging_dir: Path) -> dict[str, TransferRecord]:
-    """Every file this camera has confirmed into S3, keyed by on-card filename."""
+    """Every recording this camera has confirmed into S3, keyed by ledger key.
+
+    The key is the on-card filename for the first recording of that name and
+    ``NAME#SIZE`` for a later, different recording of the same name (see the module
+    docstring); ``TransferRecord.filename`` is always the bare on-card name. Use
+    :func:`confirmed_for` to find the record that covers a specific card file.
+    """
     out: dict[str, TransferRecord] = {}
-    for name, row in _read(ledger_path(staging_dir)).items():
+    for ledger_key, row in _read(ledger_path(staging_dir)).items():
         if not isinstance(row, dict):
             continue
         key = row.get("s3_key")
         at = row.get("at")
         raw_size = row.get("size")
         if isinstance(key, str) and isinstance(at, int | float):
-            out[name] = TransferRecord(
-                filename=name,
+            out[ledger_key] = TransferRecord(
+                filename=_filename_of(ledger_key, row),
                 s3_key=key,
                 at=float(at),
                 size=int(raw_size) if isinstance(raw_size, int | float) else None,
             )
     return out
+
+
+def confirmed_for(
+    records: Mapping[str, TransferRecord], filename: str, size: int | None
+) -> TransferRecord | None:
+    """The record proving THIS card file (name + size) is in S3, or ``None``.
+
+    Several records may share a filename (one per recording); only the one whose size
+    matches the file now on the card counts, so a stale record for a different
+    recording of the same name never answers for it.
+    """
+    for rec in records.values():
+        if rec.filename == filename and rec.matches(size):
+            return rec
+    return None
 
 
 def deletable(
@@ -172,15 +319,18 @@ def deletable(
         dict(on_card) if isinstance(on_card, Mapping) else {name: None for name in on_card}
     )
     ready: list[TransferRecord] = []
-    for name, rec in records.items():
-        if name not in sizes or (stamp - rec.at) < min_age_s:
+    for name, size in sizes.items():
+        rec = confirmed_for(records, name, size)
+        if rec is None:
+            others = [r for r in records.values() if r.filename == name]
+            for other in others:
+                logger.warning(
+                    "keeping %s: the ledger confirmed a %s-byte file but the card holds %s "
+                    "bytes — a reused GoPro filename, not the footage %s covers",
+                    name, other.size, size, other.s3_key,
+                )
             continue
-        if not rec.matches(sizes[name]):
-            logger.warning(
-                "keeping %s: the ledger confirmed a %s-byte file but the card holds %s "
-                "bytes — a reused GoPro filename, not the footage %s covers",
-                name, rec.size, sizes[name], rec.s3_key,
-            )
+        if (stamp - rec.at) < min_age_s:
             continue
         ready.append(rec)
     return sorted(ready, key=lambda r: r.at)
@@ -255,8 +405,8 @@ def card_transfer(
     settled_names: list[str] = []
     missing: list[str] = []
     for name, size in on_card.items():
-        rec = records.get(name)
-        (settled_names if rec is not None and rec.matches(size) else missing).append(name)
+        rec = confirmed_for(records, name, size)
+        (settled_names if rec is not None else missing).append(name)
     awaiting: tuple[str, ...] = ()
     if cleanup and not dry_run:
         awaiting = tuple(

@@ -806,7 +806,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"email      : {args.email or '(none — links only)'}")
 
     try:
-        health = httpx.get(f"{api}/jobs", timeout=10.0)
+        # The same service token the audit client below sends: on a gated deployment
+        # (AUTO_EDIT_API_KEY set) an unauthenticated probe is a 401, not "unreachable".
+        health = httpx.get(f"{api}/jobs", timeout=10.0, headers=_auth_headers())
         health.raise_for_status()
     except Exception as exc:  # noqa: BLE001
         raise SystemExit(f"error: API not reachable at {api} ({exc})") from exc

@@ -291,6 +291,13 @@ class Settings:
     #: then routinely pulled the card before the sweep could free it, so cleanup
     #: never ran and the card filled up anyway. See :mod:`ingest.cardstatus`.
     card_safe_requires_upload: bool = True
+    #: At start-up, re-queue staged clips the retention ledger does not confirm (a
+    #: restart mid-upload used to strand them forever). ``HANDOFF_RECONCILE_ON_START=0``
+    #: restores the pre-fix behaviour wholesale (the rollback switch); the look-back
+    #: bounds it to recent staging days so a box with years of staging does not
+    #: re-upload history on its first restart after the upgrade.
+    handoff_reconcile_on_start: bool = True
+    handoff_reconcile_max_age_days: float = 7.0
     #: Give every gallery video card a poster frame lifted from that deliverable
     #: (``GALLERY_THUMBNAILS``, on by default — see :mod:`api.thumbnail`). Off falls
     #: back to the browser's own placeholder tile, which is where the cards were
@@ -395,6 +402,10 @@ def get_settings() -> Settings:
         ),
         delete_after_transfer_dry_run=_flag("DELETE_AFTER_TRANSFER_DRY_RUN"),
         card_safe_requires_upload=_flag("CARD_SAFE_REQUIRES_UPLOAD", default=True),
+        handoff_reconcile_on_start=_flag("HANDOFF_RECONCILE_ON_START", default=True),
+        handoff_reconcile_max_age_days=float(
+            os.environ.get("HANDOFF_RECONCILE_MAX_AGE_DAYS") or 7.0
+        ),
         discovery_fake_cameras=tuple(
             c.strip()
             for c in (os.environ.get("DISCOVERY_FAKE_CAMERAS") or "").split(",")

@@ -56,6 +56,7 @@ from fastapi.responses import (
     FileResponse,
     HTMLResponse,
     JSONResponse,
+    PlainTextResponse,
     RedirectResponse,
     Response,
     StreamingResponse,
@@ -295,6 +296,17 @@ MEDIA_CACHE_OWNED = "private, max-age=86400"
 #: route's rule, is long enough to spare a re-fetch while scrubbing and short enough that
 #: an unlock appears immediately.
 MEDIA_CACHE_LOCKED = "private, max-age=60"
+
+#: Body of the 410 every ``/j/{code}…`` route answers once staff revoked the gallery.
+GALLERY_REVOKED_MESSAGE = "This gallery link has been withdrawn. Please contact the dropzone."
+
+
+class _GalleryRevoked(Exception):
+    """Raised by the gallery-code resolver for a revoked link → plain-text 410.
+
+    ``no-store``: a 410 is heuristically cacheable, and a cached one would outlive a
+    ``POST /jobs/{id}/gallery/restore``.
+    """
 
 
 #: Gallery upsell items ``POST /jobs/{id}/unlock`` can record besides the paywall
@@ -669,12 +681,21 @@ async def _report_card_state(
     if not settings.card_safe_requires_upload:
         card_status.safe_to_remove(camera_id)
         return
+    from ingest.camera import CameraError
     from ingest.retention import card_transfer
     from ingest.sdcard import SdCardCamera, mount_for
     from ingest.storage import camera_dir, storage_root
 
+    card_status.verifying(camera_id)
     try:
         mount = mount_for(camera_id, settings.sdcard_mount_roots)
+    except CameraError as e:
+        # The card is already out of the reader: nothing is left to hold here, and the
+        # next scan tick drops the row. (The staged clips finish uploading without it.)
+        logger.warning("card %s is no longer mounted (%r); nothing to verify", camera_id, e)
+        card_status.safe_to_remove(camera_id)
+        return
+    try:
         on_card = {m.filename: m.size for m in await SdCardCamera(mount).list_videos()}
         state = card_transfer(
             camera_dir(storage_root(), camera_id),
@@ -684,21 +705,48 @@ async def _report_card_state(
             dry_run=settings.delete_after_transfer_dry_run,
         )
     except Exception as e:  # noqa: BLE001 - the pull succeeded; only the banner is at risk
-        logger.warning(
-            "could not check what card %s still owes (%r); reporting it safe to remove",
-            camera_id, e,
+        # Unverified is not "done": a green banner over a card whose contents could not
+        # be read invites the operator to walk off with the only copy. Say so instead.
+        logger.warning("could not check what card %s still owes (%r)", camera_id, e)
+        card_status.needs_attention(
+            camera_id,
+            f"could not verify the card's contents ({e!r}); leave it in and check the log",
+            0,
         )
-        card_status.safe_to_remove(camera_id)
         return
     if state.settled:
         card_status.safe_to_remove(camera_id)
+        return
+    # Clips SkydiveOS refused (or that gave up after every retry) will never confirm on
+    # their own: when they are ALL that is left, the card is not "uploading" — it needs
+    # a human. Otherwise it is still uploading, with the breakdown the banner can show.
+    issues = card_status.issue_files(camera_id)
+    pending = list(state.pending)
+    stuck = [name for name in pending if name in issues]
+    if stuck and len(stuck) == len(pending):
+        logger.warning(
+            "card %s: %d clip(s) stay on the card because their hand-off was refused or "
+            "failed: %s — fix the cause (pair the card, manifest the load) and re-insert",
+            camera_id, len(stuck), ", ".join(stuck),
+        )
+        card_status.needs_attention(
+            camera_id,
+            f"{len(stuck)} clip(s) could not be handed off and stay on the card: "
+            + ", ".join(stuck),
+            len(pending),
+        )
         return
     logger.info(
         "card %s staged but not settled: %d clip(s) pending (%d not in S3, %d awaiting "
         "the cleanup sweep) — leave the card in",
         camera_id, len(state.pending), len(state.unconfirmed), len(state.awaiting_sweep),
     )
-    card_status.uploading(camera_id, len(state.pending))
+    card_status.uploading(
+        camera_id,
+        len(state.pending),
+        unconfirmed=len(state.unconfirmed),
+        awaiting_sweep=len(state.awaiting_sweep),
+    )
 
 
 def _build_pull(
@@ -903,6 +951,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 s3_notify_uploader,
             )
             from ingest.qr import qr_identity_resolver
+            from ingest.storage import storage_root as _storage_root
 
             # SD-card mode: an operator is physically waiting at the reader, so the
             # pull's progress is tracked and served (GET /ingest/cards) to tell them
@@ -959,6 +1008,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 ),
                 pull=_build_pull(settings, card_status),
                 interval=settings.discovery_interval,
+                # A restart mid-upload must not strand staged clips: at start the
+                # staging tree is reconciled against each camera's ledger and every
+                # unconfirmed clip is re-queued (ingest.discovery.stranded_handoffs).
+                staging_root=(
+                    _storage_root() if settings.handoff_reconcile_on_start else None
+                ),
+                reconcile_max_age_days=settings.handoff_reconcile_max_age_days,
+                # Per-clip hand-off verdicts feed the operator banner, so a refused
+                # clip reads "needs attention", never "uploading" forever.
+                handoff_observer=(card_status.handoff_result if card_status else None),
                 # In sdcard mode the QR identity resolver subsumes role resolution
                 # (it fills the load-derived role per clip), so the plain role
                 # resolver stays off — wiring both would resolve every clip twice.
@@ -1060,6 +1119,13 @@ def create_app() -> FastAPI:
         #     with a {job_id} (no-op when ENFORCE_INSTRUCTOR_AUTH is off).
         dependencies=[Depends(enforce_job_ownership)],
     )
+
+    @app.exception_handler(_GalleryRevoked)
+    async def _gallery_revoked_handler(request: Request, exc: _GalleryRevoked) -> Response:
+        # Short plain text, no media, no redirect, never the code.
+        return PlainTextResponse(
+            GALLERY_REVOKED_MESSAGE, status_code=410, headers={"Cache-Control": "no-store"}
+        )
 
     # One limiter per app instance, so a test client's counters are its own.
     gallery_limiter = FixedWindowLimiter(get_settings().gallery_rate_limit_per_min)
@@ -1777,6 +1843,51 @@ def create_app() -> FastAPI:
         return JobResponse.from_job(updated)
 
     @app.post(
+        "/jobs/{job_id}/gallery/revoke",
+        response_model=JobResponse,
+        tags=["jobs"],
+        summary="Revoke the customer gallery link (/j/{code} → 410 Gone)",
+    )
+    def revoke_gallery(job_id: JobId, store: StoreDep, principal: AdminDep) -> JobResponse:
+        """Withdraw the customer's ``/j/{code}`` link: every gallery route answers 410.
+
+        Gated like ``/unlock`` — the service-token middleware plus the **admin** role.
+        Idempotent (an already revoked job keeps its original timestamp). Deliberately
+        narrow: the code is NOT rotated (issuing a new link is a client decision), and
+        ``status`` / ``entitlement`` / purchases are untouched, so a restore brings the
+        same URL back exactly as it was. Delivery refuses to send a revoked link.
+        """
+        job = _load_or_404(store, job_id)
+        if job.gallery_revoked_at is not None:
+            return JobResponse.from_job(job)
+        updated = store.update(job_id, gallery_revoked_at=time.time())
+        # Never log the code itself — the job id identifies the link.
+        logger.info(
+            "job %s gallery link revoked by=%s", job_id, principal.instructor_id or "service"
+        )
+        return JobResponse.from_job(updated)
+
+    @app.post(
+        "/jobs/{job_id}/gallery/restore",
+        response_model=JobResponse,
+        tags=["jobs"],
+        summary="Restore a revoked customer gallery link",
+    )
+    def restore_gallery(job_id: JobId, store: StoreDep, principal: AdminDep) -> JobResponse:
+        """Undo :func:`revoke_gallery` — the same ``/j/{code}`` URL serves again.
+
+        Same gates, idempotent (a live link is returned unchanged).
+        """
+        job = _load_or_404(store, job_id)
+        if job.gallery_revoked_at is None:
+            return JobResponse.from_job(job)
+        updated = store.update(job_id, gallery_revoked_at=None)
+        logger.info(
+            "job %s gallery link restored by=%s", job_id, principal.instructor_id or "service"
+        )
+        return JobResponse.from_job(updated)
+
+    @app.post(
         "/jobs/{job_id}/reject",
         response_model=JobResponse,
         tags=["review"],
@@ -1818,6 +1929,28 @@ def create_app() -> FastAPI:
             raise HTTPException(
                 status_code=409,
                 detail=f"can only tweak a job that has been rendered (is {job.status.value})",
+            )
+        # Every booked package renders through the scene pipeline (several deliverables,
+        # one EDL each, repaired by edl.validate before persisting). /tweak re-renders
+        # the LEGACY single-master edl.json via rerender_job, which can neither render
+        # nor validate those cuts: it persisted the EDL unvalidated and then failed the
+        # job. ``Package.uses_scene_pipeline`` is true for every package (including the
+        # default), so the job's own artifacts decide: scene-pipeline outputs or scene
+        # manifests (or a load child, which owns no footage at all). A legacy camera-pull
+        # job — final.mp4, no outputs map — keeps the behaviour below.
+        if (
+            job.outputs
+            or job.job_kind is JobKind.load_child
+            or any(store.dir(job_id).glob("scene_manifest*.json"))
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"job {job_id} was rendered by the {job.package.value} scene pipeline, "
+                    "which /tweak cannot re-render or validate. Re-edit the delivered video "
+                    "in the SkydiveOS editor and use 'Replace customer's video', or reject "
+                    "the job to re-process it."
+                ),
             )
         store.save_edl(job_id, body.edl)
         store.log_adjustment(
@@ -1918,6 +2051,37 @@ def create_app() -> FastAPI:
         if not path.exists() or not _served_under(path, store.dir(job_id)):
             raise HTTPException(status_code=404, detail="deliverable file not found")
         return FileResponse(path, media_type="video/mp4", filename=f"{job_id}_{name}.mp4")
+
+    @app.get(
+        "/jobs/{job_id}/deliverables/{name}/protected-ranges",
+        tags=["review"],
+        summary="The seconds of one rendered video that a re-edit must not cut",
+    )
+    def get_protected_ranges(
+        job_id: JobId,
+        name: Annotated[str, PathParam(description="Deliverable key, e.g. full_video")],
+        store: StoreDep,
+    ) -> dict[str, Any]:
+        """The established editing rules, translated into the RENDERED file's seconds.
+
+        SkydiveOS's editor imports a deliverable as one clip; this tells it which spans
+        of that clip a staff re-edit must keep (``edl.protected``): the filmed intro and
+        outro bookends of ``full_video`` (whole, 1x, no music over them) and the freefall
+        run of ``full_video`` and the freefall cuts (uncut; a freefall-only cut may lose
+        its head up to ``head_trimmable_until``, the exit). ``highlights`` has none.
+
+        ``{"deliverable", "duration", "ranges": [{"kind", "start", "end", ...}],
+        "reason"?}`` — ``ranges`` is empty (with a ``reason``) when nothing is derivable,
+        e.g. a legacy single-master job or an EDL composed before the rules; the caller
+        then enforces nothing. 404 for an unknown job or deliverable. Read-only.
+        """
+        from .protected_ranges import build_protected_ranges  # noqa: PLC0415
+
+        job = _load_or_404(store, job_id)
+        outputs = job.outputs or {}
+        if name == "photos" or name not in outputs or not _is_safe_segment(name):
+            raise HTTPException(status_code=404, detail=f"no video deliverable {name!r}")
+        return build_protected_ranges(job, name, store.root)
 
     @app.post(
         "/jobs/{job_id}/deliverables/{name}/replace",
@@ -2096,9 +2260,18 @@ def create_app() -> FastAPI:
     # ----------------------------------------------------------------------- #
 
     def _job_by_token(store: JobStore, token: str) -> Job:
+        """Resolve a gallery code to its job — THE gate every ``/j/{code}…`` route uses.
+
+        A revoked gallery (``Job.gallery_revoked_at``, staff-only
+        ``POST /jobs/{id}/gallery/revoke``) is refused HERE, before any route picks a
+        file, so no subroute can serve bytes, a poster, a ZIP or a redirect to S3/CDN
+        for it. 410 (not 404): the link existed and was withdrawn on purpose.
+        """
         job = store.find_by_gallery_token(token)
         if job is None:
             raise HTTPException(status_code=404, detail="unknown gallery link")
+        if job.gallery_revoked_at is not None:
+            raise _GalleryRevoked()
         return job
 
     def _presigned_delivery_url(

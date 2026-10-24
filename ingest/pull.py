@@ -32,7 +32,7 @@ from typing import Any
 from .camera import Camera, CameraError, GoProCamera, RemoteMedia, pair
 from .events import EventEmitter, build_event, default_emitter
 from .retention import deletable
-from .storage import camera_dir, destination, is_complete, storage_root, write_manifest
+from .storage import camera_dir, resolve_destination, storage_root, write_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -66,12 +66,29 @@ async def _pull_one(
     source: dict[str, Any] | None = None,
 ) -> PulledJump:
     """Stage a single recording (MP4 + LRV + thumbnail), manifest, and emit."""
-    mp4_dest = destination(root, camera_id, media.created_epoch, media.filename)
+    # The destination is resolved from the clip's IDENTITY (name + size + creation
+    # time), not its name alone: a second card cycled through this camera today can
+    # offer a different GX010001.MP4, and it must be staged beside — never mistaken
+    # for — the first (ingest.storage.resolve_destination).
+    mp4_dest, already_staged = resolve_destination(
+        root, camera_id, media.created_epoch, media.filename, size=media.size
+    )
     job_id = _job_id(camera_id, media)
 
-    if not repull and is_complete(mp4_dest):
+    if not repull and already_staged:
         logger.info("skip %s (already staged at %s)", media.filename, mp4_dest)
         return PulledJump(job_id, camera_id, media, mp4_dest, None, None, skipped=True)
+    if mp4_dest.parent.name.startswith("alt-"):
+        # Provenance in the log line itself: WHICH card (its serial, when the transport
+        # read one) brought the second recording, so an operator can tell the two
+        # cards apart without opening the manifests.
+        card = (source or {}).get("card_serial") if isinstance(source, dict) else None
+        logger.warning(
+            "camera %s: %s is already staged for %s but as a DIFFERENT recording "
+            "(reused GoPro filename — a second card today%s); staging this one at %s",
+            camera_id, media.filename, mp4_dest.parent.parent.name,
+            f", card serial {card}" if card else "", mp4_dest,
+        )
 
     mp4_dest.parent.mkdir(parents=True, exist_ok=True)
     logger.info("downloading %s -> %s", media.camera_path, mp4_dest)
@@ -116,8 +133,20 @@ async def _pull_one(
         source=source,
     )
     # Manifest is written before emitting so a crash mid-emit still leaves the
-    # jump marked complete (resumable); the event can be re-derived on replay.
-    write_manifest(mp4_dest, event)
+    # jump marked complete (resumable); the event can be re-derived on replay
+    # (ingest.discovery.stranded_handoffs does exactly that after a restart). The
+    # manifest additionally records the clip's on-card identity — size and the
+    # original camera path — so a staged file can always be traced back to the
+    # recording it came from; the EMITTED event keeps its exact shape.
+    manifest = {
+        **event,
+        "staged": {
+            "size": media.size,
+            "camera_path": media.camera_path,
+            "collision": mp4_dest.parent.name.startswith("alt-"),
+        },
+    }
+    write_manifest(mp4_dest, manifest)
     if sink is not None:
         sink.emit(event)
 
@@ -272,10 +301,13 @@ async def pull_camera(
                 logger.error("download failed for %s: %r — skipping this clip", media.filename, e)
                 failures.append((media.filename, e))
                 # No manifest was written, so a later pull retries this clip; drop the
-                # partial file so it can never look like a complete staging.
-                destination(
-                    resolved_root, camera_id, media.created_epoch, media.filename
-                ).unlink(missing_ok=True)
+                # partial file so it can never look like a complete staging. Resolve the
+                # path the same way _pull_one did, so a collision sibling is cleaned too.
+                partial, _ = resolve_destination(
+                    resolved_root, camera_id, media.created_epoch, media.filename,
+                    size=media.size,
+                )
+                partial.unlink(missing_ok=True)
 
     if failures:
         detail = ", ".join(f"{name}: {err!r}" for name, err in failures)

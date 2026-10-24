@@ -52,7 +52,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -68,10 +68,24 @@ STATE_PULLING = "pulling"
 #: Copied off the card, but S3 (and, with cleanup on, the sweep) is not done with it
 #: yet — the card must stay in the reader. See the module docstring.
 STATE_UPLOADING = "uploading"
+#: The copy loop is done and the card is being re-read against the ledger to decide
+#: whether it still owes this host anything (``api.app._report_card_state``). Brief.
+STATE_VERIFYING = "verifying"
 STATE_SAFE_TO_REMOVE = "safe_to_remove"
+#: Everything that COULD be handed off was, but some clip(s) were refused by SkydiveOS
+#: (a permanent 4xx) or gave up after every retry: they stay on the card and on disk,
+#: and the operator must fix the cause (pair the card, manifest the load) and re-insert.
+#: Never green — a card holding an undelivered clip is not "done".
+STATE_NEEDS_ATTENTION = "needs_attention"
 STATE_ERROR = "error"
 
-_TERMINAL_STATES = frozenset({STATE_SAFE_TO_REMOVE, STATE_ERROR})
+_TERMINAL_STATES = frozenset({STATE_SAFE_TO_REMOVE, STATE_ERROR, STATE_NEEDS_ATTENTION})
+
+#: Hand-off outcomes reported per clip by discovery (``handoff_observer``).
+HANDOFF_CONFIRMED = "confirmed"
+HANDOFF_REJECTED = "rejected"
+HANDOFF_FAILED = "failed"
+HANDOFF_RETRYING = "retrying"
 
 #: States whose row may be dropped when its card stops being seen or goes stale.
 #: ``uploading`` joins the terminal two because nothing is being written to the card
@@ -119,6 +133,18 @@ class CardStatus:
     #: admin can read off the value to pair to an instructor in SkydiveOS; ``None``
     #: when the host cannot read one. SkydiveOS enriches it with the paired name.
     card_serial: str | None = None
+    #: Hand-off accounting, so the banner can say WHY a card is still held rather than
+    #: one "uploading" for every cause: clips confirmed in S3 + accepted by SkydiveOS
+    #: this session, clips the card still holds that S3 has not confirmed, clips
+    #: confirmed but not yet swept off the card, and the ones that will never clear
+    #: on their own — refused by SkydiveOS (4xx) or given up after every retry — with
+    #: the reason per file.
+    uploaded_files: int = 0
+    unconfirmed_files: int = 0
+    awaiting_sweep_files: int = 0
+    rejected_files: list[str] = field(default_factory=list)
+    failed_files: list[str] = field(default_factory=list)
+    issues: dict[str, str] = field(default_factory=dict)
 
 
 class CardStatusRegistry:
@@ -180,16 +206,29 @@ class CardStatusRegistry:
             keep = entry is not None and entry.state in (
                 STATE_SAFE_TO_REMOVE,
                 STATE_UPLOADING,
+                STATE_NEEDS_ATTENTION,
             )
             state = entry.state if keep and entry is not None else STATE_PULLING
             pending = entry.pending_files if keep and entry is not None else 0
             # Identity outlives the counters: the serial is a fact about the card,
-            # not about this run (see card_identity).
+            # not about this run (see card_identity). So does the hand-off record —
+            # which clips were confirmed, refused or given up — because those are
+            # facts about the footage, not about this copy pass.
             card_serial = entry.card_serial if entry is not None else None
-            self._cards[camera_id] = CardStatus(
+            fresh = CardStatus(
                 camera_id, state, pending_files=pending, updated_at=self._now(),
                 card_serial=card_serial,
             )
+            if entry is not None:
+                fresh.uploaded_files = entry.uploaded_files
+                fresh.rejected_files = list(entry.rejected_files)
+                fresh.failed_files = list(entry.failed_files)
+                fresh.issues = dict(entry.issues)
+                if keep:
+                    fresh.unconfirmed_files = entry.unconfirmed_files
+                    fresh.awaiting_sweep_files = entry.awaiting_sweep_files
+                    fresh.error = entry.error
+            self._cards[camera_id] = fresh
 
     def totals(self, camera_id: str, files_total: int, bytes_total: int) -> None:
         """The card's listed contents: what this pull could copy at most."""
@@ -227,7 +266,70 @@ class CardStatusRegistry:
             entry.bytes_done += size
             entry.updated_at = self._now()
 
-    def uploading(self, camera_id: str, pending: int) -> None:
+    def verifying(self, camera_id: str) -> None:
+        """The copy is done; the card is being re-read against the ledger."""
+        with self._lock:
+            entry = self._ensure(camera_id)
+            if entry.state == STATE_ERROR:
+                return
+            entry.state = STATE_VERIFYING
+            entry.current_file = None
+            entry.updated_at = self._now()
+
+    def handoff_result(
+        self, camera_id: str, filename: str, outcome: str, detail: str | None = None
+    ) -> None:
+        """Discovery's per-clip hand-off verdict (``handoff_observer``).
+
+        ``confirmed`` — the clip is in S3 and SkydiveOS accepted it (it will leave the
+        pending count at the next verification); ``rejected`` — SkydiveOS refused it
+        permanently; ``failed`` — every retry failed; ``retrying`` — a transient failure,
+        nothing to show yet. Rejected/failed files are remembered per card until they
+        are confirmed, so the banner can name them and never reads "done" over them.
+        """
+        with self._lock:
+            entry = self._ensure(camera_id)
+            if outcome == HANDOFF_CONFIRMED:
+                entry.uploaded_files += 1
+                entry.rejected_files = [f for f in entry.rejected_files if f != filename]
+                entry.failed_files = [f for f in entry.failed_files if f != filename]
+                entry.issues.pop(filename, None)
+            elif outcome == HANDOFF_REJECTED:
+                if filename not in entry.rejected_files:
+                    entry.rejected_files.append(filename)
+                entry.issues[filename] = f"refused by SkydiveOS: {detail or 'rejected'}"
+            elif outcome == HANDOFF_FAILED:
+                if filename not in entry.failed_files:
+                    entry.failed_files.append(filename)
+                entry.issues[filename] = f"hand-off failed: {detail or 'gave up'}"
+            entry.updated_at = self._now()
+
+    def issue_files(self, camera_id: str) -> set[str]:
+        """Filenames whose hand-off will not succeed without a human (refused/failed)."""
+        with self._lock:
+            entry = self._cards.get(camera_id)
+            return set(entry.issues) if entry is not None else set()
+
+    def needs_attention(self, camera_id: str, message: str, pending: int) -> None:
+        """The card cannot finish on its own: what it still holds is exactly the
+        refused/failed clips (or its contents could not be verified). Not green."""
+        with self._lock:
+            entry = self._ensure(camera_id)
+            entry.state = STATE_NEEDS_ATTENTION
+            entry.pending_files = pending
+            entry.unconfirmed_files = pending
+            entry.current_file = None
+            entry.error = message
+            entry.updated_at = self._now()
+
+    def uploading(
+        self,
+        camera_id: str,
+        pending: int,
+        *,
+        unconfirmed: int | None = None,
+        awaiting_sweep: int = 0,
+    ) -> None:
         """Copied off the card, but the card is not finished with this host yet.
 
         Raised at the end of a pull whose card still has clips S3 has not
@@ -244,6 +346,8 @@ class CardStatusRegistry:
             entry = self._ensure(camera_id)
             entry.state = STATE_UPLOADING
             entry.pending_files = pending
+            entry.unconfirmed_files = pending if unconfirmed is None else unconfirmed
+            entry.awaiting_sweep_files = awaiting_sweep
             entry.current_file = None
             entry.error = None
             entry.updated_at = self._now()
@@ -261,6 +365,8 @@ class CardStatusRegistry:
             entry = self._ensure(camera_id)
             entry.state = STATE_SAFE_TO_REMOVE
             entry.pending_files = 0
+            entry.unconfirmed_files = 0
+            entry.awaiting_sweep_files = 0
             entry.current_file = None
             entry.error = None
             entry.updated_at = self._now()
@@ -300,6 +406,7 @@ class CardStatusRegistry:
                 if camera_id in seen or entry.state not in _STALE_PRUNABLE_STATES:
                     continue
                 if entry.state in (STATE_SAFE_TO_REMOVE, STATE_UPLOADING):
+                    # (needs_attention and error linger below — the operator must see them)
                     if entry.state == STATE_UPLOADING:
                         logger.warning(
                             "card %s was removed with %d clip(s) still pending; the "

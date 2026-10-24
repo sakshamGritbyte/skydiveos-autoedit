@@ -186,6 +186,9 @@ class JobResponse(BaseModel):
     entitlement: Entitlement
     #: Epoch seconds when the paywall unlock was captured (``None`` = never).
     paid_at: float | None
+    #: True while staff have revoked the customer gallery link (``/j/{code}`` → 410).
+    #: Read-only here; flipped by ``POST /jobs/{id}/gallery/revoke`` / ``…/restore``.
+    gallery_revoked: bool = False
     #: Purchased gallery add-ons: item key → captured payment reference. SkydiveOS
     #: reads this to reconcile add-on sales; fulfilment is the gallery's own.
     addons: dict[str, str]
@@ -238,6 +241,7 @@ class JobResponse(BaseModel):
             superseded_by=job.superseded_by,
             entitlement=job.entitlement,
             paid_at=job.paid_at,
+            gallery_revoked=job.gallery_revoked_at is not None,
             addons=job.addons,
             media_refs=job.media_refs,
             deliverable_entitlements=(
@@ -449,8 +453,13 @@ class CardIngestStatus(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     camera_id: str = Field(examples=["1234"])
+    #: ``verifying``: the copy finished and the card is being re-read against the
+    #: ledger; ``needs_attention``: what the card still holds is exactly the clips
+    #: SkydiveOS refused (or that gave up after every retry) — never green, a human
+    #: must fix the cause and re-insert the card.
     state: Literal[
-        "detected", "sweeping", "pulling", "uploading", "safe_to_remove", "error"
+        "detected", "sweeping", "pulling", "uploading", "verifying",
+        "safe_to_remove", "needs_attention", "error",
     ]
     files_done: int = 0
     files_total: int = 0
@@ -469,6 +478,17 @@ class CardIngestStatus(BaseModel):
     #: instructor (``staffs.sdCards[].serial``) and shows the paired name on the
     #: banner; ``None`` when the host could not read one.
     card_serial: str | None = Field(default=None, examples=["1A2B-3C4D"])
+    #: Hand-off accounting, so the banner can say WHY a card is held: clips confirmed
+    #: (S3 + SkydiveOS) this session; clips on the card S3 has not confirmed; clips
+    #: confirmed but not yet swept off the card; and the ones that will not clear on
+    #: their own — refused by SkydiveOS (4xx) or failed after every retry — with a
+    #: per-file reason in ``issues``.
+    uploaded_files: int = 0
+    unconfirmed_files: int = 0
+    awaiting_sweep_files: int = 0
+    rejected_files: list[str] = Field(default_factory=list)
+    failed_files: list[str] = Field(default_factory=list)
+    issues: dict[str, str] = Field(default_factory=dict)
 
 
 class AssignCameraRequest(BaseModel):

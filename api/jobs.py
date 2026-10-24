@@ -544,6 +544,11 @@ class Job(BaseModel):
     #: Minted once by :meth:`JobStore.ensure_gallery_token` (NOT a default_factory:
     #: a legacy job.json missing the field must not mint a new code on every load).
     gallery_token: str | None = None
+    #: Epoch seconds when staff REVOKED the customer gallery link (``None`` = live).
+    #: Set/cleared only by ``POST /jobs/{id}/gallery/revoke`` / ``…/restore``; while
+    #: set, every ``/j/{code}…`` route answers 410 and delivery refuses to send the
+    #: link. The code itself is kept (no rotation), so a restore revives the same URL.
+    gallery_revoked_at: float | None = None
     #: Epoch seconds when the paywall unlock was captured (``None`` = never).
     paid_at: float | None = None
     #: SkydiveOS's payment/transaction id for that unlock (``None`` = never unlocked).

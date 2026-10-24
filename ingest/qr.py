@@ -396,7 +396,9 @@ class QrSessionIndex:
             marker = next(m for m in self._markers if m.filename == path.name)
             return ClipIdentity(staff_id=marker.staff_id, is_qr_marker=True)
 
-        epoch = self._epochs.get(path.name)
+        epoch = self._epochs.get(str(path))
+        if epoch is None:
+            epoch = self._epochs.get(path.name)
         if epoch is None:
             try:
                 epoch = path.stat().st_mtime
@@ -420,7 +422,10 @@ def build_session_index(
     """
     epochs: dict[str, float] = {}
     markers: list[_Marker] = []
-    for manifest_path in sorted(day_dir.glob(f"*{_MANIFEST_SUFFIX}")):
+    # ``rglob``: a clip whose GoPro filename was already taken by a different recording
+    # that day is staged in a collision sibling folder (``alt-<size>-<epoch>/``,
+    # ingest.storage.resolve_destination); it is still part of this card-day's session.
+    for manifest_path in sorted(day_dir.rglob(f"*{_MANIFEST_SUFFIX}")):
         try:
             manifest = json.loads(manifest_path.read_text())
         except (ValueError, OSError) as e:
@@ -429,15 +434,22 @@ def build_session_index(
         mp4 = Path(str((manifest.get("files") or {}).get("mp4") or ""))
         if not mp4.name:
             continue
+        clip_path = manifest_path.with_name(mp4.name)  # the manifest's sibling, any depth
         epoch = manifest.get("created_epoch")
         if not isinstance(epoch, (int, float)):
             try:
-                epoch = (day_dir / mp4.name).stat().st_mtime
+                epoch = clip_path.stat().st_mtime
             except OSError:
                 continue
-        epochs[mp4.name] = float(epoch)
+        # Keyed by filename (what identity_for looks up); a second recording of the same
+        # name that day (a collision sibling) is keyed by its path so neither hides the
+        # other's capture time.
+        if mp4.name in epochs:
+            epochs[str(clip_path)] = float(epoch)
+        else:
+            epochs[mp4.name] = float(epoch)
         staff_id = cached_staff_qr(
-            day_dir / mp4.name,
+            clip_path,
             max_clip_seconds=max_clip_seconds,
             scan_seconds=scan_seconds,
         )
@@ -465,8 +477,11 @@ def qr_identity_resolver(
 
     def _resolve(camera_id: str, mp4_path: str) -> ClipIdentity | None:
         try:
+            from .storage import day_dir_of  # noqa: PLC0415 - keeps this module light
+
+            clip = Path(mp4_path)
             index = build_session_index(
-                Path(mp4_path).parent,
+                day_dir_of(clip) or clip.parent,
                 max_clip_seconds=max_clip_seconds,
                 scan_seconds=scan_seconds,
             )

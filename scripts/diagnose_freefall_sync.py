@@ -296,7 +296,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- 1. did the rule run on this job? ---
     report = _load_json(jd / "validation_report.json") or {}
-    lines = report.get(deliverable, []) if isinstance(report, dict) else []
+    # The report is written as {"repairs": {deliverable: [...]}} (api.selfie
+    # _write_validation_report); older copies of this tool read the top level and
+    # always printed "no repair logged".
+    repairs = report.get("repairs", report) if isinstance(report, dict) else {}
+    lines = repairs.get(deliverable, []) if isinstance(repairs, dict) else []
     whole = [ln for ln in lines if "freefall plays whole" in ln]
     _w()
     _w("1. Continuity rule (commits 67408a8 / d189bf5):")

@@ -1,0 +1,295 @@
+(node:195525) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:195589) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+2026-10-24 14:11:39 [[33MWARN[39M]: [autoEditOrchestration] could not restamp jump folder after match {"mediaId":"mA","error":"Cannot read properties of undefined (reading 'select')"}
+2026-10-24 14:11:39 [[33MWARN[39M]: [autoEditOrchestration] could not restamp jump folder after match {"mediaId":"mB","error":"Cannot read properties of undefined (reading 'select')"}
+2026-10-24 14:11:39 [[33MWARN[39M]: [autoEditOrchestration] could not resolve the instructor name {"error":"Cannot read properties of undefined (reading 'select')"}
+2026-10-24 14:11:39 [[32MINFO[39M]: [autoEditOrchestration] footage processed {"mediaId":"mA","bookingId":"bk1","outcome":"attached","jobId":"JOB1"}
+2026-10-24 14:11:39 [[33MWARN[39M]: [autoEditOrchestration] could not restamp jump folder after match {"mediaId":"m1","error":"Cannot read properties of undefined (reading 'select')"}
+2026-10-24 14:11:39 [[33MWARN[39M]: [autoEditOrchestration] could not restamp jump folder after match {"mediaId":"m1","error":"Cannot read properties of undefined (reading 'select')"}
+2026-10-24 14:11:39 [[31MERROR[39M]: [autoEditOrchestration] processRawFootage error {"mediaId":"m1","error":"boom"}
+2026-10-24 14:11:39 [[32MINFO[39M]: [autoEditOrchestration] status callback {"jobId":"JOB1","status":"delivered","pipelineStatus":"delivered","bookingId":"bk1","entitlement":null,"mediaState":null,"adopted":false,"hasLinks":true}
+2026-10-24 14:11:39 [[32MINFO[39M]: [autoEditOrchestration] status callback {"jobId":"JOB1","status":"processing","pipelineStatus":"processing","bookingId":"bk1","entitlement":null,"mediaState":null,"adopted":false,"hasLinks":false}
+2026-10-24 14:11:39 [[32MINFO[39M]: [autoEditOrchestration] status callback {"jobId":"JOB1","status":"failed","pipelineStatus":"failed","bookingId":"bk1","entitlement":null,"mediaState":null,"adopted":false,"hasLinks":false}
+2026-10-24 14:11:39 [[32MINFO[39M]: [autoEditOrchestration] status callback {"jobId":"JOB1","status":"delivered","pipelineStatus":"delivered","bookingId":"bk1","entitlement":"preview_only","mediaState":"LOCKED_PREVIEW","adopted":false,"hasLinks":false}
+2026-10-24 14:11:39 [[33MWARN[39M]: [autoEditOrchestration] unrecognised entitlement on callback — ignored {"jobId":"JOB1","entitlement":"freebie"}
+2026-10-24 14:11:39 [[32MINFO[39M]: [autoEditOrchestration] status callback {"jobId":"JOB1","status":"processing","pipelineStatus":"processing","bookingId":"bk1","entitlement":"preview_only","mediaState":null,"adopted":false,"hasLinks":false}
+2026-10-24 14:11:39 [[32MINFO[39M]: [autoEditOrchestration] status callback {"jobId":"JOB1","status":"delivered","pipelineStatus":"delivered","bookingId":"bk1","entitlement":"edited_download","mediaState":null,"adopted":false,"hasLinks":false}
+2026-10-24 14:11:39 [[33MWARN[39M]: [autoEditProductState] REFUSED to re-lock a locally-unlocked media ref from the wire {"jobId":"JOB1","role":"external"}
+2026-10-24 14:11:39 [[32MINFO[39M]: [autoEditOrchestration] status callback {"jobId":"JOB1","status":"processing","pipelineStatus":"processing","bookingId":"bk1","entitlement":null,"mediaState":null,"adopted":false,"hasLinks":false}
+2026-10-24 14:11:39 [[33MWARN[39M]: [autoEditProductState] unrecognised per-deliverable entitlement — treated as LOCKED {"jobId":"JOB1","deliverable":"external_full_video","value":"freebie"}
+2026-10-24 14:11:39 [[33MWARN[39M]: [autoEditProductState] media_refs entry with unknown role — ignored {"jobId":"JOB1","role":"drone"}
+2026-10-24 14:11:39 [[33MWARN[39M]: [autoEditProductState] media_refs entry with unknown package — stored without it {"jobId":"JOB1","role":"external","package":"imax"}
+2026-10-24 14:11:39 [[32MINFO[39M]: [autoEditOrchestration] status callback {"jobId":"JOB1","status":"processing","pipelineStatus":"processing","bookingId":"bk1","entitlement":null,"mediaState":null,"adopted":false,"hasLinks":false}
+2026-10-24 14:11:39 [[32MINFO[39M]: [autoEditOrchestration] adopted unknown pipeline job from status callback {"jobId":"NEW1","bookingRef":null,"matchedBooking":null}
+2026-10-24 14:11:39 [[32MINFO[39M]: [autoEditOrchestration] status callback {"jobId":"NEW1","status":"delivered","pipelineStatus":"delivered","bookingId":null,"entitlement":"preview_only","mediaState":"LOCKED_PREVIEW","adopted":true,"hasLinks":true}
+2026-10-24 14:11:39 [[32MINFO[39M]: [autoEditOrchestration] adopted PENDING reservation for a pipeline-created job {"jobId":"NEW2","bookingId":"bk9"}
+2026-10-24 14:11:39 [[32MINFO[39M]: [autoEditOrchestration] status callback {"jobId":"NEW2","status":"processing","pipelineStatus":"processing","bookingId":"bk9","entitlement":"preview_only","mediaState":null,"adopted":true,"hasLinks":false}
+2026-10-24 14:11:39 [[33MWARN[39M]: [autoEditOrchestration] callback booking_id already owns another job — row left unmatched {"jobId":"NEW3","bookingRef":"BK-DUP","existingJobId":"OTHER"}
+2026-10-24 14:11:39 [[32MINFO[39M]: [autoEditOrchestration] adopted unknown pipeline job from status callback {"jobId":"NEW3","bookingRef":"BK-DUP","matchedBooking":null}
+2026-10-24 14:11:39 [[32MINFO[39M]: [autoEditOrchestration] status callback {"jobId":"NEW3","status":"processing","pipelineStatus":"processing","bookingId":null,"entitlement":null,"mediaState":null,"adopted":true,"hasLinks":false}
+2026-10-24 14:11:39 [[32MINFO[39M]: [autoEditOrchestration] status callback {"jobId":"NEW4","status":"processing","pipelineStatus":"processing","bookingId":null,"entitlement":null,"mediaState":null,"adopted":true,"hasLinks":false}
+2026-10-24 14:11:39 [[32MINFO[39M]: [autoEditOrchestration] media fulfilment after payment capture {"jobId":"JOB1","item":"unlock","bookingId":"bk1","paymentReference":"clover_txn_9f21"}
+2026-10-24 14:11:39 [[32MINFO[39M]: [autoEditOrchestration] media fulfilment after payment capture {"jobId":"JOB1","item":"photos","bookingId":"bk1","paymentReference":"clover_txn_9f22"}
+(node:195588) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+PASS src/__tests__/aiEditGuard.test.js
+(node:195552) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+PASS src/__tests__/ultimumSdCardFourVideos.test.js
+(node:195524) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:195546) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+PASS src/__tests__/ingestCardsProxy.test.js
+(node:195563) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+2026-10-24 14:11:41 [[32MINFO[39M]: [aiDelivery] edit republished — the customer's existing link now serves it {"mediaId":"m1","jobId":"job-abc","deliverable":"full_video","from":"media/edited/customer-full-v2.mp4","to":"deliveries/job-abc/full_video.mp4","uploadedMissing":[]}
+2026-10-24 14:11:41 [[32MINFO[39M]: [aiDelivery] edit republished — the customer's existing link now serves it {"mediaId":"m1","jobId":"job-abc","deliverable":"full_video","from":"media/edited/customer-full-v2.mp4","to":"deliveries/job-abc/renamed.mp4","uploadedMissing":["highlights"]}
+2026-10-24 14:11:41 [[32MINFO[39M]: [aiDelivery] edit republished — the customer's existing link now serves it {"mediaId":"m1","jobId":"job-abc","deliverable":"external_full_video","from":"media/edited/customer-full-v2.mp4","to":"deliveries/job-abc/external_full_video.mp4","uploadedMissing":[]}
+2026-10-24 14:11:41 [[33MWARN[39M]: [aiDelivery] pipeline refused / failed the replace {"mediaId":"m1","jobId":"job-abc","deliverable":"full_video","status":409,"reason":"job j is ready, not delivered — nothing to replace yet"}
+2026-10-24 14:11:41 [[33MWARN[39M]: [aiDelivery] replaced, but could not stamp the row {"mediaId":"m1","error":"db blip"}
+2026-10-24 14:11:41 [[32MINFO[39M]: [aiDelivery] edit republished — the customer's existing link now serves it {"mediaId":"m1","jobId":"job-abc","deliverable":"full_video","from":"media/edited/customer-full-v2.mp4","to":"deliveries/job-abc/full_video.mp4","uploadedMissing":[]}
+2026-10-24 14:11:41 [[32MINFO[39M]: [aiDelivery] edit not republished to the customer gallery {"mediaId":"m1","jobId":"job-abc","reason":"entitlement is preview_only — only a paid deliverable may replace the gallery object"}
+2026-10-24 14:11:41 [[32MINFO[39M]: [aiDelivery] edit not republished to the customer gallery {"mediaId":"m1","jobId":"job-abc","reason":"entitlement is unknown — only a paid deliverable may replace the gallery object"}
+2026-10-24 14:11:41 [[32MINFO[39M]: [aiDelivery] edit not republished to the customer gallery {"mediaId":"m1","jobId":"job-abc","reason":"not an AI output deliverable"}
+2026-10-24 14:11:41 [[32MINFO[39M]: [aiDelivery] edit not republished to the customer gallery {"mediaId":"m2","jobId":null,"reason":"not an AI output deliverable"}
+2026-10-24 14:11:41 [[32MINFO[39M]: [aiDelivery] edit not republished to the customer gallery {"mediaId":"m1","jobId":"job-abc","reason":"no exported object on the row"}
+2026-10-24 14:11:41 [[32MINFO[39M]: [aiDelivery] edit republished — the customer's existing link now serves it {"mediaId":"m1","jobId":"job-abc","deliverable":"full_video","from":"media/edited/customer-full-v2.mp4","to":"deliveries/job-abc/full_video.mp4","uploadedMissing":[]}
+2026-10-24 14:11:41 [[32MINFO[39M]: [aiDelivery] customer video replaced by operator {"mediaId":"m1","key":"deliveries/job-abc/full_video.mp4","userId":"user1"}
+2026-10-24 14:11:41 [[32MINFO[39M]: [aiDelivery] edit republished — the customer's existing link now serves it {"mediaId":"m1","jobId":"job-abc","deliverable":"full_video","from":"media/edited/customer-full-v2.mp4","to":"deliveries/job-abc/full_video.mp4","uploadedMissing":[]}
+2026-10-24 14:11:41 [[32MINFO[39M]: [aiDelivery] customer video replaced by operator {"mediaId":"m1","key":"deliveries/job-abc/full_video.mp4","userId":null}
+2026-10-24 14:11:41 [[32MINFO[39M]: [aiDelivery] edit republished — the customer's existing link now serves it {"mediaId":"m1","jobId":"job-abc","deliverable":"full_video","from":"media/edited/customer-full-v2.mp4","to":"deliveries/job-abc/full_video.mp4","uploadedMissing":[]}
+2026-10-24 14:11:41 [[32MINFO[39M]: [aiDelivery] customer video replaced by operator {"mediaId":"m1","key":"deliveries/job-abc/full_video.mp4","userId":null}
+2026-10-24 14:11:41 [[32MINFO[39M]: [aiDelivery] edit not republished to the customer gallery {"mediaId":"m1","jobId":"job-abc","reason":"entitlement is preview_only — only a paid deliverable may replace the gallery object"}
+PASS src/__tests__/aiDeliveryRepublish.test.js
+2026-10-24 14:11:42 [[31MERROR[39M]: [autoEditOrchestration] media unlock SKIPPED — pipeline not configured while money may be captured {"jobId":"JOB1","item":"unlock","bookingId":"bk1","paymentReference":"txn"}
+2026-10-24 14:11:42 [[31MERROR[39M]: [autoEditOrchestration] media fulfilment FAILED after payment capture — retry needed {"jobId":"JOB1","item":"unlock","bookingId":"bk1","paymentReference":"txn","error":"pipeline down"}
+2026-10-24 14:11:42 [[32MINFO[39M]: [autoEditOrchestration] media fulfilment after payment capture {"jobId":"JOB9","item":"unlock","bookingId":"bk9","paymentReference":"txn"}
+2026-10-24 14:11:42 [[33MWARN[39M]: [autoEditOrchestration] could not resolve the instructor name {"error":"mongo down"}
+(node:195538) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+PASS src/__tests__/videoShareLink.test.js
+2026-10-24 14:11:42 [[32MINFO[39M]: [mediaDeliverySms] delivery SMS accepted by the provider {"jobId":"JOB1","kind":"initial","to":"…1234","sid":"SM1"}
+2026-10-24 14:11:42 [[32MINFO[39M]: [autoEditOrchestration] delivery SMS sent {"jobId":"JOB1","bookingId":"bk1"}
+2026-10-24 14:11:42 [[33MWARN[39M]: Media view branding failed (non-fatal): {"error":"config down"}
+2026-10-24 14:11:42 [[32MINFO[39M]: [mediaDeliverySms] delivery SMS accepted by the provider {"jobId":"JOB1","kind":"initial","to":"…1234","sid":"SM1"}
+2026-10-24 14:11:42 [[32MINFO[39M]: [autoEditOrchestration] delivery SMS sent {"jobId":"JOB1","bookingId":"bk1"}
+2026-10-24 14:11:42 [[31MERROR[39M]: [mediaDeliverySms] delivery SMS not sent {"jobId":"JOB1","attempts":1,"status":"failed","reason":"The 'To' number +15145551234 is not a valid phone number."}
+2026-10-24 14:11:42 [[33MWARN[39M]: [mediaDeliverySms] delivery SMS failed — will retry {"jobId":"JOB1","attempts":1,"reason":"connect ETIMEDOUT"}
+2026-10-24 14:11:42 [[33MWARN[39M]: [mediaDeliverySms] delivery SMS not sent {"jobId":"JOB1","attempts":1,"status":"skipped","reason":"SMS sending is turned off on this server (SMS_ENABLED)"}
+2026-10-24 14:11:42 [[33MWARN[39M]: [mediaDeliverySms] delivery SMS failed — will retry {"jobId":"JOB1","attempts":1,"reason":"connect ETIMEDOUT"}
+2026-10-24 14:11:42 [[32MINFO[39M]: [mediaDeliverySms] delivery SMS accepted by the provider {"jobId":"JOB1","kind":"initial","to":"…1234","sid":"SM1"}
+2026-10-24 14:11:42 [[32MINFO[39M]: [autoEditOrchestration] delivery SMS sent {"jobId":"JOB1","bookingId":"bk1"}
+2026-10-24 14:11:42 [[32MINFO[39M]: [autoEditOrchestration] status callback {"jobId":"JOB1","status":"delivered","pipelineStatus":"delivered","bookingId":"bk1","entitlement":null,"mediaState":null,"adopted":false,"hasLinks":true}
+2026-10-24 14:11:42 [[32MINFO[39M]: [autoEditOrchestration] status callback {"jobId":"JOB1","status":"processing","pipelineStatus":"processing","bookingId":"bk1","entitlement":null,"mediaState":null,"adopted":false,"hasLinks":false}
+2026-10-24 14:11:42 [[32MINFO[39M]: [autoEditOrchestration] delivery SMS held — waiting for the external camera render(s) to deliver {"jobId":"JOB1"}
+2026-10-24 14:11:42 [[32MINFO[39M]: [autoEditOrchestration] status callback {"jobId":"JOB1","status":"delivered","pipelineStatus":"delivered","bookingId":"bk1","entitlement":null,"mediaState":null,"adopted":false,"hasLinks":false}
+2026-10-24 14:11:42 [[33MWARN[39M]: [mediaDeliverySms] delivery SMS failed — will retry {"jobId":"JOB1","attempts":1,"reason":"twilio down"}
+2026-10-24 14:11:42 [[32MINFO[39M]: [autoEditOrchestration] status callback {"jobId":"JOB1","status":"delivered","pipelineStatus":"delivered","bookingId":"bk1","entitlement":null,"mediaState":null,"adopted":false,"hasLinks":false}
+2026-10-24 14:11:42 [[32MINFO[39M]: [autoEditOrchestration] status callback {"jobId":"JOB1","status":"ready_for_review","pipelineStatus":"ready","bookingId":"bk1","entitlement":null,"mediaState":null,"adopted":false,"hasLinks":false}
+2026-10-24 14:11:42 [[32MINFO[39M]: [autoEditOrchestration] status callback {"jobId":"JOB1","status":"ready_for_review","pipelineStatus":"ready","bookingId":"bk1","entitlement":null,"mediaState":null,"adopted":false,"hasLinks":false}
+2026-10-24 14:11:42 [[32MINFO[39M]: [autoEditOrchestration] status callback {"jobId":"JOB1","status":"queued","pipelineStatus":"rejected","bookingId":"bk1","entitlement":null,"mediaState":null,"adopted":false,"hasLinks":false}
+PASS src/__tests__/smsNotificationServiceTick.test.js
+2026-10-24 14:11:42 [[33MWARN[39M]: [autoEditOrchestration] unrecognised pipeline status — ignored {"jobId":"JOB1","status":"transcoding_v2","bookingId":"bk1"}
+2026-10-24 14:11:42 [[32MINFO[39M]: [autoEditOrchestration] adopted unknown pipeline job from status callback {"jobId":"LOST1","bookingRef":null,"matchedBooking":null}
+2026-10-24 14:11:42 [[32MINFO[39M]: [autoEditOrchestration] adopted pipeline job from GET /jobs/{id} (status callback never landed) {"jobId":"LOST1","status":"delivered","entitlement":"edited_download","matchedBooking":null}
+2026-10-24 14:11:42 [[33MWARN[39M]: [autoEditOrchestration] pipeline record names a different job — not adopted {"jobId":"LOST1","remoteJobId":"OTHER"}
+2026-10-24 14:11:42 [[32MINFO[39M]: [autoEditOrchestration] adopted pipeline job from GET /jobs/{id} (status callback never landed) {"jobId":"LOST1","status":"delivered","entitlement":"edited_download","matchedBooking":null}
+2026-10-24 14:11:42 [[32MINFO[39M]: [autoEditOrchestration] late gallery_url recorded from a re-sent callback {"jobId":"JOB1"}
+
+ReferenceError: You are trying to `import` a file after the Jest environment has been torn down. From src/__tests__/autoEditOrchestration.test.js.
+
+      2121 |         // the unlock sweep, and the offer page self-heals one too.
+      2122 |         setImmediate(() => {
+    > 2123 |           import('./mediaIncludedReleaseService.js')
+           |           ^
+      2124 |             .then(({ default: included }) => included.releaseForJob(job.jobId, { trigger: 'delivered' }))
+      2125 |             .catch((err) => logger.warn(`${TAG} included-media release could not start`, {
+      2126 |               jobId, error: err.message,
+
+      at Immediate._onImmediate (src/services/autoEditOrchestrationService.js:2123:11)
+
+ReferenceError: You are trying to `import` a file after the Jest environment has been torn down. From src/__tests__/autoEditOrchestration.test.js.
+
+
+
+ReferenceError: You are trying to `import` a file after the Jest environment has been torn down. From src/__tests__/autoEditOrchestration.test.js.
+
+      2121 |         // the unlock sweep, and the offer page self-heals one too.
+      2122 |         setImmediate(() => {
+    > 2123 |           import('./mediaIncludedReleaseService.js')
+           |           ^
+      2124 |             .then(({ default: included }) => included.releaseForJob(job.jobId, { trigger: 'delivered' }))
+      2125 |             .catch((err) => logger.warn(`${TAG} included-media release could not start`, {
+      2126 |               jobId, error: err.message,
+
+      at Immediate._onImmediate (src/services/autoEditOrchestrationService.js:2123:11)
+
+ReferenceError: You are trying to `import` a file after the Jest environment has been torn down. From src/__tests__/autoEditOrchestration.test.js.
+
+
+
+ReferenceError: You are trying to `import` a file after the Jest environment has been torn down. From src/__tests__/autoEditOrchestration.test.js.
+
+      2121 |         // the unlock sweep, and the offer page self-heals one too.
+      2122 |         setImmediate(() => {
+    > 2123 |           import('./mediaIncludedReleaseService.js')
+           |           ^
+      2124 |             .then(({ default: included }) => included.releaseForJob(job.jobId, { trigger: 'delivered' }))
+      2125 |             .catch((err) => logger.warn(`${TAG} included-media release could not start`, {
+      2126 |               jobId, error: err.message,
+
+      at Immediate._onImmediate (src/services/autoEditOrchestrationService.js:2123:11)
+
+ReferenceError: You are trying to `import` a file after the Jest environment has been torn down. From src/__tests__/autoEditOrchestration.test.js.
+
+
+PASS src/__tests__/autoEditOrchestration.test.js
+2026-10-24 14:11:42 [[33MWARN[39M]: [autoEditOrchestration] included-media release could not start {"jobId":"JOB1","error":"Provided module is not an instance of Module"}
+2026-10-24 14:11:42 [[33MWARN[39M]: [autoEditOrchestration] included-media release could not start {"jobId":"JOB1","error":"Provided module is not an instance of Module"}
+2026-10-24 14:11:42 [[33MWARN[39M]: [autoEditOrchestration] included-media release could not start {"jobId":"JOB1","error":"Provided module is not an instance of Module"}
+2026-10-24 14:11:42 [[32MINFO[39M]: [sdCardService] SD card paired {"staffId":"s1","serial":"1A2B-3C4D","relabel":false,"by":"admin1"}
+2026-10-24 14:11:42 [[32MINFO[39M]: [sdCardService] SD card paired {"staffId":"s1","serial":"BBBB-0002","relabel":false,"by":null}
+2026-10-24 14:11:42 [[32MINFO[39M]: [sdCardService] SD card paired {"staffId":"s1","serial":"1A2B-3C4D","relabel":true,"by":null}
+2026-10-24 14:11:42 [[32MINFO[39M]: [sdCardService] SD card paired {"staffId":"s-self","serial":"CCCC-0003","relabel":false,"by":"u-self"}
+2026-10-24 14:11:42 [[32MINFO[39M]: [sdCardService] SD card unpaired {"staffId":"s1","serial":"AAAA-0001"}
+2026-10-24 14:11:42 [[33MWARN[39M]: [sdCardService] could not resolve SD card owners for the ingest banner {"error":"mongo down"}
+2026-10-24 14:11:42 [[31MERROR[39M]: Failed to fetch system config: config.toObject is not a function
+TypeError: config.toObject is not a function
+    at ConfigCacheService.getConfig (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/configCacheService.js:22:28)
+    at processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at getDzTimezoneCached (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/utils/dateUtils.js:273:17)
+    at MediaService.registerRawFromS3 (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/mediaService.js:994:55)
+    at Object.<anonymous> (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/__tests__/sdCardPairing.test.js:233:19)
+PASS src/__tests__/task431Certificates.test.js
+PASS src/__tests__/giftCardEmailStartDate.test.js
+(node:195545) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+PASS src/__tests__/sdCardPairing.test.js
+2026-10-24 14:11:42 [[31MERROR[39M]: Failed to fetch system config: config.toObject is not a function
+TypeError: config.toObject is not a function
+    at ConfigCacheService.getConfig (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/configCacheService.js:22:28)
+    at processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at getDzTimezoneCached (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/utils/dateUtils.js:273:17)
+    at MediaService._resolveJumpFolder (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/mediaService.js:224:18)
+    at MediaService.registerRawFromS3 (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/mediaService.js:992:24)
+    at Object.<anonymous> (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/__tests__/sdCardPairing.test.js:233:19)
+2026-10-24 14:11:42 [[32MINFO[39M]: [mediaService] raw GoPro media ingested {"mediaId":"m1","mediaNumber":"MED-1","cameraman":"s-card","goproSerial":"4313","s3Key":"raw/4313/GX010002.MP4"}
+2026-10-24 14:11:42 [[31MERROR[39M]: Failed to fetch system config: config.toObject is not a function
+TypeError: config.toObject is not a function
+    at ConfigCacheService.getConfig (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/configCacheService.js:22:28)
+    at processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at getDzTimezoneCached (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/utils/dateUtils.js:273:17)
+    at MediaService.registerRawFromS3 (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/mediaService.js:994:55)
+    at Object.<anonymous> (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/__tests__/sdCardPairing.test.js:251:19)
+2026-10-24 14:11:42 [[31MERROR[39M]: Failed to fetch system config: config.toObject is not a function
+TypeError: config.toObject is not a function
+    at ConfigCacheService.getConfig (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/configCacheService.js:22:28)
+    at processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at getDzTimezoneCached (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/utils/dateUtils.js:273:17)
+    at MediaService._resolveJumpFolder (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/mediaService.js:224:18)
+    at MediaService.registerRawFromS3 (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/mediaService.js:992:24)
+    at Object.<anonymous> (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/__tests__/sdCardPairing.test.js:251:19)
+2026-10-24 14:11:42 [[32MINFO[39M]: [mediaService] raw GoPro media ingested {"mediaId":"m1","mediaNumber":"MED-1","cameraman":"s-camera","goproSerial":"4313","s3Key":"raw/4313/GX010002.MP4"}
+2026-10-24 14:11:42 [[33MWARN[39M]: [mediaService] QR marker names a different staff than the card's pairing — QR wins {"staffId":"665f1c0a2ab79c0012345678","cardOwnerId":"s-card","sdCardSerial":"1A2B-3C4D"}
+2026-10-24 14:11:42 [[31MERROR[39M]: Failed to fetch system config: config.toObject is not a function
+TypeError: config.toObject is not a function
+    at ConfigCacheService.getConfig (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/configCacheService.js:22:28)
+    at processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at getDzTimezoneCached (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/utils/dateUtils.js:273:17)
+    at MediaService.registerRawFromS3 (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/mediaService.js:994:55)
+    at Object.<anonymous> (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/__tests__/sdCardPairing.test.js:266:19)
+2026-10-24 14:11:42 [[31MERROR[39M]: Failed to fetch system config: config.toObject is not a function
+TypeError: config.toObject is not a function
+    at ConfigCacheService.getConfig (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/configCacheService.js:22:28)
+    at processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at getDzTimezoneCached (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/utils/dateUtils.js:273:17)
+    at MediaService._resolveJumpFolder (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/mediaService.js:224:18)
+    at MediaService.registerRawFromS3 (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/mediaService.js:992:24)
+    at Object.<anonymous> (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/__tests__/sdCardPairing.test.js:266:19)
+2026-10-24 14:11:42 [[32MINFO[39M]: [mediaService] raw GoPro media ingested {"mediaId":"m1","mediaNumber":"MED-1","cameraman":"665f1c0a2ab79c0012345678","goproSerial":"4313","s3Key":"raw/4313/GX010002.MP4"}
+2026-10-24 14:11:42 [[31MERROR[39M]: Failed to fetch system config: config.toObject is not a function
+TypeError: config.toObject is not a function
+    at ConfigCacheService.getConfig (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/configCacheService.js:22:28)
+    at processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at getDzTimezoneCached (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/utils/dateUtils.js:273:17)
+    at MediaService.registerRawFromS3 (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/mediaService.js:994:55)
+    at Object.<anonymous> (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/__tests__/sdCardPairing.test.js:279:5)
+2026-10-24 14:11:42 [[31MERROR[39M]: Failed to fetch system config: config.toObject is not a function
+TypeError: config.toObject is not a function
+    at ConfigCacheService.getConfig (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/configCacheService.js:22:28)
+    at processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at getDzTimezoneCached (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/utils/dateUtils.js:273:17)
+    at MediaService._resolveJumpFolder (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/mediaService.js:224:18)
+    at MediaService.registerRawFromS3 (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/mediaService.js:992:24)
+    at Object.<anonymous> (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/__tests__/sdCardPairing.test.js:279:5)
+2026-10-24 14:11:42 [[32MINFO[39M]: [mediaService] raw GoPro media ingested {"mediaId":"m1","mediaNumber":"MED-1","cameraman":"s-camera","goproSerial":"4313","s3Key":"raw/4313/GX010002.MP4"}
+2026-10-24 14:11:42 [[31MERROR[39M]: Failed to fetch system config: config.toObject is not a function
+TypeError: config.toObject is not a function
+    at ConfigCacheService.getConfig (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/configCacheService.js:22:28)
+    at processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at getDzTimezoneCached (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/utils/dateUtils.js:273:17)
+    at MediaService._resolveJumpFolder (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/mediaService.js:224:18)
+    at MediaService.uploadRawFromCamera (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/services/mediaService.js:883:24)
+    at Object.<anonymous> (/home/msi/Desktop/Development/skydiving/skydiving-os/backend/src/__tests__/sdCardPairing.test.js:320:19)
+2026-10-24 14:11:42 [[32MINFO[39M]: [mediaService] raw GoPro media ingested {"mediaId":"m1","mediaNumber":"MED-1","cameraman":"s-card","goproSerial":"4313","s3Key":"media/abc.mp4"}
+2026-10-24 14:11:42 [[32MINFO[39M]: [autoEditOrchestration] staff-identified footage left unlinked (flag queue) {"mediaId":"m1","staffId":"s1","staffSource":"sd-card","status":"unmatched","reason":"no load"}
+2026-10-24 14:11:42 [[32MINFO[39M]: [autoEditOrchestration] footage left unlinked {"mediaId":"m2","status":"unmatched","reason":"no load"}
+PASS src/__tests__/autoEditStatusReceiver.test.js
+PASS src/__tests__/bilingualInlineEmails.test.js
+(node:195531) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+PASS src/__tests__/mediaGalleryShare.test.js
+PASS src/__tests__/aiEditRules.test.js
+PASS src/__tests__/bug439GalleryZip.test.js
+PASS src/__tests__/bilingualCustomerEmails.test.js
+PASS src/__tests__/mediaDeliveryEmail.test.js
+(node:195532) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+2026-10-24 14:11:43 [[32MINFO[39M]: Media share links revoked {"mediaId":"aaaaaaaaaaaaaaaaaaaaaaaa","revoked":2,"by":"u-staff"}
+2026-10-24 14:11:43 [[32MINFO[39M]: Media share links revoked {"mediaId":"aaaaaaaaaaaaaaaaaaaaaaaa","revoked":0,"by":"u1"}
+2026-10-24 14:11:43 [[32MINFO[39M]: Media share links revoked {"mediaId":"aaaaaaaaaaaaaaaaaaaaaaaa","revoked":1,"by":"u-cust"}
+2026-10-24 14:11:43 [[31MERROR[39M]: [aiBackendProxy] request failed {"url":"/jobs","method":"GET","error":"connect ECONNREFUSED 127.0.0.1:1"}
+2026-10-24 14:11:43 [[32MINFO[39M]: Gallery shares revoked {"mediaId":"aaaaaaaaaaaaaaaaaaaaaaaa","importSessionId":"sess-1","revoked":1,"by":"u-staff"}
+PASS src/__tests__/aiJobProxy.test.js
+PASS src/__tests__/autoEditUnlockWire.test.js
+PASS src/__tests__/autoEditImport.test.js
+2026-10-24 14:11:43 [[33MWARN[39M]: No token provided
+2026-10-24 14:11:43 [[32MINFO[39M]: Media share links revoked {"mediaId":"aaaaaaaaaaaaaaaaaaaaaaaa","revoked":1,"by":"u-staff"}
+2026-10-24 14:11:43 [[32MINFO[39M]: Media share links revoked {"mediaId":"aaaaaaaaaaaaaaaaaaaaaaaa","revoked":1,"by":"u-admin"}
+2026-10-24 14:11:43 [[32MINFO[39M]: Media share links revoked {"mediaId":"aaaaaaaaaaaaaaaaaaaaaaaa","revoked":1,"by":"u-mine"}
+PASS src/__tests__/autoEditPackageMapping.test.js
+PASS src/__tests__/aiJobSources.test.js
+PASS src/__tests__/shareLinkRevocation.test.js
+PASS src/__tests__/notificationEmailPipeline.test.js
+PASS src/__tests__/consolidatedCustomerEmails.test.js
+2026-10-24 14:11:43 [[33MWARN[39M]: Access denied
+2026-10-24 14:11:43 [[33MWARN[39M]: No token provided
+2026-10-24 14:11:43 [[33MWARN[39M]: Access denied for user m@x.test with role customer and staffRoles []
+2026-10-24 14:11:43 [[33MWARN[39M]: Access denied. Required role: manifest or instructor or admin or owner
+2026-10-24 14:11:43 [[33MWARN[39M]: Failed to probe media source metadata {"mediaId":"m1","error":"ffprobe exited with code 1\nffprobe version N-66595-gc2b38619c0-static https://johnvansickle.com/ffmpeg/  Copyright (c) 2007-2023 the FFmpeg developers\n  built with gcc 8 (Debian 8.3.0-6)\n  configuration: --enable-gpl --enable-version3 --enable-static --disable-debug --disable-ffplay --disable-indev=sndio --disable-outdev=sndio --cc=gcc --enable-fontconfig --enable-frei0r --enable-gnutls --enable-gmp --enable-libgme --enable-gray --enable-libaom --enable-libfribidi --enable-libass --enable-libvmaf --enable-libfreetype --enable-libmp3lame --enable-libopencore-amrnb --enable-libopencore-amrwb --enable-libopenjpeg --enable-librubberband --enable-libsoxr --enable-libspeex --enable-libsrt --enable-libvorbis --enable-libopus --enable-libtheora --enable-libvidstab --enable-libvo-amrwbenc --enable-libvpx --enable-libwebp --enable-libx264 --enable-libx265 --enable-libxml2 --enable-libdav1d --enable-libxvid --enable-libzvbi --enable-libzimg\n  libavutil      58. 14.100 / 58. 14.100\n  libavcodec     60. 22.100 / 60. 22.100\n  libavformat    60. 10.100 / 60. 10.100\n  libavdevice    60.  2.101 / 60.  2.101\n  libavfilter     9.  8.102 /  9.  8.102\n  libswscale      7.  3.100 /  7.  3.100\n  libswresample   4. 11.100 /  4. 11.100\n  libpostproc    57.  2.100 / 57.  2.100\n[mov,mp4,m4a,3gp,3g2,mj2 @ 0x217c0000] Format mov,mp4,m4a,3gp,3g2,mj2 detected only with low score of 1, misdetection possible!\n[mov,mp4,m4a,3gp,3g2,mj2 @ 0x217c0000] moov atom not found\n/tmp/probe-m1-48c4c81531ad.mp4: Invalid data found when processing input\n"}
+2026-10-24 14:11:43 [[32MINFO[39M]: Gallery shares revoked {"mediaId":"aaaaaaaaaaaaaaaaaaaaaaaa","importSessionId":"sess-1","revoked":1,"by":"u-staff"}
+2026-10-24 14:11:43 [[33MWARN[39M]: This link has been revoked. Ask the dropzone for a new one.
+2026-10-24 14:11:43 [[33MWARN[39M]: This link has been revoked. Ask the dropzone for a new one.
+2026-10-24 14:11:43 [[33MWARN[39M]: This gallery link has been revoked. Ask the dropzone for a new one.
+2026-10-24 14:11:43 [[33MWARN[39M]: This gallery link has been revoked. Ask the dropzone for a new one.
+2026-10-24 14:11:43 [[33MWARN[39M]: This gallery link has been revoked. Ask the dropzone for a new one.
+2026-10-24 14:11:43 [[33MWARN[39M]: This gallery link has been revoked. Ask the dropzone for a new one.
+PASS src/__tests__/bilingualSimpleTemplates.test.js
+PASS src/__tests__/slowMotionAudioFlow.test.js (5.062 s)
+2026-10-24 14:11:43 [[32MINFO[39M]: Watermark skipped for export {"mediaId":"m-bookends","pipeline":"v2","watermarkMode":"default","globalWatermarkEnabled":false,"logoFound":false,"logoSource":null,"skipReason":"global-disabled"}
+2026-10-24 14:11:43 [[32MINFO[39M]: [export] sequence resolution {"mediaId":"m-bookends","source":"base clip","width":160,"height":120}
+2026-10-24 14:11:44 [[32MINFO[39M]: Video concatenation completed (stream copy, 3 clips)
+2026-10-24 14:11:44 [[32MINFO[39M]: [export] music confined between intro and outro {"mediaId":"m-bookends","start":3,"end":9.02322}
+2026-10-24 14:11:45 [[32MINFO[39M]: Background audio mixing completed
+2026-10-24 14:11:45 [[32MINFO[39M]: Preview generation completed
+2026-10-24 14:11:45 [[32MINFO[39M]: Video v2 processing completed {"mediaId":"m-bookends","clipCount":3,"audioCount":1}
+PASS src/__tests__/editBookendsExport.test.js (6.89 s)
+
+Test Suites: 28 passed, 28 total
+Tests:       615 passed, 615 total
+Snapshots:   0 total
+Time:        7.179 s
+EXIT=0

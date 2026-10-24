@@ -151,7 +151,8 @@ def _status_payload(job: Job, settings: Settings) -> dict[str, object]:
         # The load master this gallery streams — lets SkydiveOS show "Load 17 aerial
         # video" against the master's render rather than treating the child as orphaned.
         payload["source_job_id"] = job.source_job_id
-    if job.gallery_token and settings.public_base_url:
+    if job.gallery_token and settings.public_base_url and job.gallery_revoked_at is None:
+        # (A REVOKED link is withheld: SkydiveOS would SMS/email a page that 410s.)
         # The short, never-expiring customer gallery link — what SkydiveOS should
         # SMS/email on `delivered` (it may append its own ?s= source tag).
         payload["gallery_url"] = f"{settings.public_base_url}/j/{job.gallery_token}"

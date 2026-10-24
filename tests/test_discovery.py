@@ -1755,3 +1755,36 @@ def test_s3_notify_uploader_skips_the_upload_when_s3_already_holds_the_bytes(
     mp4.write_bytes(b"other-recording-bytes-longer")
     other = upload(str(mp4), "1234", None)
     assert other != key and s3.uploads == [key, other]
+
+
+def test_rejected_handoff_logs_the_reason_skydiveos_gave(tmp_path: Path, caplog) -> None:
+    """South Shore 2026-10-24: 36 clips across seven cameras were refused with a bare
+    404 and nobody could tell WHY from the log. The body is the actionable part."""
+    import logging
+
+    err = _status_error(404)
+    err.response.text = '{"message":"No instructor is paired to GoPro serial \"4812\""}'  # type: ignore[attr-defined]
+
+    class _Uploader:
+        def __call__(self, *args: object, **kwargs: object) -> None:
+            raise err
+
+    service = CameraDiscoveryService(
+        scanner=StaticCameraScanner(["4812"]),
+        registry=FakeRegistry([CameraRecord(camera_id="4812", paired_at=1.0)]),
+        upload=_Uploader(),
+        pull=_make_pull(tmp_path / "GX010989.MP4"),
+        interval=0.05,
+        handoff_retry_delay=0.01,
+    )
+
+    async def scenario() -> None:
+        with caplog.at_level(logging.ERROR, logger="ingest.discovery"):
+            await service.start()
+            await _wait_for(lambda: any("REJECTED" in r.getMessage() for r in caplog.records))
+            await service.stop()
+
+    asyncio.run(scenario())
+    [line] = [r.getMessage() for r in caplog.records if "REJECTED" in r.getMessage()]
+    assert 'No instructor is paired to GoPro serial "4812"' in line
+    assert "restart the service" in line

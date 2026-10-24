@@ -81,6 +81,17 @@ _HANDOFF_ATTEMPTS_KEY = "_handoff_attempts"
 _HANDOFF_MAX_DELAY = 300.0
 
 
+def _response_body(error: Exception) -> str:
+    """The first line of a rejected notify's body — the reason SkydiveOS gave
+    (``No instructor is paired to GoPro serial "4812"``), without which a 404 in the
+    log cannot be acted on. Never raises; ``"(no response body)"`` when there is none."""
+    resp = getattr(error, "response", None)
+    text = getattr(resp, "text", None)
+    if not isinstance(text, str) or not text.strip():
+        return "(no response body)"
+    return " ".join(text.split())[:300]
+
+
 def _is_permanent_handoff_error(error: Exception) -> bool:
     """True when re-sending this notification cannot succeed (an HTTP 4xx).
 
@@ -930,10 +941,10 @@ class CameraDiscoveryService:
             # only recorded in the retention ledger on success, so the file stays on
             # the card and stays undeletable.
             logger.error(
-                "hand-off REJECTED by SkydiveOS for %s: %r. Not retrying (a 4xx is "
-                "permanent). The file stays staged and on the card; fix the "
-                "notification's cause, then re-pull.",
-                mp4, error,
+                "hand-off REJECTED by SkydiveOS for %s: %r — %s. Not retrying (a 4xx is "
+                "permanent). The file stays staged and on the card; fix the cause named "
+                "above, then restart the service to re-queue it.",
+                mp4, error, _response_body(error),
             )
             return
         if attempt >= self._handoff_max_attempts:

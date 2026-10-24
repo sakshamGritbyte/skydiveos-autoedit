@@ -35,6 +35,9 @@ $logDir = Join-Path $RepoRoot 'logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $outLog = Join-Path $logDir 'ingest.out.log'
 $errLog = Join-Path $logDir 'ingest.err.log'
+# The wrapper's own notes. Start-Process truncates BOTH redirect targets when the child
+# attaches, so anything written to them before launch is lost; this one is only appended.
+$wrapLog = Join-Path $logDir 'ingest.wrapper.log'
 
 # uvicorn logs to STDERR, so ingest.err.log is the interesting one - same split as the
 # Mac's launchd plist (StandardOutPath / StandardErrorPath).
@@ -91,8 +94,8 @@ foreach ($f in @($outLog, $errLog)) {
 }
 
 "=== ingest start $(Get-Date -Format o) host=$BindHost port=$Port ===" |
-  Out-File $outLog -Encoding UTF8
-foreach ($n in $notes) { $n | Out-File $outLog -Append -Encoding UTF8 }
+  Out-File $wrapLog -Append -Encoding UTF8
+foreach ($n in $notes) { $n | Out-File $wrapLog -Append -Encoding UTF8 }
 
 # Fail loudly on the one misconfiguration that looks exactly like "no cards today":
 # a scanner set to something other than sdcard, or discovery switched off entirely.
@@ -101,7 +104,7 @@ $scannerMatch = Select-String -Path .env -Pattern '^\s*CAMERA_SCANNER\s*=\s*(\S+
 $scanner = if ($scannerMatch) { $scannerMatch.Matches[0].Groups[1].Value } else { $null }
 if ($scanner -and $scanner -ne 'sdcard') {
   "WARNING: CAMERA_SCANNER=$scanner on a card-reader box - sdcard was expected" |
-    Out-File $outLog -Append -Encoding UTF8
+    Out-File $wrapLog -Append -Encoding UTF8
 }
 
 # Resolve uv by full path. A Scheduled Task's PATH is not the shell the operator
@@ -118,7 +121,7 @@ if (-not $uv) {
 }
 if (-not $uv) {
   "FATAL: uv not found. Install it, or add its directory to the machine PATH." |
-    Out-File $errLog -Append -Encoding UTF8
+    Out-File $wrapLog -Append -Encoding UTF8
   exit 9
 }
 

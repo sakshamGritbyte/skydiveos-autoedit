@@ -186,12 +186,12 @@ git pull origin main
 uv sync
 schtasks /End /TN "SkydiveOS-Ingest"
 schtasks /Run /TN "SkydiveOS-Ingest"
-Get-Content logs\ingest.out.log -Tail 5      # "=== ingest start <now> ===" (+ any "reclaiming port" line)
+Get-Content logs\ingest.wrapper.log -Tail 5  # "=== ingest start <now> ===" (+ any "reclaiming port" line)
 Get-Content logs\ingest.err.log -Tail 5      # "Application startup complete."
 ```
 
 `schtasks /End` kills the wrapper but not always the uvicorn it started; `run.ps1`
-reclaims port 8000 from that stale chain itself (and notes it in `ingest.out.log`), so
+reclaims port 8000 from that stale chain itself (and notes it in `ingest.wrapper.log`), so
 the new code — not the old process — is what serves. Proof, if in doubt: the running
 API's route list must contain the newest routes, e.g.
 `(Invoke-RestMethod http://127.0.0.1:8000/openapi.json -Headers @{Authorization="Bearer <AUTO_EDIT_API_KEY>"}).paths.PSObject.Properties.Name`.

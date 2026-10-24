@@ -61,7 +61,7 @@ switch ($Action) {
     $t | Format-List TaskName, State
     Get-ScheduledTaskInfo -TaskName $TaskName |
       Format-List LastRunTime, LastTaskResult, NextRunTime
-    Write-Host "Logs: $RepoRoot\logs\ingest.err.log (uvicorn), ingest.out.log (wrapper)"
+    Write-Host "Logs: $RepoRoot\logs\ingest.err.log (uvicorn), ingest.wrapper.log (wrapper)"
     break
   }
 
